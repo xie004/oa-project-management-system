@@ -50,6 +50,26 @@ PROJECT_PLAN_MILESTONES = [
     ("项目整体验收完成", "组织验收小组完成整体验收，形成验收报告并进入质保期。", "2026-10-30", "", "planned", "green"),
 ]
 
+PROJECT_PLAN_MILESTONE_TITLES = {item[0] for item in PROJECT_PLAN_MILESTONES}
+
+OBSOLETE_SEED_MILESTONE_TITLES = [
+    "项目启动会完成",
+    "合同与需求资料归档",
+    "项目组织与启动",
+    "需求调研与范围确认",
+    "系统集成需求清单确认",
+    "服务器资源申请与确认",
+    "测试环境与资源准备",
+    "表单迁移与前台逻辑落地",
+    "表单与数据迁移",
+    "系统集成开发与联调",
+    "业务测试与问题整改",
+    "上线准备与试运行",
+    "上线切换与试运行",
+    "项目验收",
+    "项目验收与资料归档",
+]
+
 PROJECT_PLAN_BREAKDOWN = [
     {
         "phase": "1. 合同与启动基线",
@@ -514,6 +534,14 @@ def ensure_project_plan(conn: sqlite3.Connection) -> None:
         set_setting(conn, "project_plan_breakdown", PROJECT_PLAN_BREAKDOWN)
 
     now = now_iso()
+    conn.executemany(
+        """
+        DELETE FROM milestones
+        WHERE title = ? AND source_document_id IS NULL
+        """,
+        [(title,) for title in OBSOLETE_SEED_MILESTONE_TITLES],
+    )
+
     conn.execute(
         """
         UPDATE project_profile

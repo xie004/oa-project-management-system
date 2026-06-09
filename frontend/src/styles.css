@@ -746,6 +746,33 @@ label {
   gap: 0;
 }
 
+.milestone-summary {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(120px, 1fr));
+  gap: 10px;
+  margin-bottom: 16px;
+}
+
+.milestone-summary > div {
+  min-height: 68px;
+  display: grid;
+  align-content: center;
+  gap: 4px;
+  padding: 12px;
+  border-radius: 8px;
+  background: var(--surface-alt);
+  border: 1px solid var(--border);
+}
+
+.milestone-summary strong {
+  font-size: 24px;
+}
+
+.milestone-summary span {
+  color: var(--muted);
+  font-size: 13px;
+}
+
 .timeline-item {
   display: grid;
   grid-template-columns: 22px minmax(0, 1fr);
@@ -1037,6 +1064,10 @@ th {
   }
 
   .stats-grid {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .milestone-summary {
     grid-template-columns: 1fr 1fr;
   }
 

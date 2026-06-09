@@ -106,6 +106,29 @@ const typeText = {
   change_request: "变更"
 };
 
+const refinedMilestoneTitles = new Set([
+  "合同签订与项目启动",
+  "启动会与主计划初版完成",
+  "测试环境基础部署完成",
+  "迁移策略与样例验证完成",
+  "签章与档案系统测试部署完成",
+  "公文数据首轮试迁移完成",
+  "系统集成清单确认",
+  "生产资源方案确认",
+  "财务预算报销方案确认",
+  "表单批量试迁移完成",
+  "新样式表单与前台逻辑完成",
+  "生产资源申请与环境部署完成",
+  "系统集成开发联调完成",
+  "内部验证与问题整改完成",
+  "UAT 用户测试完成",
+  "上线申请提交",
+  "正式切换上线",
+  "试运行满 30 日",
+  "测评与验收资料齐套",
+  "项目整体验收完成"
+]);
+
 function safeDate(value) {
   if (!value) return null;
   const date = new Date(`${value}`.slice(0, 10));
@@ -507,12 +530,32 @@ function TaskBoard({ tasks, onCreate, onPatch, onPreview }) {
 }
 
 function MilestoneView({ milestones, profile, goals, breakdown, onPreview }) {
+  const plannedMilestones = milestones.filter((item) => refinedMilestoneTitles.has(item.title));
+  const extraMilestones = milestones.filter((item) => !refinedMilestoneTitles.has(item.title));
   return (
     <div className="view-grid">
       <ProjectPlanPanel profile={profile} goals={goals} milestones={milestones} breakdown={breakdown} />
-      <Section title="里程碑时间轴">
+      <Section title="关键里程碑">
+        <div className="milestone-summary">
+          <div>
+            <strong>{plannedMilestones.length}</strong>
+            <span>新版计划里程碑</span>
+          </div>
+          <div>
+            <strong>{plannedMilestones.filter((item) => item.status === "completed").length}</strong>
+            <span>已完成</span>
+          </div>
+          <div>
+            <strong>{plannedMilestones.filter((item) => item.status === "in_progress").length}</strong>
+            <span>进行中</span>
+          </div>
+          <div>
+            <strong>{plannedMilestones.filter((item) => item.status === "planned").length}</strong>
+            <span>计划中</span>
+          </div>
+        </div>
         <div className="timeline">
-          {milestones.map((item) => (
+          {plannedMilestones.map((item) => (
             <div className="timeline-item" key={item.id}>
               <div className={`timeline-dot ${item.color_status || "green"}`} />
               <div>
@@ -528,9 +571,27 @@ function MilestoneView({ milestones, profile, goals, breakdown, onPreview }) {
               </div>
             </div>
           ))}
-          {!milestones.length && <Empty />}
+          {!plannedMilestones.length && <Empty />}
         </div>
       </Section>
+      {!!extraMilestones.length && (
+        <Section title="动态补充里程碑">
+          <div className="list">
+            {extraMilestones.map((item) => (
+              <div className="list-row" key={item.id}>
+                <div>
+                  <strong>{item.title}</strong>
+                  <p>{item.description}</p>
+                  {item.document_name && (
+                    <p><FileButton documentId={item.source_document_id} name={item.document_name} onPreview={onPreview} /></p>
+                  )}
+                </div>
+                <StatusPill value={item.status} color={item.color_status} />
+              </div>
+            ))}
+          </div>
+        </Section>
+      )}
     </div>
   );
 }
