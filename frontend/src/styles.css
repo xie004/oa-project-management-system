@@ -194,6 +194,11 @@ main {
   line-height: 1.25;
 }
 
+.hero-status > div:first-child {
+  min-width: 240px;
+  flex: 1 1 380px;
+}
+
 .hero-meta {
   display: flex;
   gap: 14px;
@@ -201,6 +206,135 @@ main {
   color: var(--muted);
   margin-top: 12px;
   font-size: 14px;
+}
+
+.hero-side {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 18px;
+  flex: 0 1 520px;
+  min-width: 400px;
+}
+
+.hero-task-status {
+  width: min(330px, 100%);
+  min-width: 260px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #f8fafc;
+}
+
+.hero-panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.hero-panel-head > div:first-child {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.hero-panel-head strong {
+  color: var(--text);
+  font-size: 18px;
+}
+
+.status-mode {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.status-mode button {
+  height: 26px;
+  padding: 0 9px;
+  border: 0;
+  border-radius: 6px;
+  color: var(--muted);
+  background: transparent;
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.status-mode button.active {
+  color: #ffffff;
+  background: var(--blue);
+}
+
+.status-stack {
+  display: flex;
+  width: 100%;
+  height: 14px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: #e5e7eb;
+}
+
+.status-stack span {
+  display: block;
+  min-width: 7px;
+}
+
+.status-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  margin-top: 10px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.status-legend span,
+.status-list-row span {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.status-legend i,
+.status-list-row i {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex: 0 0 auto;
+}
+
+.status-list {
+  display: grid;
+  gap: 6px;
+}
+
+.status-list-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.status-list-row strong {
+  color: var(--text);
+}
+
+.status-empty {
+  min-height: 36px;
+  display: grid;
+  place-items: center;
+  color: var(--muted);
+  font-size: 13px;
 }
 
 .progress-ring {
@@ -1110,6 +1244,21 @@ th {
 }
 
 @media (max-width: 1100px) {
+  .hero-status {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .hero-side {
+    width: 100%;
+    min-width: 0;
+  }
+
+  .hero-task-status {
+    flex: 1 1 auto;
+    min-width: 240px;
+  }
+
   .stats-grid {
     grid-template-columns: repeat(3, minmax(130px, 1fr));
   }
@@ -1158,6 +1307,20 @@ th {
   .suggestion {
     align-items: stretch;
     flex-direction: column;
+  }
+
+  .hero-status > div:first-child {
+    min-width: 0;
+  }
+
+  .hero-side {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .hero-task-status {
+    width: 100%;
+    min-width: 0;
   }
 
   .stats-grid {

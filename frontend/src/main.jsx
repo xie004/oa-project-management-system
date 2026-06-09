@@ -1,6 +1,5 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
-import ReactECharts from "echarts-for-react";
 import {
   AlertTriangle,
   CalendarDays,
@@ -295,14 +294,23 @@ function ProjectPlanPanel({ profile = {}, goals = [], milestones = [], breakdown
   );
 }
 
-const dashboardLayoutKey = "oa-dashboard-layout-v2";
+const dashboardLayoutKey = "oa-dashboard-layout-v3";
+const taskStatusViewKey = "oa-task-status-view-v1";
 const defaultDashboardLayout = [
-  { id: "taskStatus", span: 6 },
-  { id: "risks", span: 6 },
+  { id: "risks", span: 12 },
   { id: "suggestions", span: 4 },
   { id: "documents", span: 4 },
   { id: "projectPlan", span: 4 }
 ];
+
+const taskStatusColors = {
+  completed: "#16835d",
+  in_progress: "#2563eb",
+  blocked: "#b7791f",
+  delayed: "#c24135",
+  not_started: "#64748b",
+  other: "#475569"
+};
 
 function clampSpan(value) {
   return Math.max(3, Math.min(12, Number(value) || 4));
@@ -330,6 +338,77 @@ function loadDashboardLayout() {
   } catch {
     return normalizeDashboardLayout();
   }
+}
+
+function loadTaskStatusView() {
+  try {
+    return localStorage.getItem(taskStatusViewKey) === "list" ? "list" : "stack";
+  } catch {
+    return "stack";
+  }
+}
+
+function TaskStatusInline({ items, view, onViewChange }) {
+  const total = items.reduce((sum, item) => sum + item.value, 0);
+  const visibleItems = items.filter((item) => item.value > 0);
+
+  return (
+    <div className="hero-task-status">
+      <div className="hero-panel-head">
+        <div>
+          <span>任务状态</span>
+          <strong>{total}</strong>
+        </div>
+        <div className="status-mode" aria-label="任务状态显示类型">
+          <button className={view === "stack" ? "active" : ""} onClick={() => onViewChange("stack")} type="button">
+            条形
+          </button>
+          <button className={view === "list" ? "active" : ""} onClick={() => onViewChange("list")} type="button">
+            列表
+          </button>
+        </div>
+      </div>
+
+      {!visibleItems.length ? (
+        <div className="status-empty">暂无任务</div>
+      ) : view === "list" ? (
+        <div className="status-list">
+          {visibleItems.map((item) => (
+            <div className="status-list-row" key={item.key}>
+              <span>
+                <i style={{ backgroundColor: item.color }} />
+                {item.label}
+              </span>
+              <strong>{item.value}</strong>
+            </div>
+          ))}
+        </div>
+      ) : (
+        <>
+          <div className="status-stack" aria-label="任务状态分布">
+            {visibleItems.map((item) => (
+              <span
+                key={item.key}
+                style={{
+                  width: `${Math.max(7, (item.value / total) * 100)}%`,
+                  backgroundColor: item.color
+                }}
+                title={`${item.label}：${item.value}`}
+              />
+            ))}
+          </div>
+          <div className="status-legend">
+            {visibleItems.map((item) => (
+              <span key={item.key}>
+                <i style={{ backgroundColor: item.color }} />
+                {item.label} {item.value}
+              </span>
+            ))}
+          </div>
+        </>
+      )}
+    </div>
+  );
 }
 
 function DashboardWidget({ widget, title, action, children, onWidgetDragStart, onResizeStart, dragging }) {
@@ -464,29 +543,43 @@ function DashboardWorkspace({ widgets, renderWidget, onReset }) {
 }
 
 function Dashboard({ data, onScan, onPreview }) {
+  const [taskStatusView, setTaskStatusView] = useState(loadTaskStatusView);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(taskStatusViewKey, taskStatusView);
+    } catch {
+      // Browser storage can be unavailable in privacy modes; the control still works for the session.
+    }
+  }, [taskStatusView]);
+
   const taskStatus = useMemo(() => {
     const counts = {};
-    for (const task of data.tasks || []) counts[statusLabel(task.status)] = (counts[statusLabel(task.status)] || 0) + 1;
-    return Object.entries(counts).map(([name, value]) => ({ name, value }));
+    for (const task of data.tasks || []) {
+      const key = task.status || "not_started";
+      counts[key] = (counts[key] || 0) + 1;
+    }
+    const orderedKeys = ["completed", "in_progress", "blocked", "delayed", "not_started"];
+    const ordered = orderedKeys.map((key) => ({
+      key,
+      label: statusLabel(key),
+      value: counts[key] || 0,
+      color: taskStatusColors[key]
+    }));
+    const other = Object.keys(counts)
+      .filter((key) => !orderedKeys.includes(key))
+      .sort()
+      .map((key) => ({
+        key,
+        label: statusLabel(key),
+        value: counts[key],
+        color: taskStatusColors.other
+      }));
+    return [...ordered, ...other];
   }, [data.tasks]);
-
-  const chartOptions = {
-    tooltip: { trigger: "item" },
-    color: ["#16835d", "#b7791f", "#2563eb", "#c24135", "#64748b"],
-    series: [
-      {
-        type: "pie",
-        radius: ["48%", "72%"],
-        avoidLabelOverlap: true,
-        label: { formatter: "{b}\n{c}" },
-        data: taskStatus
-      }
-    ]
-  };
 
   const profile = data.profile || {};
   const dashboardWidgets = {
-    taskStatus: { title: "任务状态" },
     risks: { title: "近期风险" },
     suggestions: {
       title: "智能更新",
@@ -501,14 +594,6 @@ function Dashboard({ data, onScan, onPreview }) {
   };
 
   const renderDashboardWidget = (id) => {
-    if (id === "taskStatus") {
-      return (
-        <div className="chart-box">
-          {taskStatus.length ? <ReactECharts option={chartOptions} style={{ height: 280 }} /> : <Empty />}
-        </div>
-      );
-    }
-
     if (id === "risks") {
       return (
         <div className="list">
@@ -584,12 +669,15 @@ function Dashboard({ data, onScan, onPreview }) {
           <div className="hero-meta">
             <span>阶段：{profile.phase || "开发实施"}</span>
             <span>状态：{colorText[profile.color_status] || profile.color_status}</span>
-            <span>最近扫描：{data.lastScanAt || "-"}</span>
+            <span>最近扫描：{formatDate(data.lastScanAt)}</span>
           </div>
         </div>
-        <div className="progress-ring">
-          <div className="progress-number">{profile.overall_progress || 0}%</div>
-          <div className="progress-label">总体进度</div>
+        <div className="hero-side">
+          <TaskStatusInline items={taskStatus} view={taskStatusView} onViewChange={setTaskStatusView} />
+          <div className="progress-ring">
+            <div className="progress-number">{profile.overall_progress || 0}%</div>
+            <div className="progress-label">总体进度</div>
+          </div>
         </div>
       </div>
 
