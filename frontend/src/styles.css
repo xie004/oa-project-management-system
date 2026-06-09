@@ -421,11 +421,6 @@ main {
   gap: 10px;
 }
 
-.dashboard-workspace-head {
-  display: flex;
-  justify-content: flex-end;
-}
-
 .dashboard-grid {
   display: grid;
   grid-template-columns: repeat(12, minmax(0, 1fr));

@@ -436,7 +436,7 @@ function DashboardWidget({ widget, title, action, children, onWidgetDragStart, o
   );
 }
 
-function DashboardWorkspace({ widgets, renderWidget, onReset }) {
+function DashboardWorkspace({ widgets, renderWidget, resetSignal }) {
   const [layout, setLayout] = useState(loadDashboardLayout);
   const [draggingId, setDraggingId] = useState("");
 
@@ -508,17 +508,14 @@ function DashboardWorkspace({ widgets, renderWidget, onReset }) {
     const reset = normalizeDashboardLayout();
     setLayout(reset);
     localStorage.setItem(dashboardLayoutKey, JSON.stringify(reset));
-    onReset?.();
   };
+
+  useEffect(() => {
+    if (resetSignal) resetLayout();
+  }, [resetSignal]);
 
   return (
     <div className="dashboard-workspace">
-      <div className="dashboard-workspace-head">
-        <button className="ghost-button" onClick={resetLayout}>
-          <RotateCcw size={16} />
-          恢复布局
-        </button>
-      </div>
       <div className="dashboard-grid">
         {layout.map((item) => {
           const config = widgets[item.id];
@@ -542,7 +539,7 @@ function DashboardWorkspace({ widgets, renderWidget, onReset }) {
   );
 }
 
-function Dashboard({ data, onScan, onPreview }) {
+function Dashboard({ data, onScan, onPreview, resetLayoutSignal }) {
   const [taskStatusView, setTaskStatusView] = useState(loadTaskStatusView);
 
   useEffect(() => {
@@ -690,7 +687,7 @@ function Dashboard({ data, onScan, onPreview }) {
         <Stat label="资料文件" value={data.counts?.documents || 0} icon={FolderCog} tone="neutral" />
       </div>
 
-      <DashboardWorkspace widgets={dashboardWidgets} renderWidget={renderDashboardWidget} />
+      <DashboardWorkspace widgets={dashboardWidgets} renderWidget={renderDashboardWidget} resetSignal={resetLayoutSignal} />
     </div>
   );
 }
@@ -1143,6 +1140,7 @@ function App() {
   const [loading, setLoading] = useState(true);
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
+  const [dashboardResetSignal, setDashboardResetSignal] = useState(0);
 
   const refresh = async () => {
     setError("");
@@ -1210,7 +1208,9 @@ function App() {
 
   const content = () => {
     if (loading) return <div className="loading">加载中</div>;
-    if (active === "dashboard") return <Dashboard data={dashboardData} onScan={scanNow} onPreview={openPreview} />;
+    if (active === "dashboard") {
+      return <Dashboard data={dashboardData} onScan={scanNow} onPreview={openPreview} resetLayoutSignal={dashboardResetSignal} />;
+    }
     if (active === "gantt") return <Gantt tasks={tasks} />;
     if (active === "board") return <TaskBoard tasks={tasks} onCreate={createTask} onPatch={patchTask} onPreview={openPreview} />;
     if (active === "milestones") {
@@ -1266,6 +1266,12 @@ function App() {
           <div className="top-actions">
             {notice && <span className="notice">{notice}</span>}
             {error && <span className="error">{error}</span>}
+            {active === "dashboard" && (
+              <button className="ghost-button topbar-reset-button" onClick={() => setDashboardResetSignal((value) => value + 1)} title="恢复布局">
+                <RotateCcw size={16} />
+                恢复布局
+              </button>
+            )}
             <button className="icon-button" onClick={() => runAction(refresh, "已刷新")} title="刷新">
               <RefreshCw size={18} />
             </button>
