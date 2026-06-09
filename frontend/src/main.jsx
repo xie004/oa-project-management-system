@@ -531,68 +531,46 @@ function TaskBoard({ tasks, onCreate, onPatch, onPreview }) {
 
 function MilestoneView({ milestones, profile, goals, breakdown, onPreview }) {
   const plannedMilestones = milestones.filter((item) => refinedMilestoneTitles.has(item.title));
-  const extraMilestones = milestones.filter((item) => !refinedMilestoneTitles.has(item.title));
   return (
-    <div className="view-grid">
-      <ProjectPlanPanel profile={profile} goals={goals} milestones={milestones} breakdown={breakdown} />
-      <Section title="关键里程碑">
-        <div className="milestone-summary">
-          <div>
-            <strong>{plannedMilestones.length}</strong>
-            <span>新版计划里程碑</span>
-          </div>
-          <div>
-            <strong>{plannedMilestones.filter((item) => item.status === "completed").length}</strong>
-            <span>已完成</span>
-          </div>
-          <div>
-            <strong>{plannedMilestones.filter((item) => item.status === "in_progress").length}</strong>
-            <span>进行中</span>
-          </div>
-          <div>
-            <strong>{plannedMilestones.filter((item) => item.status === "planned").length}</strong>
-            <span>计划中</span>
-          </div>
+    <Section title="关键里程碑">
+      <div className="milestone-summary">
+        <div>
+          <strong>{plannedMilestones.length}</strong>
+          <span>新版计划里程碑</span>
         </div>
-        <div className="timeline">
-          {plannedMilestones.map((item) => (
-            <div className="timeline-item" key={item.id}>
-              <div className={`timeline-dot ${item.color_status || "green"}`} />
-              <div>
-                <div className="timeline-title">
-                  <strong>{item.title}</strong>
-                  <StatusPill value={item.status} color={item.color_status} />
-                </div>
-                <p>{item.description}</p>
-                {item.document_name && (
-                  <p><FileButton documentId={item.source_document_id} name={item.document_name} onPreview={onPreview} /></p>
-                )}
-                <span>{formatDate(item.actual_date || item.planned_date)}</span>
-              </div>
-            </div>
-          ))}
-          {!plannedMilestones.length && <Empty />}
+        <div>
+          <strong>{plannedMilestones.filter((item) => item.status === "completed").length}</strong>
+          <span>已完成</span>
         </div>
-      </Section>
-      {!!extraMilestones.length && (
-        <Section title="动态补充里程碑">
-          <div className="list">
-            {extraMilestones.map((item) => (
-              <div className="list-row" key={item.id}>
-                <div>
-                  <strong>{item.title}</strong>
-                  <p>{item.description}</p>
-                  {item.document_name && (
-                    <p><FileButton documentId={item.source_document_id} name={item.document_name} onPreview={onPreview} /></p>
-                  )}
-                </div>
+        <div>
+          <strong>{plannedMilestones.filter((item) => item.status === "in_progress").length}</strong>
+          <span>进行中</span>
+        </div>
+        <div>
+          <strong>{plannedMilestones.filter((item) => item.status === "planned").length}</strong>
+          <span>计划中</span>
+        </div>
+      </div>
+      <div className="timeline">
+        {plannedMilestones.map((item) => (
+          <div className="timeline-item" key={item.id}>
+            <div className={`timeline-dot ${item.color_status || "green"}`} />
+            <div>
+              <div className="timeline-title">
+                <strong>{item.title}</strong>
                 <StatusPill value={item.status} color={item.color_status} />
               </div>
-            ))}
+              <p>{item.description}</p>
+              {item.document_name && (
+                <p><FileButton documentId={item.source_document_id} name={item.document_name} onPreview={onPreview} /></p>
+              )}
+              <span>{formatDate(item.actual_date || item.planned_date)}</span>
+            </div>
           </div>
-        </Section>
-      )}
-    </div>
+        ))}
+        {!plannedMilestones.length && <Empty />}
+      </div>
+    </Section>
   );
 }
 

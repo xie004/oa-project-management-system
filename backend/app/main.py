@@ -162,7 +162,10 @@ def dashboard() -> dict[str, Any]:
                 SELECT t.*, d.name AS document_name, d.path AS document_path
                 FROM tasks t
                 LEFT JOIN documents d ON d.id = t.source_document_id
-                ORDER BY t.id DESC
+                ORDER BY
+                    COALESCE(t.start_date, ''),
+                    COALESCE(t.due_date, ''),
+                    t.id
                 """
             ).fetchall()
         )
@@ -255,7 +258,10 @@ def get_tasks() -> list[dict[str, Any]]:
                 SELECT t.*, d.name AS document_name, d.path AS document_path
                 FROM tasks t
                 LEFT JOIN documents d ON d.id = t.source_document_id
-                ORDER BY t.id DESC
+                ORDER BY
+                    COALESCE(t.start_date, ''),
+                    COALESCE(t.due_date, ''),
+                    t.id
                 """
             ).fetchall()
         )
