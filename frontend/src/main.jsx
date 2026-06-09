@@ -12,12 +12,14 @@ import {
   FolderCog,
   Gauge,
   GitPullRequest,
+  GripVertical,
   Kanban,
   LayoutDashboard,
   ListChecks,
   Milestone,
   Plus,
   RefreshCw,
+  RotateCcw,
   Settings,
   Sparkles,
   X
@@ -216,12 +218,12 @@ function PreviewModal({ preview, loading, onClose }) {
   );
 }
 
-function ProjectPlanPanel({ profile = {}, goals = [], milestones = [], breakdown = [] }) {
+function ProjectPlanContent({ profile = {}, goals = [], milestones = [], breakdown = [] }) {
   const planItems = milestones.filter((item) =>
     ["合同签订与项目启动", "启动会与主计划初版完成", "测试环境基础部署完成", "迁移策略与样例验证完成", "表单批量试迁移完成", "新样式表单与前台逻辑完成", "系统集成开发联调完成", "UAT 用户测试完成", "正式切换上线", "项目整体验收完成"].includes(item.title)
   );
   return (
-    <Section title="项目目标与计划">
+    <>
       <div className="goal-grid">
         <div>
           <div className="mini-title">建设目标</div>
@@ -281,7 +283,183 @@ function ProjectPlanPanel({ profile = {}, goals = [], milestones = [], breakdown
           ))}
         </div>
       )}
+    </>
+  );
+}
+
+function ProjectPlanPanel({ profile = {}, goals = [], milestones = [], breakdown = [] }) {
+  return (
+    <Section title="项目目标与计划">
+      <ProjectPlanContent profile={profile} goals={goals} milestones={milestones} breakdown={breakdown} />
     </Section>
+  );
+}
+
+const dashboardLayoutKey = "oa-dashboard-layout-v2";
+const defaultDashboardLayout = [
+  { id: "taskStatus", span: 6 },
+  { id: "risks", span: 6 },
+  { id: "suggestions", span: 4 },
+  { id: "documents", span: 4 },
+  { id: "projectPlan", span: 4 }
+];
+
+function clampSpan(value) {
+  return Math.max(3, Math.min(12, Number(value) || 4));
+}
+
+function normalizeDashboardLayout(layout) {
+  const knownIds = defaultDashboardLayout.map((item) => item.id);
+  const fallback = defaultDashboardLayout.map((item) => ({ ...item }));
+  if (!Array.isArray(layout)) return fallback;
+  const normalized = [];
+  for (const item of layout) {
+    if (item && knownIds.includes(item.id) && !normalized.some((existing) => existing.id === item.id)) {
+      normalized.push({ id: item.id, span: clampSpan(item.span) });
+    }
+  }
+  for (const item of fallback) {
+    if (!normalized.some((existing) => existing.id === item.id)) normalized.push(item);
+  }
+  return normalized;
+}
+
+function loadDashboardLayout() {
+  try {
+    return normalizeDashboardLayout(JSON.parse(localStorage.getItem(dashboardLayoutKey)));
+  } catch {
+    return normalizeDashboardLayout();
+  }
+}
+
+function DashboardWidget({ widget, title, action, children, onWidgetDragStart, onResizeStart, dragging }) {
+  return (
+    <section
+      className={`dashboard-widget section ${dragging ? "dragging" : ""}`}
+      data-widget-id={widget.id}
+      style={{ gridColumn: `span ${widget.span}` }}
+    >
+      <div className="section-head widget-head" onMouseDown={(event) => onWidgetDragStart(event, widget.id)}>
+        <div className="widget-title">
+          <GripVertical size={17} />
+          <h2>{title}</h2>
+        </div>
+        {action}
+      </div>
+      <div className="dashboard-widget-body">{children}</div>
+      <button
+        className="resize-handle"
+        onMouseDown={(event) => onResizeStart(event, widget.id, widget.span)}
+        title="调整宽度"
+        aria-label="调整宽度"
+      />
+    </section>
+  );
+}
+
+function DashboardWorkspace({ widgets, renderWidget, onReset }) {
+  const [layout, setLayout] = useState(loadDashboardLayout);
+  const [draggingId, setDraggingId] = useState("");
+
+  useEffect(() => {
+    localStorage.setItem(dashboardLayoutKey, JSON.stringify(layout));
+  }, [layout]);
+
+  const moveWidget = (sourceId, targetId) => {
+    if (!sourceId || sourceId === targetId) return;
+    setLayout((current) => {
+      const next = [...current];
+      const sourceIndex = next.findIndex((item) => item.id === sourceId);
+      const targetIndex = next.findIndex((item) => item.id === targetId);
+      if (sourceIndex < 0 || targetIndex < 0) return current;
+      const [moved] = next.splice(sourceIndex, 1);
+      next.splice(targetIndex, 0, moved);
+      return next;
+    });
+  };
+
+  const updateSpan = (id, span) => {
+    setLayout((current) => current.map((item) => (item.id === id ? { ...item, span: clampSpan(span) } : item)));
+  };
+
+  const startResize = (event, id, startSpan) => {
+    event.preventDefault();
+    event.stopPropagation();
+    const startX = event.clientX;
+    const onMove = (moveEvent) => {
+      const delta = Math.round((moveEvent.clientX - startX) / 90);
+      updateSpan(id, startSpan + delta);
+    };
+    const onUp = () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  };
+
+  const startWidgetDrag = (event, id) => {
+    if (event.target.closest("button,a,input,select,textarea")) return;
+    event.preventDefault();
+    const startX = event.clientX;
+    const startY = event.clientY;
+    setDraggingId(id);
+    document.body.style.userSelect = "none";
+
+    const onMove = (moveEvent) => {
+      if (Math.abs(moveEvent.clientX - startX) + Math.abs(moveEvent.clientY - startY) > 6) {
+        document.body.classList.add("dashboard-is-dragging");
+      }
+    };
+    const onUp = (upEvent) => {
+      const target = document.elementFromPoint(upEvent.clientX, upEvent.clientY)?.closest(".dashboard-widget");
+      const targetId = target?.dataset?.widgetId;
+      moveWidget(id, targetId);
+      setDraggingId("");
+      document.body.style.userSelect = "";
+      document.body.classList.remove("dashboard-is-dragging");
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  };
+
+  const resetLayout = () => {
+    const reset = normalizeDashboardLayout();
+    setLayout(reset);
+    localStorage.setItem(dashboardLayoutKey, JSON.stringify(reset));
+    onReset?.();
+  };
+
+  return (
+    <div className="dashboard-workspace">
+      <div className="dashboard-workspace-head">
+        <button className="ghost-button" onClick={resetLayout}>
+          <RotateCcw size={16} />
+          恢复布局
+        </button>
+      </div>
+      <div className="dashboard-grid">
+        {layout.map((item) => {
+          const config = widgets[item.id];
+          if (!config) return null;
+          return (
+            <DashboardWidget
+              key={item.id}
+              widget={item}
+              title={config.title}
+              action={config.action}
+              dragging={draggingId === item.id}
+              onWidgetDragStart={startWidgetDrag}
+              onResizeStart={startResize}
+            >
+              {renderWidget(item.id)}
+            </DashboardWidget>
+          );
+        })}
+      </div>
+    </div>
   );
 }
 
@@ -307,6 +485,96 @@ function Dashboard({ data, onScan, onPreview }) {
   };
 
   const profile = data.profile || {};
+  const dashboardWidgets = {
+    taskStatus: { title: "任务状态" },
+    risks: { title: "近期风险" },
+    suggestions: {
+      title: "智能更新",
+      action: (
+        <button className="icon-button" onClick={onScan} title="重新扫描">
+          <RefreshCw size={17} />
+        </button>
+      )
+    },
+    documents: { title: "最近资料" },
+    projectPlan: { title: "项目目标与计划" }
+  };
+
+  const renderDashboardWidget = (id) => {
+    if (id === "taskStatus") {
+      return (
+        <div className="chart-box">
+          {taskStatus.length ? <ReactECharts option={chartOptions} style={{ height: 280 }} /> : <Empty />}
+        </div>
+      );
+    }
+
+    if (id === "risks") {
+      return (
+        <div className="list">
+          {(data.risks || []).slice(0, 6).map((risk) => (
+            <div className="list-row" key={risk.id}>
+              <div>
+                <strong>{risk.title}</strong>
+                <p>{risk.description}</p>
+                {risk.document_name && <p><FileButton documentId={risk.source_document_id} name={risk.document_name} onPreview={onPreview} /></p>}
+              </div>
+              <StatusPill value={risk.status} color={risk.level === "high" ? "red" : "amber"} />
+            </div>
+          ))}
+          {!(data.risks || []).length && <Empty />}
+        </div>
+      );
+    }
+
+    if (id === "suggestions") {
+      return (
+        <div className="list compact-list">
+          {(data.suggestions || []).map((item) => (
+            <div className="list-row" key={item.id}>
+              <div>
+                <strong>{item.title}</strong>
+                <p><FileButton documentId={item.document_id} name={item.document_name} onPreview={onPreview} /></p>
+              </div>
+              <StatusPill value={typeText[item.suggestion_type]} color="blue" />
+            </div>
+          ))}
+          {!(data.suggestions || []).length && <Empty />}
+        </div>
+      );
+    }
+
+    if (id === "documents") {
+      return (
+        <div className="list compact-list">
+          {(data.documents || []).map((doc) => (
+            <div className="list-row" key={doc.id}>
+              <div>
+                <strong><FileButton documentId={doc.id} name={doc.name} onPreview={onPreview} /></strong>
+                <p>{formatDate(doc.modified_at)} · {typeText[doc.doc_category] || doc.doc_category}</p>
+              </div>
+              <StatusPill value={doc.status} color={doc.status === "error" ? "red" : "green"} />
+            </div>
+          ))}
+          {!(data.documents || []).length && <Empty />}
+        </div>
+      );
+    }
+
+    if (id === "projectPlan") {
+      return (
+        <ProjectPlanContent
+          profile={profile}
+          goals={data.projectGoals || []}
+          milestones={data.milestones || []}
+          breakdown={data.projectPlanBreakdown || []}
+        />
+      );
+    }
+
+    return null;
+  };
+
   return (
     <div className="view-grid">
       <div className={`hero-status ${profile.color_status || "green"}`}>
@@ -334,73 +602,7 @@ function Dashboard({ data, onScan, onPreview }) {
         <Stat label="资料文件" value={data.counts?.documents || 0} icon={FolderCog} tone="neutral" />
       </div>
 
-      <ProjectPlanPanel
-        profile={profile}
-        goals={data.projectGoals || []}
-        milestones={data.milestones || []}
-        breakdown={data.projectPlanBreakdown || []}
-      />
-
-      <div className="two-col">
-        <Section title="任务状态">
-          <div className="chart-box">
-            {taskStatus.length ? <ReactECharts option={chartOptions} style={{ height: 280 }} /> : <Empty />}
-          </div>
-        </Section>
-        <Section
-          title="智能更新"
-          action={
-            <button className="icon-button" onClick={onScan} title="重新扫描">
-              <RefreshCw size={17} />
-            </button>
-          }
-        >
-          <div className="list">
-            {(data.suggestions || []).map((item) => (
-              <div className="list-row" key={item.id}>
-                <div>
-                  <strong>{item.title}</strong>
-                  <p><FileButton documentId={item.document_id} name={item.document_name} onPreview={onPreview} /></p>
-                </div>
-                <StatusPill value={typeText[item.suggestion_type]} color="blue" />
-              </div>
-            ))}
-            {!(data.suggestions || []).length && <Empty />}
-          </div>
-        </Section>
-      </div>
-
-      <div className="two-col">
-        <Section title="近期风险">
-          <div className="list">
-            {(data.risks || []).slice(0, 6).map((risk) => (
-              <div className="list-row" key={risk.id}>
-                <div>
-                  <strong>{risk.title}</strong>
-                  <p>{risk.description}</p>
-                  {risk.document_name && <p><FileButton documentId={risk.source_document_id} name={risk.document_name} onPreview={onPreview} /></p>}
-                </div>
-                <StatusPill value={risk.status} color={risk.level === "high" ? "red" : "amber"} />
-              </div>
-            ))}
-            {!(data.risks || []).length && <Empty />}
-          </div>
-        </Section>
-        <Section title="最近资料">
-          <div className="list">
-            {(data.documents || []).map((doc) => (
-              <div className="list-row" key={doc.id}>
-                <div>
-                  <strong><FileButton documentId={doc.id} name={doc.name} onPreview={onPreview} /></strong>
-                  <p>{formatDate(doc.modified_at)} · {typeText[doc.doc_category] || doc.doc_category}</p>
-                </div>
-                <StatusPill value={doc.status} color={doc.status === "error" ? "red" : "green"} />
-              </div>
-            ))}
-            {!(data.documents || []).length && <Empty />}
-          </div>
-        </Section>
-      </div>
+      <DashboardWorkspace widgets={dashboardWidgets} renderWidget={renderDashboardWidget} />
     </div>
   );
 }

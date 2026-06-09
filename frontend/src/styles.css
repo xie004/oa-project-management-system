@@ -282,6 +282,99 @@ main {
   gap: 16px;
 }
 
+.dashboard-workspace {
+  display: grid;
+  gap: 10px;
+}
+
+.dashboard-workspace-head {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.dashboard-grid {
+  display: grid;
+  grid-template-columns: repeat(12, minmax(0, 1fr));
+  gap: 16px;
+  align-items: start;
+}
+
+.dashboard-widget {
+  position: relative;
+  min-height: 160px;
+  overflow: hidden;
+}
+
+.dashboard-widget-body {
+  max-height: 720px;
+  overflow: auto;
+  padding-right: 4px;
+  padding-bottom: 6px;
+}
+
+.widget-head {
+  cursor: grab;
+}
+
+.dashboard-widget.dragging {
+  opacity: 0.72;
+  outline: 2px solid var(--blue);
+  outline-offset: -2px;
+}
+
+.dashboard-is-dragging,
+.dashboard-is-dragging * {
+  cursor: grabbing !important;
+}
+
+.widget-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.widget-title svg {
+  color: var(--muted);
+  flex: 0 0 auto;
+}
+
+.resize-handle {
+  position: absolute;
+  right: 4px;
+  bottom: 4px;
+  width: 18px;
+  height: 18px;
+  border: 0;
+  background: transparent;
+  cursor: ew-resize;
+}
+
+.resize-handle::after {
+  content: "";
+  position: absolute;
+  right: 4px;
+  bottom: 4px;
+  width: 10px;
+  height: 10px;
+  border-right: 2px solid #94a3b8;
+  border-bottom: 2px solid #94a3b8;
+}
+
+.dashboard-grid .goal-grid,
+.dashboard-grid .phase-grid,
+.dashboard-grid .phase-cols {
+  grid-template-columns: 1fr;
+}
+
+.dashboard-grid .plan-strip {
+  grid-template-columns: repeat(2, minmax(110px, 1fr));
+}
+
+.compact-list .list-row {
+  align-items: flex-start;
+}
+
 .section {
   padding: 16px;
   min-width: 0;
@@ -1041,6 +1134,10 @@ th {
 @media (max-width: 760px) {
   .app-shell {
     grid-template-columns: 1fr;
+  }
+
+  .dashboard-widget {
+    grid-column: span 12 !important;
   }
 
   .sidebar {
