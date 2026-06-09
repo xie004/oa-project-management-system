@@ -237,6 +237,8 @@ def dashboard() -> dict[str, Any]:
             "suggestions": suggestions,
             "weeklyReports": weekly_rows,
             "projectGoals": get_setting(conn, "project_goals", []),
+            "projectPlanBreakdown": get_setting(conn, "project_plan_breakdown", []),
+            "projectPlanVersion": get_setting(conn, "project_plan_version", ""),
             "lastScanAt": get_setting(conn, "last_scan_at", ""),
         }
     finally:

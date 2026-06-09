@@ -193,9 +193,9 @@ function PreviewModal({ preview, loading, onClose }) {
   );
 }
 
-function ProjectPlanPanel({ profile = {}, goals = [], milestones = [] }) {
+function ProjectPlanPanel({ profile = {}, goals = [], milestones = [], breakdown = [] }) {
   const planItems = milestones.filter((item) =>
-    ["项目组织与启动", "需求调研与范围确认", "测试环境与资源准备", "表单与数据迁移", "系统集成开发与联调", "业务测试与问题整改", "上线切换与试运行", "项目验收与资料归档"].includes(item.title)
+    ["合同签订与项目启动", "启动会与主计划初版完成", "测试环境基础部署完成", "迁移策略与样例验证完成", "表单批量试迁移完成", "新样式表单与前台逻辑完成", "系统集成开发联调完成", "UAT 用户测试完成", "正式切换上线", "项目整体验收完成"].includes(item.title)
   );
   return (
     <Section title="项目目标与计划">
@@ -224,6 +224,40 @@ function ProjectPlanPanel({ profile = {}, goals = [], milestones = [] }) {
           </div>
         </div>
       </div>
+      {!!breakdown?.length && (
+        <div className="phase-grid">
+          {breakdown.map((phase) => (
+            <div className={`phase-card ${phase.status || "planned"}`} key={phase.phase}>
+              <div className="phase-head">
+                <div>
+                  <strong>{phase.phase}</strong>
+                  <span>{phase.period}</span>
+                </div>
+                <StatusPill value={phase.status} color={phase.status === "completed" ? "green" : phase.status === "in_progress" ? "amber" : "blue"} />
+              </div>
+              <p>{phase.objective}</p>
+              <div className="phase-progress">
+                <span style={{ width: `${phase.progress || 0}%` }} />
+              </div>
+              <div className="phase-cols">
+                <div>
+                  <div className="mini-title">重点工作</div>
+                  <ul>
+                    {(phase.work || []).slice(0, 6).map((item) => <li key={item}>{item}</li>)}
+                  </ul>
+                </div>
+                <div>
+                  <div className="mini-title">交付物</div>
+                  <ul>
+                    {(phase.deliverables || []).slice(0, 6).map((item) => <li key={item}>{item}</li>)}
+                  </ul>
+                </div>
+              </div>
+              <small>依据：{phase.basis}</small>
+            </div>
+          ))}
+        </div>
+      )}
     </Section>
   );
 }
@@ -277,7 +311,12 @@ function Dashboard({ data, onScan, onPreview }) {
         <Stat label="资料文件" value={data.counts?.documents || 0} icon={FolderCog} tone="neutral" />
       </div>
 
-      <ProjectPlanPanel profile={profile} goals={data.projectGoals || []} milestones={data.milestones || []} />
+      <ProjectPlanPanel
+        profile={profile}
+        goals={data.projectGoals || []}
+        milestones={data.milestones || []}
+        breakdown={data.projectPlanBreakdown || []}
+      />
 
       <div className="two-col">
         <Section title="任务状态">
@@ -467,10 +506,10 @@ function TaskBoard({ tasks, onCreate, onPatch, onPreview }) {
   );
 }
 
-function MilestoneView({ milestones, profile, goals, onPreview }) {
+function MilestoneView({ milestones, profile, goals, breakdown, onPreview }) {
   return (
     <div className="view-grid">
-      <ProjectPlanPanel profile={profile} goals={goals} milestones={milestones} />
+      <ProjectPlanPanel profile={profile} goals={goals} milestones={milestones} breakdown={breakdown} />
       <Section title="里程碑时间轴">
         <div className="timeline">
           {milestones.map((item) => (
@@ -851,6 +890,7 @@ function App() {
           milestones={milestones}
           profile={dashboardData.profile}
           goals={dashboardData.projectGoals || []}
+          breakdown={dashboardData.projectPlanBreakdown || []}
           onPreview={openPreview}
         />
       );

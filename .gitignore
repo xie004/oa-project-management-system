@@ -1,4 +1,6 @@
 backend/.venv/
+__pycache__/
+*.py[cod]
 backend/data/oa_project.db
 backend/data/exports/
 frontend/node_modules/

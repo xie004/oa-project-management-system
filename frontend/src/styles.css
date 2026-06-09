@@ -449,7 +449,7 @@ main {
 
 .plan-strip {
   display: grid;
-  grid-template-columns: repeat(4, minmax(120px, 1fr));
+  grid-template-columns: repeat(5, minmax(120px, 1fr));
   gap: 9px;
 }
 
@@ -482,6 +482,99 @@ main {
 
 .plan-node small {
   color: var(--muted);
+}
+
+.phase-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(280px, 1fr));
+  gap: 12px;
+  margin-top: 18px;
+}
+
+.phase-card {
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--blue);
+  border-radius: 8px;
+  padding: 14px;
+  background: #ffffff;
+}
+
+.phase-card.completed {
+  border-left-color: var(--green);
+}
+
+.phase-card.in_progress {
+  border-left-color: var(--amber);
+}
+
+.phase-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.phase-head strong,
+.phase-head span {
+  display: block;
+}
+
+.phase-head span {
+  color: var(--muted);
+  font-size: 12px;
+  margin-top: 4px;
+}
+
+.phase-card p {
+  margin: 10px 0;
+  color: var(--text);
+  line-height: 1.55;
+}
+
+.phase-card small {
+  display: block;
+  color: var(--muted);
+  line-height: 1.45;
+  margin-top: 10px;
+}
+
+.phase-progress {
+  height: 8px;
+  border-radius: 999px;
+  background: #e5eaf0;
+  overflow: hidden;
+  margin: 10px 0 12px;
+}
+
+.phase-progress span {
+  display: block;
+  height: 100%;
+  border-radius: 999px;
+  background: var(--blue);
+}
+
+.phase-card.completed .phase-progress span {
+  background: var(--green);
+}
+
+.phase-card.in_progress .phase-progress span {
+  background: var(--amber);
+}
+
+.phase-cols {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+
+.phase-cols ul {
+  margin: 0;
+  padding-left: 17px;
+  display: grid;
+  gap: 5px;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.45;
 }
 
 .empty,
@@ -907,7 +1000,8 @@ th {
     grid-template-columns: 1fr;
   }
 
-  .plan-strip {
+  .plan-strip,
+  .phase-grid {
     grid-template-columns: repeat(2, minmax(120px, 1fr));
   }
 
@@ -951,7 +1045,9 @@ th {
     grid-template-columns: 1fr;
   }
 
-  .plan-strip {
+  .plan-strip,
+  .phase-grid,
+  .phase-cols {
     grid-template-columns: 1fr;
   }
 
