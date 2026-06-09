@@ -4,12 +4,22 @@ import json
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from app.auth import (
+    SESSION_COOKIE_NAME,
+    SESSION_TTL_SECONDS,
+    admin_from_request,
+    authenticate_admin,
+    create_session_token,
+    current_auth,
+    ensure_auth_defaults,
+    set_admin_password,
+)
 from app.database import (
     DEFAULT_MONITOR_ROOT,
     SYSTEM_ROOT,
@@ -51,6 +61,16 @@ class SettingsPayload(BaseModel):
     monitorTypes: dict[str, dict[str, Any]]
 
 
+class LoginPayload(BaseModel):
+    username: str
+    password: str
+
+
+class PasswordChangePayload(BaseModel):
+    currentPassword: str
+    newPassword: str
+
+
 class TaskPayload(BaseModel):
     title: str
     description: str = ""
@@ -70,6 +90,7 @@ class GenericPatchPayload(BaseModel):
 @app.on_event("startup")
 def startup() -> None:
     init_db()
+    ensure_auth_defaults()
     try:
         scan_all(force=False)
     except Exception:
@@ -90,8 +111,39 @@ def health() -> dict[str, Any]:
     return {"ok": True, "name": "国产化OA集成项目管理系统"}
 
 
+@app.get("/api/auth/me")
+def auth_me(request: Request) -> dict[str, Any]:
+    return current_auth(request)
+
+
+@app.post("/api/auth/login")
+def auth_login(payload: LoginPayload, response: Response) -> dict[str, Any]:
+    if not authenticate_admin(payload.username.strip(), payload.password):
+        raise HTTPException(status_code=401, detail="账号或密码不正确")
+    response.set_cookie(
+        SESSION_COOKIE_NAME,
+        create_session_token(),
+        max_age=SESSION_TTL_SECONDS,
+        httponly=True,
+        samesite="lax",
+    )
+    return {"ok": True, "isAdmin": True, "username": "admin"}
+
+
+@app.post("/api/auth/logout")
+def auth_logout(response: Response) -> dict[str, Any]:
+    response.delete_cookie(SESSION_COOKIE_NAME)
+    return {"ok": True}
+
+
+@app.post("/api/auth/change-password")
+def change_password(payload: PasswordChangePayload, _: dict[str, Any] = Depends(admin_from_request)) -> dict[str, Any]:
+    set_admin_password(payload.currentPassword, payload.newPassword)
+    return {"ok": True}
+
+
 @app.get("/api/settings")
-def get_settings() -> dict[str, Any]:
+def get_settings(_: dict[str, Any] = Depends(admin_from_request)) -> dict[str, Any]:
     conn = get_connection()
     try:
         return {
@@ -105,7 +157,7 @@ def get_settings() -> dict[str, Any]:
 
 
 @app.put("/api/settings")
-def update_settings(payload: SettingsPayload) -> dict[str, Any]:
+def update_settings(payload: SettingsPayload, _: dict[str, Any] = Depends(admin_from_request)) -> dict[str, Any]:
     conn = get_connection()
     try:
         set_setting(conn, "system_name", payload.systemName)

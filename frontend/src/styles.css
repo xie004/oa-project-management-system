@@ -52,6 +52,8 @@ a.primary-button {
   position: sticky;
   top: 0;
   height: 100vh;
+  display: flex;
+  flex-direction: column;
   padding: 18px 14px;
   background: #202830;
   color: #f9fafb;
@@ -81,6 +83,26 @@ nav {
   display: grid;
   gap: 4px;
   padding-top: 14px;
+}
+
+.sidebar-footer {
+  margin-top: auto;
+  padding-top: 14px;
+}
+
+.sidebar-auth-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 26px;
+  padding: 0 6px;
+  color: #94a3b8;
+  background: transparent;
+  font-size: 12px;
+}
+
+.sidebar-auth-button:hover {
+  color: #e2e8f0;
 }
 
 nav button {
@@ -938,6 +960,17 @@ main {
   align-items: end;
 }
 
+.password-form {
+  grid-template-columns: repeat(3, minmax(160px, 1fr)) auto;
+}
+
+.password-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
 input,
 select,
 textarea {
@@ -1192,6 +1225,17 @@ th {
   border-radius: 8px;
   box-shadow: 0 24px 80px rgba(15, 23, 42, 0.28);
   overflow: hidden;
+}
+
+.auth-modal {
+  width: min(420px, 100%);
+  grid-template-rows: auto auto;
+}
+
+.auth-form {
+  display: grid;
+  gap: 12px;
+  padding: 16px;
 }
 
 .modal-head {

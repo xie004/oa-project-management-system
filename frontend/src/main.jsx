@@ -13,8 +13,11 @@ import {
   GitPullRequest,
   GripVertical,
   Kanban,
+  KeyRound,
   LayoutDashboard,
   ListChecks,
+  Lock,
+  LogOut,
   Milestone,
   Plus,
   RefreshCw,
@@ -26,9 +29,18 @@ import {
 import "./styles.css";
 
 const api = {
+  async error(response) {
+    const text = await response.text();
+    try {
+      const data = JSON.parse(text);
+      return data.detail || text;
+    } catch {
+      return text;
+    }
+  },
   async get(path) {
     const response = await fetch(path);
-    if (!response.ok) throw new Error(await response.text());
+    if (!response.ok) throw new Error(await this.error(response));
     return response.json();
   },
   async post(path, body) {
@@ -37,7 +49,7 @@ const api = {
       headers: body ? { "Content-Type": "application/json" } : undefined,
       body: body ? JSON.stringify(body) : undefined
     });
-    if (!response.ok) throw new Error(await response.text());
+    if (!response.ok) throw new Error(await this.error(response));
     return response.json();
   },
   async put(path, body) {
@@ -46,7 +58,7 @@ const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body)
     });
-    if (!response.ok) throw new Error(await response.text());
+    if (!response.ok) throw new Error(await this.error(response));
     return response.json();
   },
   async patch(path, body) {
@@ -55,7 +67,7 @@ const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body)
     });
-    if (!response.ok) throw new Error(await response.text());
+    if (!response.ok) throw new Error(await this.error(response));
     return response.json();
   }
 };
@@ -213,6 +225,59 @@ function PreviewModal({ preview, loading, onClose }) {
           <pre className="preview-text">{preview?.text || preview?.error || "暂无可预览内容"}</pre>
         )}
       </div>
+    </div>
+  );
+}
+
+function LoginModal({ open, onClose, onLogin }) {
+  const [draft, setDraft] = useState({ username: "admin", password: "" });
+  const [error, setError] = useState("");
+  if (!open) return null;
+
+  const submit = async (event) => {
+    event.preventDefault();
+    setError("");
+    const ok = await onLogin(draft);
+    if (!ok) {
+      setError("账号或密码不正确");
+      return;
+    }
+    setDraft({ username: "admin", password: "" });
+  };
+
+  return (
+    <div className="modal-backdrop" role="dialog" aria-modal="true">
+      <form className="modal auth-modal" onSubmit={submit}>
+        <div className="modal-head">
+          <div>
+            <h2>管理员登录</h2>
+            <p>登录后可进入系统设置</p>
+          </div>
+          <button className="icon-button" onClick={onClose} type="button" title="关闭">
+            <X size={18} />
+          </button>
+        </div>
+        <div className="auth-form">
+          <label>
+            账号
+            <input value={draft.username} onChange={(e) => setDraft({ ...draft, username: e.target.value })} autoFocus />
+          </label>
+          <label>
+            密码
+            <input
+              value={draft.password}
+              onChange={(e) => setDraft({ ...draft, password: e.target.value })}
+              type="password"
+              autoComplete="current-password"
+            />
+          </label>
+          {error && <span className="error">{error}</span>}
+          <button className="primary-button" type="submit">
+            <Lock size={16} />
+            登录
+          </button>
+        </div>
+      </form>
     </div>
   );
 }
@@ -1043,7 +1108,9 @@ function WeeklyView({ weekly, onPreview }) {
   );
 }
 
-function SettingsView({ settings, setSettings, onSave, onScan }) {
+function SettingsView({ settings, setSettings, onSave, onScan, onChangePassword }) {
+  const [passwordDraft, setPasswordDraft] = useState({ currentPassword: "", newPassword: "", confirmPassword: "" });
+  const [passwordError, setPasswordError] = useState("");
   const updateType = (key, patch) => {
     setSettings({
       ...settings,
@@ -1052,6 +1119,24 @@ function SettingsView({ settings, setSettings, onSave, onScan }) {
         [key]: { ...settings.monitorTypes[key], ...patch }
       }
     });
+  };
+
+  const submitPassword = async (event) => {
+    event.preventDefault();
+    setPasswordError("");
+    if (!passwordDraft.newPassword || passwordDraft.newPassword.length < 4) {
+      setPasswordError("新密码至少需要 4 位");
+      return;
+    }
+    if (passwordDraft.newPassword !== passwordDraft.confirmPassword) {
+      setPasswordError("两次新密码不一致");
+      return;
+    }
+    const ok = await onChangePassword({
+      currentPassword: passwordDraft.currentPassword,
+      newPassword: passwordDraft.newPassword
+    });
+    if (ok) setPasswordDraft({ currentPassword: "", newPassword: "", confirmPassword: "" });
   };
 
   return (
@@ -1120,6 +1205,45 @@ function SettingsView({ settings, setSettings, onSave, onScan }) {
           ))}
         </div>
       </Section>
+
+      <Section title="管理员密码">
+        <form className="settings-grid password-form" onSubmit={submitPassword}>
+          <label>
+            当前密码
+            <input
+              value={passwordDraft.currentPassword}
+              onChange={(e) => setPasswordDraft({ ...passwordDraft, currentPassword: e.target.value })}
+              type="password"
+              autoComplete="current-password"
+            />
+          </label>
+          <label>
+            新密码
+            <input
+              value={passwordDraft.newPassword}
+              onChange={(e) => setPasswordDraft({ ...passwordDraft, newPassword: e.target.value })}
+              type="password"
+              autoComplete="new-password"
+            />
+          </label>
+          <label>
+            确认新密码
+            <input
+              value={passwordDraft.confirmPassword}
+              onChange={(e) => setPasswordDraft({ ...passwordDraft, confirmPassword: e.target.value })}
+              type="password"
+              autoComplete="new-password"
+            />
+          </label>
+          <div className="password-actions">
+            {passwordError && <span className="error">{passwordError}</span>}
+            <button className="ghost-button" type="submit">
+              <KeyRound size={16} />
+              修改密码
+            </button>
+          </div>
+        </form>
+      </Section>
     </div>
   );
 }
@@ -1135,6 +1259,8 @@ function App() {
   const [suggestions, setSuggestions] = useState([]);
   const [weekly, setWeekly] = useState({});
   const [settings, setSettings] = useState({ monitorTypes: {} });
+  const [auth, setAuth] = useState({ isAdmin: false, username: "" });
+  const [loginOpen, setLoginOpen] = useState(false);
   const [preview, setPreview] = useState(null);
   const [previewLoading, setPreviewLoading] = useState(false);
   const [loading, setLoading] = useState(true);
@@ -1144,7 +1270,7 @@ function App() {
 
   const refresh = async () => {
     setError("");
-    const [dashboard, taskList, milestoneList, meetingList, changeList, documentList, suggestionList, weeklyData, settingData] =
+    const [dashboard, taskList, milestoneList, meetingList, changeList, documentList, suggestionList, weeklyData] =
       await Promise.all([
         api.get("/api/dashboard"),
         api.get("/api/tasks"),
@@ -1153,8 +1279,7 @@ function App() {
         api.get("/api/changes"),
         api.get("/api/documents"),
         api.get("/api/suggestions"),
-        api.get("/api/weekly-summary"),
-        api.get("/api/settings")
+        api.get("/api/weekly-summary")
       ]);
     setDashboardData(dashboard);
     setTasks(taskList);
@@ -1164,14 +1289,34 @@ function App() {
     setDocuments(documentList);
     setSuggestions(suggestionList);
     setWeekly(weeklyData);
-    setSettings(settingData);
+  };
+
+  const refreshAuth = async () => {
+    try {
+      setAuth(await api.get("/api/auth/me"));
+    } catch {
+      setAuth({ isAdmin: false, username: "" });
+    }
+  };
+
+  const loadSettings = async () => {
+    setSettings(await api.get("/api/settings"));
   };
 
   useEffect(() => {
-    refresh()
+    Promise.all([refresh(), refreshAuth()])
       .catch((err) => setError(err.message || "加载失败"))
       .finally(() => setLoading(false));
   }, []);
+
+  useEffect(() => {
+    if (!auth.isAdmin) {
+      setSettings({ monitorTypes: {} });
+      if (active === "settings") setActive("dashboard");
+      return;
+    }
+    loadSettings().catch((err) => setError(err.message || "系统设置加载失败"));
+  }, [auth.isAdmin]);
 
   const runAction = async (action, success) => {
     try {
@@ -1180,13 +1325,48 @@ function App() {
       await action();
       await refresh();
       setNotice(success);
+      return true;
     } catch (err) {
       setError(err.message || "操作失败");
+      return false;
     }
   };
 
   const scanNow = () => runAction(() => api.post("/api/scan"), "扫描完成");
-  const saveSettings = () => runAction(() => api.put("/api/settings", settings), "设置已保存");
+  const saveSettings = async () => {
+    const ok = await runAction(() => api.put("/api/settings", settings), "设置已保存");
+    if (ok) await loadSettings();
+    return ok;
+  };
+  const loginAdmin = async (payload) => {
+    try {
+      setNotice("");
+      setError("");
+      await api.post("/api/auth/login", payload);
+      await refreshAuth();
+      await loadSettings();
+      setLoginOpen(false);
+      setNotice("管理员已登录");
+      return true;
+    } catch (err) {
+      setError(err.message || "登录失败");
+      return false;
+    }
+  };
+  const logoutAdmin = async () => {
+    try {
+      setNotice("");
+      setError("");
+      await api.post("/api/auth/logout");
+      await refreshAuth();
+      setSettings({ monitorTypes: {} });
+      if (active === "settings") setActive("dashboard");
+      setNotice("已退出管理员");
+    } catch (err) {
+      setError(err.message || "退出失败");
+    }
+  };
+  const changeAdminPassword = (payload) => runAction(() => api.post("/api/auth/change-password", payload), "管理员密码已修改");
   const applySuggestion = (id) => runAction(() => api.post(`/api/suggestions/${id}/apply`), "建议已应用");
   const dismissSuggestion = (id) => runAction(() => api.post(`/api/suggestions/${id}/dismiss`), "建议已忽略");
   const createTask = (payload) => runAction(() => api.post("/api/tasks", payload), "任务已新增");
@@ -1231,9 +1411,20 @@ function App() {
     }
     if (active === "documents") return <DocumentsView documents={documents} onPreview={openPreview} />;
     if (active === "weekly") return <WeeklyView weekly={weekly} onPreview={openPreview} />;
-    if (active === "settings") return <SettingsView settings={settings} setSettings={setSettings} onSave={saveSettings} onScan={scanNow} />;
+    if (active === "settings" && auth.isAdmin) {
+      return (
+        <SettingsView
+          settings={settings}
+          setSettings={setSettings}
+          onSave={saveSettings}
+          onScan={scanNow}
+          onChangePassword={changeAdminPassword}
+        />
+      );
+    }
     return null;
   };
+  const visibleNavItems = navItems.filter((item) => item.id !== "settings" || auth.isAdmin);
 
   return (
     <div className="app-shell">
@@ -1246,7 +1437,7 @@ function App() {
           </div>
         </div>
         <nav>
-          {navItems.map((item) => {
+          {visibleNavItems.map((item) => {
             const Icon = item.icon;
             return (
               <button className={active === item.id ? "active" : ""} key={item.id} onClick={() => setActive(item.id)}>
@@ -1256,12 +1447,25 @@ function App() {
             );
           })}
         </nav>
+        <div className="sidebar-footer">
+          {auth.isAdmin ? (
+            <button className="sidebar-auth-button" onClick={logoutAdmin} title="退出管理员">
+              <LogOut size={13} />
+              退出管理员
+            </button>
+          ) : (
+            <button className="sidebar-auth-button" onClick={() => setLoginOpen(true)} title="管理员登录">
+              <Lock size={13} />
+              管理员登录
+            </button>
+          )}
+        </div>
       </aside>
       <main>
         <header className="topbar">
           <div>
             <div className="eyebrow">国产化OA集成项目管理系统</div>
-            <h1>{navItems.find((item) => item.id === active)?.label || "项目管理"}</h1>
+            <h1>{visibleNavItems.find((item) => item.id === active)?.label || "项目管理"}</h1>
           </div>
           <div className="top-actions">
             {notice && <span className="notice">{notice}</span>}
@@ -1280,6 +1484,7 @@ function App() {
         {content()}
       </main>
       <PreviewModal preview={preview} loading={previewLoading} onClose={() => setPreview(null)} />
+      <LoginModal open={loginOpen} onClose={() => setLoginOpen(false)} onLogin={loginAdmin} />
     </div>
   );
 }
