@@ -8,7 +8,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.auth import (
     SESSION_COOKIE_NAME,
@@ -22,6 +22,7 @@ from app.auth import (
 )
 from app.database import (
     DEFAULT_MONITOR_ROOT,
+    DEFAULT_INTELLIGENT_ANALYSIS,
     SYSTEM_ROOT,
     get_connection,
     get_setting,
@@ -59,6 +60,7 @@ class SettingsPayload(BaseModel):
     systemName: str
     defaultMonitorDir: str
     monitorTypes: dict[str, dict[str, Any]]
+    intelligentAnalysis: dict[str, Any] = Field(default_factory=dict)
 
 
 class LoginPayload(BaseModel):
@@ -85,6 +87,21 @@ class TaskPayload(BaseModel):
 
 class GenericPatchPayload(BaseModel):
     values: dict[str, Any]
+
+
+def merge_intelligent_analysis_config(payload: dict[str, Any]) -> dict[str, Any]:
+    config = {**DEFAULT_INTELLIGENT_ANALYSIS, **(payload or {})}
+    config["enabled"] = bool(config.get("enabled"))
+    config["reviewOnly"] = bool(config.get("reviewOnly", True))
+    config["allowExternalService"] = bool(config.get("allowExternalService"))
+    for key in ["timeoutSeconds", "maxTextLength"]:
+        try:
+            config[key] = int(config.get(key) or DEFAULT_INTELLIGENT_ANALYSIS[key])
+        except (TypeError, ValueError):
+            config[key] = DEFAULT_INTELLIGENT_ANALYSIS[key]
+    config["timeoutSeconds"] = max(10, min(300, config["timeoutSeconds"]))
+    config["maxTextLength"] = max(1000, min(80000, config["maxTextLength"]))
+    return config
 
 
 @app.on_event("startup")
@@ -150,6 +167,7 @@ def get_settings(_: dict[str, Any] = Depends(admin_from_request)) -> dict[str, A
             "systemName": get_setting(conn, "system_name", "国产化OA集成项目管理系统"),
             "defaultMonitorDir": get_setting(conn, "default_monitor_dir", str(DEFAULT_MONITOR_ROOT)),
             "monitorTypes": get_setting(conn, "monitor_types", {}),
+            "intelligentAnalysis": get_setting(conn, "intelligent_analysis", DEFAULT_INTELLIGENT_ANALYSIS),
             "lastScanAt": get_setting(conn, "last_scan_at", ""),
         }
     finally:
@@ -163,6 +181,7 @@ def update_settings(payload: SettingsPayload, _: dict[str, Any] = Depends(admin_
         set_setting(conn, "system_name", payload.systemName)
         set_setting(conn, "default_monitor_dir", payload.defaultMonitorDir)
         set_setting(conn, "monitor_types", payload.monitorTypes)
+        set_setting(conn, "intelligent_analysis", merge_intelligent_analysis_config(payload.intelligentAnalysis))
         conn.execute(
             "UPDATE project_profile SET system_name = ?, updated_at = ? WHERE id = 1",
             (payload.systemName, now_iso()),
@@ -277,6 +296,10 @@ def dashboard() -> dict[str, Any]:
             "documents": conn.execute("SELECT COUNT(*) AS c FROM documents").fetchone()["c"],
             "pendingSuggestions": conn.execute(
                 "SELECT COUNT(*) AS c FROM update_suggestions WHERE status = 'pending'"
+            ).fetchone()["c"],
+            "deliverables": conn.execute("SELECT COUNT(*) AS c FROM deliverables").fetchone()["c"],
+            "submittedDeliverables": conn.execute(
+                "SELECT COUNT(*) AS c FROM deliverables WHERE status = 'submitted'"
             ).fetchone()["c"],
         }
         profile["overall_progress"] = progress_from_tasks(tasks)
@@ -458,6 +481,60 @@ def get_risks() -> list[dict[str, Any]]:
 @app.get("/api/documents")
 def get_documents() -> list[dict[str, Any]]:
     return list_documents()
+
+
+@app.get("/api/deliverables")
+def get_deliverables() -> list[dict[str, Any]]:
+    conn = get_connection()
+    try:
+        return rows_to_dicts(
+            conn.execute(
+                """
+                SELECT
+                    dv.*,
+                    d.name AS document_name,
+                    d.path AS document_path,
+                    d.modified_at AS document_modified_at
+                FROM deliverables dv
+                LEFT JOIN documents d ON d.id = dv.document_id
+                ORDER BY dv.sort_order, dv.id
+                """
+            ).fetchall()
+        )
+    finally:
+        conn.close()
+
+
+@app.patch("/api/deliverables/{deliverable_id}")
+def update_deliverable(deliverable_id: int, payload: GenericPatchPayload) -> dict[str, Any]:
+    allowed = {
+        "name",
+        "requirement_source",
+        "description",
+        "status",
+        "owner",
+        "planned_date",
+        "submitted_date",
+        "document_id",
+    }
+    values = {key: value for key, value in payload.values.items() if key in allowed}
+    if "status" in values and values["status"] not in {"not_started", "draft", "review", "finalized", "submitted"}:
+        raise HTTPException(status_code=400, detail="交付物状态不正确。")
+    if "document_id" in values and values["document_id"] in ("", None):
+        values["document_id"] = None
+    if not values:
+        return {"ok": True}
+    conn = get_connection()
+    try:
+        assignments = ", ".join([f"{key} = ?" for key in values])
+        conn.execute(
+            f"UPDATE deliverables SET {assignments}, updated_at = ? WHERE id = ?",
+            [*values.values(), now_iso(), deliverable_id],
+        )
+        conn.commit()
+        return {"ok": True}
+    finally:
+        conn.close()
 
 
 @app.get("/api/documents/{document_id}/preview")

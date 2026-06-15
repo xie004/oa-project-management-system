@@ -18,6 +18,93 @@ DEFAULT_MONITOR_ROOT = Path(
 
 PROJECT_PLAN_VERSION = "2026-06-09-refined-from-project-files"
 
+DEFAULT_INTELLIGENT_ANALYSIS = {
+    "enabled": False,
+    "provider": "openai_compatible",
+    "apiBaseUrl": "",
+    "apiKey": "",
+    "modelName": "",
+    "timeoutSeconds": 60,
+    "maxTextLength": 12000,
+    "reviewOnly": True,
+    "allowExternalService": False,
+}
+
+DEFAULT_DELIVERABLES = [
+    (
+        "需求分析报告",
+        "合同/招标要求",
+        "梳理项目建设目标、业务需求、流程范围、系统集成需求和验收口径。",
+        "项目经理",
+    ),
+    (
+        "总体实施方案",
+        "合同/实施管理",
+        "明确实施组织、阶段计划、部署策略、迁移策略、联调测试和上线安排。",
+        "实施单位",
+    ),
+    (
+        "测试报告",
+        "验收要求",
+        "覆盖功能测试、集成测试、回归测试、UAT 问题闭环和测试结论。",
+        "实施单位",
+    ),
+    (
+        "数据字典",
+        "验收要求",
+        "整理核心业务数据结构、接口字段、流程表单字段和数据交换字段说明。",
+        "实施单位",
+    ),
+    (
+        "操作手册",
+        "培训/验收要求",
+        "面向普通用户、审批人员和管理员的系统操作说明。",
+        "实施单位",
+    ),
+    (
+        "安装/运维手册",
+        "运维移交要求",
+        "说明部署架构、安装步骤、配置项、备份恢复、巡检和常见故障处理。",
+        "实施单位",
+    ),
+    (
+        "数据迁移一致性校验报告",
+        "验收硬指标",
+        "说明迁移范围、抽检方法、校验结果、差异处理和最终结论。",
+        "实施单位",
+    ),
+    (
+        "等保测评报告",
+        "安全测评要求",
+        "完成不低于二级等保测评相关材料和测评报告归档。",
+        "测评单位/实施单位",
+    ),
+    (
+        "软件测评报告",
+        "验收要求",
+        "完成第三方或内部软件测评材料、问题整改和测评结论归档。",
+        "测评单位/实施单位",
+    ),
+    (
+        "上线切换方案",
+        "上线管理要求",
+        "包含上线步骤、回退预案、应急联系人、停机窗口和试运行安排。",
+        "项目经理",
+    ),
+    (
+        "培训材料与培训签到",
+        "培训/验收要求",
+        "沉淀用户培训课件、培训记录、签到表和培训问题反馈。",
+        "实施单位",
+    ),
+    (
+        "验收报告",
+        "验收硬指标",
+        "形成验收申请、验收意见、问题闭环、验收结论和签字盖章材料。",
+        "项目经理",
+    ),
+]
+
 PROJECT_GOALS = [
     "建设国产化协同办公平台，覆盖公文、流程表单、行政办公、财务预算报销、项目/采购、人事、会议日程、移动办公等协同办公场景。",
     "完成 OA、档案管理、电子签章及国产化基础软件环境的一体化部署，支持本地私有化部署、国产操作系统/数据库/中间件、统一身份认证和移动端使用。",
@@ -452,14 +539,31 @@ def init_db() -> None:
                 applied_at TEXT
             );
 
+            CREATE TABLE IF NOT EXISTS deliverables (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                requirement_source TEXT,
+                description TEXT,
+                status TEXT NOT NULL DEFAULT 'not_started',
+                owner TEXT,
+                planned_date TEXT,
+                submitted_date TEXT,
+                document_id INTEGER REFERENCES documents(id) ON DELETE SET NULL,
+                sort_order INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
             CREATE INDEX IF NOT EXISTS idx_documents_category ON documents(doc_category);
             CREATE INDEX IF NOT EXISTS idx_suggestions_status ON update_suggestions(status);
             CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
             CREATE INDEX IF NOT EXISTS idx_milestones_status ON milestones(status);
+            CREATE INDEX IF NOT EXISTS idx_deliverables_status ON deliverables(status);
             """
         )
         seed_defaults(conn)
         ensure_project_plan(conn)
+        ensure_deliverables(conn)
         conn.commit()
     finally:
         conn.close()
@@ -474,6 +578,8 @@ def seed_defaults(conn: sqlite3.Connection) -> None:
         set_setting(conn, "monitor_types", default_monitor_types(DEFAULT_MONITOR_ROOT))
         set_setting(conn, "ignored_directories", ["oa-project-management-system", ".venv", "node_modules", "dist"])
         set_setting(conn, "last_scan_at", "")
+    if get_setting(conn, "intelligent_analysis") is None:
+        set_setting(conn, "intelligent_analysis", DEFAULT_INTELLIGENT_ANALYSIS)
 
     profile = conn.execute("SELECT id FROM project_profile WHERE id = 1").fetchone()
     if not profile:
@@ -559,6 +665,22 @@ def seed_defaults(conn: sqlite3.Connection) -> None:
                 now,
             ),
         )
+
+
+def ensure_deliverables(conn: sqlite3.Connection) -> None:
+    if conn.execute("SELECT COUNT(*) AS c FROM deliverables").fetchone()["c"] > 0:
+        return
+    now = now_iso()
+    conn.executemany(
+        """
+        INSERT INTO deliverables(
+            name, requirement_source, description, status, owner, planned_date,
+            submitted_date, document_id, sort_order, created_at, updated_at
+        )
+        VALUES(?, ?, ?, 'not_started', ?, '', '', NULL, ?, ?, ?)
+        """,
+        [(*item, index + 1, now, now) for index, item in enumerate(DEFAULT_DELIVERABLES)],
+    )
 
 
 def ensure_project_plan(conn: sqlite3.Connection) -> None:

@@ -382,7 +382,7 @@ main {
 
 .stats-grid {
   display: grid;
-  grid-template-columns: repeat(6, minmax(130px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(126px, 1fr));
   gap: 12px;
 }
 
@@ -1163,6 +1163,48 @@ th {
   gap: 12px;
 }
 
+.analysis-settings-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(180px, 1fr));
+  gap: 12px;
+  align-items: end;
+}
+
+.analysis-switch-card {
+  grid-column: span 2;
+}
+
+.analysis-switch-card p {
+  margin: 10px 0 0;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.checkbox-row {
+  min-height: 36px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.checkbox-row input {
+  width: auto;
+  min-height: 0;
+}
+
+.deliverable-stats {
+  grid-template-columns: repeat(4, minmax(160px, 1fr));
+}
+
+.deliverable-file-cell {
+  min-width: 260px;
+}
+
+.deliverable-file-cell select {
+  margin-bottom: 6px;
+}
+
 .monitor-item {
   padding: 14px;
   display: grid;
@@ -1304,8 +1346,13 @@ th {
 
   .two-col,
   .monitor-grid,
+  .analysis-settings-grid,
   .goal-grid {
     grid-template-columns: 1fr;
+  }
+
+  .analysis-switch-card {
+    grid-column: span 1;
   }
 
   .plan-strip,

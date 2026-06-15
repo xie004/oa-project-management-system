@@ -5,6 +5,7 @@ import {
   CalendarDays,
   Check,
   Circle,
+  ClipboardCheck,
   Download,
   FileText,
   Flag,
@@ -81,6 +82,7 @@ const navItems = [
   { id: "changes", label: "变更需求", icon: GitPullRequest },
   { id: "suggestions", label: "智能建议", icon: Sparkles },
   { id: "documents", label: "资料台账", icon: FolderCog },
+  { id: "deliverables", label: "交付物清单", icon: ClipboardCheck },
   { id: "weekly", label: "周报汇总", icon: ListChecks },
   { id: "settings", label: "系统设置", icon: Settings }
 ];
@@ -96,7 +98,11 @@ const statusText = {
   open: "未关闭",
   closed: "已关闭",
   applied: "已应用",
-  dismissed: "已忽略"
+  dismissed: "已忽略",
+  draft: "草稿",
+  review: "评审中",
+  finalized: "已定稿",
+  submitted: "已提交"
 };
 
 const colorText = {
@@ -375,6 +381,18 @@ const taskStatusColors = {
   delayed: "#c24135",
   not_started: "#64748b",
   other: "#475569"
+};
+
+const defaultIntelligentAnalysis = {
+  enabled: false,
+  provider: "openai_compatible",
+  apiBaseUrl: "",
+  apiKey: "",
+  modelName: "",
+  timeoutSeconds: 60,
+  maxTextLength: 12000,
+  reviewOnly: true,
+  allowExternalService: false
 };
 
 function clampSpan(value) {
@@ -749,6 +767,7 @@ function Dashboard({ data, onScan, onPreview, resetLayoutSignal }) {
         <Stat label="开放风险" value={data.counts?.openRisks || 0} icon={AlertTriangle} tone="amber" />
         <Stat label="待确认建议" value={data.counts?.pendingSuggestions || 0} icon={Sparkles} tone="red" />
         <Stat label="里程碑" value={data.counts?.milestones || 0} icon={Flag} tone="neutral" />
+        <Stat label="交付物" value={`${data.counts?.submittedDeliverables || 0}/${data.counts?.deliverables || 0}`} icon={ClipboardCheck} tone="green" />
         <Stat label="资料文件" value={data.counts?.documents || 0} icon={FolderCog} tone="neutral" />
       </div>
 
@@ -1052,6 +1071,87 @@ function DocumentsView({ documents, onPreview }) {
   );
 }
 
+const deliverableStatuses = [
+  ["not_started", "未开始", "neutral"],
+  ["draft", "草稿", "blue"],
+  ["review", "评审中", "amber"],
+  ["finalized", "已定稿", "green"],
+  ["submitted", "已提交", "green"]
+];
+
+function DeliverablesView({ deliverables, documents, onPatch, onPreview }) {
+  const total = deliverables.length;
+  const submitted = deliverables.filter((item) => item.status === "submitted").length;
+  const ready = deliverables.filter((item) => ["finalized", "submitted"].includes(item.status)).length;
+  const linked = deliverables.filter((item) => item.document_id).length;
+
+  return (
+    <div className="view-grid">
+      <div className="stats-grid deliverable-stats">
+        <Stat label="交付物总数" value={total} icon={ClipboardCheck} tone="blue" />
+        <Stat label="已提交" value={submitted} icon={Check} tone="green" />
+        <Stat label="已定稿/已提交" value={ready} icon={Flag} tone="amber" />
+        <Stat label="已关联文件" value={linked} icon={FolderCog} tone="neutral" />
+      </div>
+      <Section title="交付物台账">
+        <div className="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>交付物</th>
+                <th>依据</th>
+                <th>状态</th>
+                <th>责任人</th>
+                <th>计划日期</th>
+                <th>提交日期</th>
+                <th>关联文件</th>
+              </tr>
+            </thead>
+            <tbody>
+              {deliverables.map((item) => (
+                <tr key={item.id}>
+                  <td className="wide-cell">
+                    <strong>{item.name}</strong>
+                    <p>{item.description}</p>
+                  </td>
+                  <td>{item.requirement_source || "-"}</td>
+                  <td>
+                    <select value={item.status} onChange={(e) => onPatch(item.id, { status: e.target.value })}>
+                      {deliverableStatuses.map(([value, label]) => <option value={value} key={value}>{label}</option>)}
+                    </select>
+                  </td>
+                  <td>
+                    <input value={item.owner || ""} onChange={(e) => onPatch(item.id, { owner: e.target.value })} />
+                  </td>
+                  <td>
+                    <input type="date" value={item.planned_date || ""} onChange={(e) => onPatch(item.id, { planned_date: e.target.value })} />
+                  </td>
+                  <td>
+                    <input type="date" value={item.submitted_date || ""} onChange={(e) => onPatch(item.id, { submitted_date: e.target.value })} />
+                  </td>
+                  <td className="deliverable-file-cell">
+                    <select
+                      value={item.document_id || ""}
+                      onChange={(e) => onPatch(item.id, { document_id: e.target.value ? Number(e.target.value) : null })}
+                    >
+                      <option value="">未关联</option>
+                      {documents.map((doc) => <option value={doc.id} key={doc.id}>{doc.name}</option>)}
+                    </select>
+                    {item.document_name && (
+                      <FileButton documentId={item.document_id} name={item.document_name} onPreview={onPreview} />
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          {!deliverables.length && <Empty />}
+        </div>
+      </Section>
+    </div>
+  );
+}
+
 function WeeklyView({ weekly, onPreview }) {
   const latest = weekly.latest_weekly || {};
   const profile = weekly.profile || {};
@@ -1111,12 +1211,22 @@ function WeeklyView({ weekly, onPreview }) {
 function SettingsView({ settings, setSettings, onSave, onScan, onChangePassword }) {
   const [passwordDraft, setPasswordDraft] = useState({ currentPassword: "", newPassword: "", confirmPassword: "" });
   const [passwordError, setPasswordError] = useState("");
+  const intelligentAnalysis = { ...defaultIntelligentAnalysis, ...(settings.intelligentAnalysis || {}) };
   const updateType = (key, patch) => {
     setSettings({
       ...settings,
       monitorTypes: {
         ...settings.monitorTypes,
         [key]: { ...settings.monitorTypes[key], ...patch }
+      }
+    });
+  };
+  const updateAnalysis = (patch) => {
+    setSettings({
+      ...settings,
+      intelligentAnalysis: {
+        ...intelligentAnalysis,
+        ...patch
       }
     });
   };
@@ -1167,6 +1277,95 @@ function SettingsView({ settings, setSettings, onSave, onScan, onChangePassword 
               value={settings.defaultMonitorDir || ""}
               onChange={(e) => setSettings({ ...settings, defaultMonitorDir: e.target.value })}
             />
+          </label>
+        </div>
+      </Section>
+
+      <Section title="智能文件分析">
+        <div className="analysis-settings-grid">
+          <div className="monitor-item analysis-switch-card">
+            <div className="monitor-head">
+              <strong>启用智能分析</strong>
+              <label className="switch">
+                <input
+                  type="checkbox"
+                  checked={!!intelligentAnalysis.enabled}
+                  onChange={(e) => updateAnalysis({ enabled: e.target.checked })}
+                />
+                <span />
+              </label>
+            </div>
+            <p>启用后可在后续扫描流程中调用模型，生成待确认的任务、风险、里程碑、交付物更新建议。</p>
+          </div>
+          <label>
+            模型服务类型
+            <select value={intelligentAnalysis.provider} onChange={(e) => updateAnalysis({ provider: e.target.value })}>
+              <option value="openai_compatible">兼容 OpenAI API</option>
+              <option value="local">本地模型服务</option>
+              <option value="custom">自定义服务</option>
+            </select>
+          </label>
+          <label>
+            API 地址
+            <input
+              value={intelligentAnalysis.apiBaseUrl || ""}
+              onChange={(e) => updateAnalysis({ apiBaseUrl: e.target.value })}
+              placeholder="例如 http://localhost:11434/v1 或 https://.../v1"
+            />
+          </label>
+          <label>
+            API Key
+            <input
+              value={intelligentAnalysis.apiKey || ""}
+              onChange={(e) => updateAnalysis({ apiKey: e.target.value })}
+              type="password"
+              autoComplete="new-password"
+            />
+          </label>
+          <label>
+            模型名称
+            <input
+              value={intelligentAnalysis.modelName || ""}
+              onChange={(e) => updateAnalysis({ modelName: e.target.value })}
+              placeholder="例如 gpt-4.1-mini / qwen..."
+            />
+          </label>
+          <label>
+            超时时间（秒）
+            <input
+              type="number"
+              min="10"
+              max="300"
+              value={intelligentAnalysis.timeoutSeconds || 60}
+              onChange={(e) => updateAnalysis({ timeoutSeconds: Number(e.target.value) })}
+            />
+          </label>
+          <label>
+            单次最大文本长度
+            <input
+              type="number"
+              min="1000"
+              max="80000"
+              step="1000"
+              value={intelligentAnalysis.maxTextLength || 12000}
+              onChange={(e) => updateAnalysis({ maxTextLength: Number(e.target.value) })}
+            />
+          </label>
+          <label className="checkbox-row">
+            <input
+              type="checkbox"
+              checked={!!intelligentAnalysis.reviewOnly}
+              onChange={(e) => updateAnalysis({ reviewOnly: e.target.checked })}
+            />
+            仅生成待确认建议
+          </label>
+          <label className="checkbox-row">
+            <input
+              type="checkbox"
+              checked={!!intelligentAnalysis.allowExternalService}
+              onChange={(e) => updateAnalysis({ allowExternalService: e.target.checked })}
+            />
+            允许发送内容到外部模型服务
           </label>
         </div>
       </Section>
@@ -1256,6 +1455,7 @@ function App() {
   const [meetings, setMeetings] = useState([]);
   const [changes, setChanges] = useState([]);
   const [documents, setDocuments] = useState([]);
+  const [deliverables, setDeliverables] = useState([]);
   const [suggestions, setSuggestions] = useState([]);
   const [weekly, setWeekly] = useState({});
   const [settings, setSettings] = useState({ monitorTypes: {} });
@@ -1270,7 +1470,7 @@ function App() {
 
   const refresh = async () => {
     setError("");
-    const [dashboard, taskList, milestoneList, meetingList, changeList, documentList, suggestionList, weeklyData] =
+    const [dashboard, taskList, milestoneList, meetingList, changeList, documentList, deliverableList, suggestionList, weeklyData] =
       await Promise.all([
         api.get("/api/dashboard"),
         api.get("/api/tasks"),
@@ -1278,6 +1478,7 @@ function App() {
         api.get("/api/meetings"),
         api.get("/api/changes"),
         api.get("/api/documents"),
+        api.get("/api/deliverables"),
         api.get("/api/suggestions"),
         api.get("/api/weekly-summary")
       ]);
@@ -1287,6 +1488,7 @@ function App() {
     setMeetings(meetingList);
     setChanges(changeList);
     setDocuments(documentList);
+    setDeliverables(deliverableList);
     setSuggestions(suggestionList);
     setWeekly(weeklyData);
   };
@@ -1371,6 +1573,7 @@ function App() {
   const dismissSuggestion = (id) => runAction(() => api.post(`/api/suggestions/${id}/dismiss`), "建议已忽略");
   const createTask = (payload) => runAction(() => api.post("/api/tasks", payload), "任务已新增");
   const patchTask = (id, values) => runAction(() => api.patch(`/api/tasks/${id}`, { values }), "任务已更新");
+  const patchDeliverable = (id, values) => runAction(() => api.patch(`/api/deliverables/${id}`, { values }), "交付物已更新");
   const openPreview = async (documentId) => {
     if (!documentId) return;
     try {
@@ -1410,6 +1613,9 @@ function App() {
       return <SuggestionsView suggestions={suggestions} onApply={applySuggestion} onDismiss={dismissSuggestion} onPreview={openPreview} />;
     }
     if (active === "documents") return <DocumentsView documents={documents} onPreview={openPreview} />;
+    if (active === "deliverables") {
+      return <DeliverablesView deliverables={deliverables} documents={documents} onPatch={patchDeliverable} onPreview={openPreview} />;
+    }
     if (active === "weekly") return <WeeklyView weekly={weekly} onPreview={openPreview} />;
     if (active === "settings" && auth.isAdmin) {
       return (
