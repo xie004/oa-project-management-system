@@ -979,6 +979,13 @@ main {
   margin-bottom: 12px;
 }
 
+.model-picker {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 10px;
+  align-items: end;
+}
+
 .knowledge-status-grid {
   display: grid;
   grid-template-columns: repeat(4, minmax(140px, 1fr));
@@ -1411,6 +1418,7 @@ th {
   .task-form,
   .settings-grid,
   .qa-form,
+  .model-picker,
   .knowledge-status-grid {
     grid-template-columns: 1fr 1fr;
   }
@@ -1470,6 +1478,7 @@ th {
   .task-form,
   .settings-grid,
   .qa-form,
+  .model-picker,
   .knowledge-status-grid {
     grid-template-columns: 1fr;
   }

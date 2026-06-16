@@ -1281,7 +1281,19 @@ function QAView({ onPreview }) {
   );
 }
 
-function SettingsView({ settings, setSettings, onSave, onScan, onChangePassword, onTestModel, modelTest, onRebuildKnowledge, knowledgeStatus }) {
+function SettingsView({
+  settings,
+  setSettings,
+  onSave,
+  onScan,
+  onChangePassword,
+  onTestModel,
+  modelTest,
+  onLoadModels,
+  modelList,
+  onRebuildKnowledge,
+  knowledgeStatus
+}) {
   const [passwordDraft, setPasswordDraft] = useState({ currentPassword: "", newPassword: "", confirmPassword: "" });
   const [passwordError, setPasswordError] = useState("");
   const intelligentAnalysis = { ...defaultIntelligentAnalysis, ...(settings.intelligentAnalysis || {}) };
@@ -1360,7 +1372,11 @@ function SettingsView({ settings, setSettings, onSave, onScan, onChangePassword,
             <Sparkles size={16} />
             测试连接
           </button>
-          {modelTest && <span className={modelTest.ok ? "notice" : "error"}>{modelTest.ok ? `连接正常：${modelTest.elapsedMs}ms` : modelTest.error}</span>}
+          {modelTest && (
+            <span className={modelTest.ok ? "notice" : "error"}>
+              {modelTest.ok ? `连接正常：${modelTest.modelName || "已自动选择模型"}，${modelTest.elapsedMs}ms` : modelTest.error}
+            </span>
+          )}
         </div>
         <div className="analysis-settings-grid">
           <div className="monitor-item analysis-switch-card">
@@ -1407,9 +1423,25 @@ function SettingsView({ settings, setSettings, onSave, onScan, onChangePassword,
             <input
               value={intelligentAnalysis.modelName || ""}
               onChange={(e) => updateAnalysis({ modelName: e.target.value })}
-              placeholder="例如 gpt-4.1-mini / qwen..."
+              placeholder="可留空，测试时自动读取 /models 的第一个模型"
             />
           </label>
+          <div className="model-picker">
+            <button className="ghost-button" onClick={onLoadModels} type="button">
+              <RefreshCw size={16} />
+              读取模型
+            </button>
+            <select
+              value={intelligentAnalysis.modelName || ""}
+              onChange={(e) => updateAnalysis({ modelName: e.target.value })}
+              disabled={!modelList.length}
+            >
+              <option value="">{modelList.length ? "自动选择第一个模型" : "尚未读取模型"}</option>
+              {modelList.map((model) => (
+                <option value={model.id} key={model.id}>{model.id}</option>
+              ))}
+            </select>
+          </div>
           <label>
             超时时间（秒）
             <input
@@ -1654,6 +1686,7 @@ function App() {
   const [weekly, setWeekly] = useState({});
   const [settings, setSettings] = useState({ monitorTypes: {} });
   const [modelTest, setModelTest] = useState(null);
+  const [modelList, setModelList] = useState([]);
   const [knowledgeStatus, setKnowledgeStatus] = useState({});
   const [auth, setAuth] = useState({ isAdmin: false, username: "" });
   const [loginOpen, setLoginOpen] = useState(false);
@@ -1777,6 +1810,26 @@ function App() {
       setModelTest({ ok: false, error: err.message || "测试失败" });
     }
   };
+  const loadModels = async () => {
+    try {
+      setError("");
+      const data = await api.get("/api/ai/models");
+      setModelList(data.models || []);
+      const intelligentAnalysis = { ...defaultIntelligentAnalysis, ...(settings.intelligentAnalysis || {}) };
+      if (!intelligentAnalysis.modelName && data.defaultModel) {
+        setSettings({
+          ...settings,
+          intelligentAnalysis: {
+            ...intelligentAnalysis,
+            modelName: data.defaultModel
+          }
+        });
+      }
+      setNotice(data.models?.length ? `已读取 ${data.models.length} 个模型` : "未读取到可用模型");
+    } catch (err) {
+      setError(err.message || "读取模型失败");
+    }
+  };
   const rebuildKnowledge = async () => {
     const ok = await runAction(() => api.post("/api/knowledge/rebuild"), "知识库索引已重建");
     if (ok) await loadKnowledgeStatus();
@@ -1840,6 +1893,8 @@ function App() {
           onChangePassword={changeAdminPassword}
           onTestModel={testModel}
           modelTest={modelTest}
+          onLoadModels={loadModels}
+          modelList={modelList}
           onRebuildKnowledge={rebuildKnowledge}
           knowledgeStatus={knowledgeStatus}
         />

@@ -34,7 +34,7 @@ from app.database import (
 )
 from app.services.exporter import build_weekly_summary, export_weekly_docx
 from app.services.extractors import extract_text
-from app.services.ai import answer_question, knowledge_status, rebuild_knowledge, test_chat_model
+from app.services.ai import answer_question, knowledge_status, list_chat_models, rebuild_knowledge, test_chat_model
 from app.services.scanner import (
     apply_suggestion,
     dismiss_suggestion,
@@ -208,6 +208,11 @@ def scan(force: bool = True) -> dict[str, Any]:
 @app.post("/api/ai/test")
 def ai_test(_: dict[str, Any] = Depends(admin_from_request)) -> dict[str, Any]:
     return test_chat_model()
+
+
+@app.get("/api/ai/models")
+def ai_models(_: dict[str, Any] = Depends(admin_from_request)) -> dict[str, Any]:
+    return list_chat_models()
 
 
 @app.get("/api/knowledge/status")

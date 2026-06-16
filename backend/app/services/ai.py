@@ -42,9 +42,22 @@ def _url(base: str, endpoint: str) -> str:
     base = (base or "").rstrip("/")
     if not base:
         raise ValueError("API 地址未配置")
-    if base.endswith(endpoint):
+    if base.endswith(endpoint) or base.endswith(f"/v1{endpoint}"):
         return base
     return f"{base}{endpoint}"
+
+
+def _get_json(url: str, api_key: str = "", timeout: int = 60) -> dict[str, Any]:
+    headers = {"Accept": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    request = urllib.request.Request(url, headers=headers, method="GET")
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="ignore")
+        raise RuntimeError(f"模型服务返回 {exc.code}: {detail}") from exc
 
 
 def _post_json(url: str, payload: dict[str, Any], api_key: str = "", timeout: int = 60) -> dict[str, Any]:
@@ -65,6 +78,32 @@ def _post_json(url: str, payload: dict[str, Any], api_key: str = "", timeout: in
         raise RuntimeError(f"模型服务返回 {exc.code}: {detail}") from exc
 
 
+def list_chat_models(config: dict[str, Any] | None = None) -> dict[str, Any]:
+    config = {**DEFAULT_INTELLIGENT_ANALYSIS, **(config or ai_config())}
+    if not config.get("apiBaseUrl"):
+        raise ValueError("聊天模型 API 地址未配置")
+    started = time.perf_counter()
+    data = _get_json(
+        _url(config["apiBaseUrl"], "/models"),
+        config.get("apiKey", ""),
+        int(config.get("timeoutSeconds") or 60),
+    )
+    raw_models = data.get("data") if isinstance(data, dict) else []
+    models = []
+    if isinstance(raw_models, list):
+        for item in raw_models:
+            if isinstance(item, dict) and item.get("id"):
+                models.append({"id": str(item["id"]), "ownedBy": item.get("owned_by", "")})
+            elif isinstance(item, str):
+                models.append({"id": item, "ownedBy": ""})
+    return {
+        "ok": True,
+        "models": models,
+        "defaultModel": models[0]["id"] if models else "",
+        "elapsedMs": round((time.perf_counter() - started) * 1000),
+    }
+
+
 def _field_path(data: Any, path: str) -> Any:
     current = data
     for part in (path or "").split("."):
@@ -79,10 +118,13 @@ def _field_path(data: Any, path: str) -> Any:
 
 def chat_completion(messages: list[dict[str, str]], config: dict[str, Any] | None = None) -> str:
     config = {**DEFAULT_INTELLIGENT_ANALYSIS, **(config or ai_config())}
-    if not config.get("apiBaseUrl") or not config.get("modelName"):
-        raise ValueError("聊天模型 API 地址或模型名称未配置")
+    if not config.get("apiBaseUrl"):
+        raise ValueError("聊天模型 API 地址未配置")
+    model_name = config.get("modelName") or list_chat_models(config).get("defaultModel")
+    if not model_name:
+        raise ValueError("聊天模型名称未配置，且未能从 /models 自动读取模型")
     payload = {
-        "model": config["modelName"],
+        "model": model_name,
         "messages": messages,
         "temperature": 0.2,
     }
@@ -98,13 +140,20 @@ def chat_completion(messages: list[dict[str, str]], config: dict[str, Any] | Non
 def test_chat_model() -> dict[str, Any]:
     started = time.perf_counter()
     try:
+        models = list_chat_models()
         answer = chat_completion(
             [
                 {"role": "system", "content": "你是项目管理系统的模型连通性测试助手。"},
                 {"role": "user", "content": "请用一句中文回复：模型连接正常。"},
             ]
         )
-        return {"ok": True, "answer": answer, "elapsedMs": round((time.perf_counter() - started) * 1000)}
+        return {
+            "ok": True,
+            "answer": answer,
+            "models": models.get("models", []),
+            "modelName": ai_config().get("modelName") or models.get("defaultModel", ""),
+            "elapsedMs": round((time.perf_counter() - started) * 1000),
+        }
     except Exception as exc:
         return {"ok": False, "answer": "", "elapsedMs": round((time.perf_counter() - started) * 1000), "error": str(exc)}
 
