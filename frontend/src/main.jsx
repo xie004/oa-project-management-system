@@ -1254,11 +1254,20 @@ function QAView({ onPreview }) {
             placeholder="请输入与项目资料相关的问题"
           />
           <button className="primary-button" type="submit" disabled={loading}>
-            <MessageSquareText size={16} />
+            {loading ? <span className="button-spinner" /> : <MessageSquareText size={16} />}
             {loading ? "查询中" : "提问"}
           </button>
         </form>
       </Section>
+      {loading && (
+        <div className="qa-loading">
+          <span className="qa-spinner" />
+          <div>
+            <strong>正在检索项目资料并生成回答</strong>
+            <p>已进入知识库召回、来源筛选和模型生成流程，复杂问题可能需要稍等。</p>
+          </div>
+        </div>
+      )}
       {error && <div className="error">{error}</div>}
       {answer && (
         <Section title="回答">

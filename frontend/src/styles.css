@@ -999,6 +999,49 @@ main {
   align-items: end;
 }
 
+.button-spinner,
+.qa-spinner {
+  border-radius: 50%;
+  border: 2px solid currentColor;
+  border-top-color: transparent;
+  animation: spin 0.8s linear infinite;
+}
+
+.button-spinner {
+  width: 16px;
+  height: 16px;
+}
+
+.qa-loading {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 14px 16px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #f7faf9;
+  color: var(--text);
+}
+
+.qa-spinner {
+  width: 28px;
+  height: 28px;
+  color: var(--green);
+  flex: 0 0 auto;
+}
+
+.qa-loading p {
+  margin: 4px 0 0;
+  color: var(--muted);
+  line-height: 1.45;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
 .source-list {
   display: grid;
   gap: 10px;

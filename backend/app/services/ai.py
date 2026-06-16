@@ -25,6 +25,8 @@ from app.services.extractors import compact_text
 CHUNK_SIZE = 900
 CHUNK_OVERLAP = 140
 QA_SOURCE_LIMIT = 6
+QA_CONTEXT_SOURCE_LIMIT = 4
+QA_CONTEXT_CHARS_PER_SOURCE = 620
 RETRIEVAL_LIMIT = 12
 LIKE_CANDIDATE_LIMIT = 80
 MIN_SOURCE_SCORE = 0.3
@@ -116,17 +118,31 @@ def _field_path(data: Any, path: str) -> Any:
     return current
 
 
-def chat_completion(messages: list[dict[str, str]], config: dict[str, Any] | None = None) -> str:
+def chat_completion(messages: list[dict[str, str]], config: dict[str, Any] | None = None, max_tokens: int = 1000) -> str:
     config = {**DEFAULT_INTELLIGENT_ANALYSIS, **(config or ai_config())}
     if not config.get("apiBaseUrl"):
         raise ValueError("聊天模型 API 地址未配置")
-    model_name = config.get("modelName") or list_chat_models(config).get("defaultModel")
+    model_name = config.get("modelName")
+    if not model_name:
+        models = list_chat_models(config)
+        model_name = models.get("defaultModel")
+        if model_name:
+            conn = get_connection()
+            try:
+                current = {**DEFAULT_INTELLIGENT_ANALYSIS, **get_setting(conn, "intelligent_analysis", {})}
+                if not current.get("modelName"):
+                    current["modelName"] = model_name
+                    set_setting(conn, "intelligent_analysis", current)
+                    conn.commit()
+            finally:
+                conn.close()
     if not model_name:
         raise ValueError("聊天模型名称未配置，且未能从 /models 自动读取模型")
     payload = {
         "model": model_name,
         "messages": messages,
         "temperature": 0.2,
+        "max_tokens": max_tokens,
     }
     data = _post_json(
         _url(config["apiBaseUrl"], "/chat/completions"),
@@ -145,7 +161,8 @@ def test_chat_model() -> dict[str, Any]:
             [
                 {"role": "system", "content": "你是项目管理系统的模型连通性测试助手。"},
                 {"role": "user", "content": "请用一句中文回复：模型连接正常。"},
-            ]
+            ],
+            max_tokens=80,
         )
         return {
             "ok": True,
@@ -468,17 +485,32 @@ def answer_question(question: str) -> dict[str, Any]:
             "retrievalMode": "hybrid",
         }
     context = "\n\n".join(
-        f"来源{index + 1}：{item['document_name']}\n{item['text']}" for index, item in enumerate(sources)
+        f"来源{index + 1}：{item['document_name']}\n{compact_text(item['text'], QA_CONTEXT_CHARS_PER_SOURCE)}"
+        for index, item in enumerate(sources[:QA_CONTEXT_SOURCE_LIMIT])
     )
     try:
         answer = chat_completion(
             [
                 {
                     "role": "system",
-                    "content": "你只能依据给定项目资料回答。资料不足时必须回答：未在项目资料中找到依据。",
+                    "content": (
+                        "你是项目资料问答助手，只能依据给定项目资料回答。"
+                        "请用中文回答，尽量结构化、具体、完整，但避免冗长；优先按要点列出结论、依据和待确认事项。"
+                        "每个关键结论后标注对应来源编号，例如“（来源1）”。"
+                        "不要编造资料中没有的信息；资料不足时必须回答：未在项目资料中找到依据。"
+                    ),
                 },
-                {"role": "user", "content": f"问题：{question}\n\n项目资料：\n{context}"},
-            ]
+                {
+                    "role": "user",
+                    "content": (
+                        f"问题：{question}\n\n"
+                        "请基于以下项目资料详细回答。若资料中有多个相关片段，请综合归纳；"
+                        "若只能找到部分依据，请说明“根据现有资料可确认”和“仍需补充确认”的内容。\n\n"
+                        f"项目资料：\n{context}"
+                    ),
+                },
+            ],
+            max_tokens=900,
         )
     except Exception as exc:
         answer = f"已找到相关项目资料，但聊天模型暂不可用：{exc}"
