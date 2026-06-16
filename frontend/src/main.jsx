@@ -19,6 +19,7 @@ import {
   ListChecks,
   Lock,
   LogOut,
+  MessageSquareText,
   Milestone,
   Plus,
   RefreshCw,
@@ -83,6 +84,7 @@ const navItems = [
   { id: "suggestions", label: "智能建议", icon: Sparkles },
   { id: "documents", label: "资料台账", icon: FolderCog },
   { id: "deliverables", label: "交付物清单", icon: ClipboardCheck },
+  { id: "qa", label: "智能问答", icon: MessageSquareText },
   { id: "weekly", label: "周报汇总", icon: ListChecks },
   { id: "settings", label: "系统设置", icon: Settings }
 ];
@@ -389,6 +391,19 @@ const defaultIntelligentAnalysis = {
   apiBaseUrl: "",
   apiKey: "",
   modelName: "",
+  embeddingApiBaseUrl: "",
+  embeddingApiKey: "",
+  embeddingModelName: "",
+  embeddingTextField: "text",
+  embeddingModelField: "model",
+  embeddingVectorPath: "embedding",
+  rerankerEnabled: false,
+  rerankerApiBaseUrl: "",
+  rerankerApiKey: "",
+  rerankerModelName: "",
+  rerankerScorePath: "score",
+  analysisMode: "auto_suggest",
+  autoApplyLowRisk: true,
   timeoutSeconds: 60,
   maxTextLength: 12000,
   reviewOnly: true,
@@ -1208,7 +1223,65 @@ function WeeklyView({ weekly, onPreview }) {
   );
 }
 
-function SettingsView({ settings, setSettings, onSave, onScan, onChangePassword }) {
+function QAView({ onPreview }) {
+  const [question, setQuestion] = useState("");
+  const [answer, setAnswer] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+
+  const ask = async (event) => {
+    event.preventDefault();
+    if (!question.trim()) return;
+    try {
+      setLoading(true);
+      setError("");
+      setAnswer(await api.post("/api/qa/ask", { question }));
+    } catch (err) {
+      setError(err.message || "问答失败");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="view-grid">
+      <Section title="智能问答">
+        <form className="qa-form" onSubmit={ask}>
+          <textarea
+            value={question}
+            onChange={(event) => setQuestion(event.target.value)}
+            rows={3}
+            placeholder="请输入与项目资料相关的问题"
+          />
+          <button className="primary-button" type="submit" disabled={loading}>
+            <MessageSquareText size={16} />
+            {loading ? "查询中" : "提问"}
+          </button>
+        </form>
+      </Section>
+      {error && <div className="error">{error}</div>}
+      {answer && (
+        <Section title="回答">
+          <pre className="text-block">{answer.answer}</pre>
+          <div className="source-list">
+            {(answer.sources || []).map((source, index) => (
+              <div className="source-card" key={`${source.documentId}-${index}`}>
+                <div className="source-card-head">
+                  <strong>来源 {index + 1}</strong>
+                  <FileButton documentId={source.documentId} name={source.documentName} onPreview={onPreview} />
+                </div>
+                <p>{source.snippet}</p>
+              </div>
+            ))}
+            {!(answer.sources || []).length && <Empty text="暂无来源" />}
+          </div>
+        </Section>
+      )}
+    </div>
+  );
+}
+
+function SettingsView({ settings, setSettings, onSave, onScan, onChangePassword, onTestModel, modelTest, onRebuildKnowledge, knowledgeStatus }) {
   const [passwordDraft, setPasswordDraft] = useState({ currentPassword: "", newPassword: "", confirmPassword: "" });
   const [passwordError, setPasswordError] = useState("");
   const intelligentAnalysis = { ...defaultIntelligentAnalysis, ...(settings.intelligentAnalysis || {}) };
@@ -1282,6 +1355,13 @@ function SettingsView({ settings, setSettings, onSave, onScan, onChangePassword 
       </Section>
 
       <Section title="智能文件分析">
+        <div className="section-inline-action">
+          <button className="ghost-button" onClick={onTestModel} type="button">
+            <Sparkles size={16} />
+            测试连接
+          </button>
+          {modelTest && <span className={modelTest.ok ? "notice" : "error"}>{modelTest.ok ? `连接正常：${modelTest.elapsedMs}ms` : modelTest.error}</span>}
+        </div>
         <div className="analysis-settings-grid">
           <div className="monitor-item analysis-switch-card">
             <div className="monitor-head">
@@ -1367,6 +1447,120 @@ function SettingsView({ settings, setSettings, onSave, onScan, onChangePassword 
             />
             允许发送内容到外部模型服务
           </label>
+          <label className="checkbox-row">
+            <input
+              type="checkbox"
+              checked={!!intelligentAnalysis.autoApplyLowRisk}
+              onChange={(e) => updateAnalysis({ autoApplyLowRisk: e.target.checked })}
+            />
+            自动更新低风险内容
+          </label>
+        </div>
+      </Section>
+
+      <Section title="Embedding 与重排序">
+        <div className="analysis-settings-grid">
+          <label>
+            Embedding API 地址
+            <input
+              value={intelligentAnalysis.embeddingApiBaseUrl || ""}
+              onChange={(e) => updateAnalysis({ embeddingApiBaseUrl: e.target.value })}
+              placeholder="本地 embedding 服务地址"
+            />
+          </label>
+          <label>
+            Embedding API Key
+            <input
+              value={intelligentAnalysis.embeddingApiKey || ""}
+              onChange={(e) => updateAnalysis({ embeddingApiKey: e.target.value })}
+              type="password"
+              autoComplete="new-password"
+            />
+          </label>
+          <label>
+            Embedding 模型名
+            <input
+              value={intelligentAnalysis.embeddingModelName || ""}
+              onChange={(e) => updateAnalysis({ embeddingModelName: e.target.value })}
+            />
+          </label>
+          <label>
+            文本字段
+            <input
+              value={intelligentAnalysis.embeddingTextField || "text"}
+              onChange={(e) => updateAnalysis({ embeddingTextField: e.target.value })}
+            />
+          </label>
+          <label>
+            模型字段
+            <input
+              value={intelligentAnalysis.embeddingModelField || "model"}
+              onChange={(e) => updateAnalysis({ embeddingModelField: e.target.value })}
+            />
+          </label>
+          <label>
+            向量字段路径
+            <input
+              value={intelligentAnalysis.embeddingVectorPath || "embedding"}
+              onChange={(e) => updateAnalysis({ embeddingVectorPath: e.target.value })}
+              placeholder="embedding 或 data.0.embedding"
+            />
+          </label>
+          <label className="checkbox-row">
+            <input
+              type="checkbox"
+              checked={!!intelligentAnalysis.rerankerEnabled}
+              onChange={(e) => updateAnalysis({ rerankerEnabled: e.target.checked })}
+            />
+            启用 Reranker
+          </label>
+          <label>
+            Reranker API 地址
+            <input
+              value={intelligentAnalysis.rerankerApiBaseUrl || ""}
+              onChange={(e) => updateAnalysis({ rerankerApiBaseUrl: e.target.value })}
+            />
+          </label>
+          <label>
+            Reranker API Key
+            <input
+              value={intelligentAnalysis.rerankerApiKey || ""}
+              onChange={(e) => updateAnalysis({ rerankerApiKey: e.target.value })}
+              type="password"
+              autoComplete="new-password"
+            />
+          </label>
+          <label>
+            Reranker 模型名
+            <input
+              value={intelligentAnalysis.rerankerModelName || ""}
+              onChange={(e) => updateAnalysis({ rerankerModelName: e.target.value })}
+            />
+          </label>
+          <label>
+            分数字段路径
+            <input
+              value={intelligentAnalysis.rerankerScorePath || "score"}
+              onChange={(e) => updateAnalysis({ rerankerScorePath: e.target.value })}
+            />
+          </label>
+        </div>
+      </Section>
+
+      <Section
+        title="知识库索引"
+        action={
+          <button className="ghost-button" onClick={onRebuildKnowledge} type="button">
+            <RefreshCw size={16} />
+            重建索引
+          </button>
+        }
+      >
+        <div className="knowledge-status-grid">
+          <Stat label="已索引文档" value={knowledgeStatus?.indexed_documents || 0} icon={FileText} tone="blue" />
+          <Stat label="知识片段" value={knowledgeStatus?.chunks || 0} icon={ListChecks} tone="green" />
+          <Stat label="向量数量" value={knowledgeStatus?.vectors || 0} icon={Sparkles} tone="amber" />
+          <Stat label="失败文档" value={knowledgeStatus?.failed_documents || 0} icon={AlertTriangle} tone="red" />
         </div>
       </Section>
 
@@ -1459,6 +1653,8 @@ function App() {
   const [suggestions, setSuggestions] = useState([]);
   const [weekly, setWeekly] = useState({});
   const [settings, setSettings] = useState({ monitorTypes: {} });
+  const [modelTest, setModelTest] = useState(null);
+  const [knowledgeStatus, setKnowledgeStatus] = useState({});
   const [auth, setAuth] = useState({ isAdmin: false, username: "" });
   const [loginOpen, setLoginOpen] = useState(false);
   const [preview, setPreview] = useState(null);
@@ -1505,6 +1701,10 @@ function App() {
     setSettings(await api.get("/api/settings"));
   };
 
+  const loadKnowledgeStatus = async () => {
+    setKnowledgeStatus(await api.get("/api/knowledge/status"));
+  };
+
   useEffect(() => {
     Promise.all([refresh(), refreshAuth()])
       .catch((err) => setError(err.message || "加载失败"))
@@ -1517,7 +1717,7 @@ function App() {
       if (active === "settings") setActive("dashboard");
       return;
     }
-    loadSettings().catch((err) => setError(err.message || "系统设置加载失败"));
+    Promise.all([loadSettings(), loadKnowledgeStatus()]).catch((err) => setError(err.message || "系统设置加载失败"));
   }, [auth.isAdmin]);
 
   const runAction = async (action, success) => {
@@ -1569,6 +1769,18 @@ function App() {
     }
   };
   const changeAdminPassword = (payload) => runAction(() => api.post("/api/auth/change-password", payload), "管理员密码已修改");
+  const testModel = async () => {
+    try {
+      setModelTest(null);
+      setModelTest(await api.post("/api/ai/test"));
+    } catch (err) {
+      setModelTest({ ok: false, error: err.message || "测试失败" });
+    }
+  };
+  const rebuildKnowledge = async () => {
+    const ok = await runAction(() => api.post("/api/knowledge/rebuild"), "知识库索引已重建");
+    if (ok) await loadKnowledgeStatus();
+  };
   const applySuggestion = (id) => runAction(() => api.post(`/api/suggestions/${id}/apply`), "建议已应用");
   const dismissSuggestion = (id) => runAction(() => api.post(`/api/suggestions/${id}/dismiss`), "建议已忽略");
   const createTask = (payload) => runAction(() => api.post("/api/tasks", payload), "任务已新增");
@@ -1616,6 +1828,7 @@ function App() {
     if (active === "deliverables") {
       return <DeliverablesView deliverables={deliverables} documents={documents} onPatch={patchDeliverable} onPreview={openPreview} />;
     }
+    if (active === "qa") return <QAView onPreview={openPreview} />;
     if (active === "weekly") return <WeeklyView weekly={weekly} onPreview={openPreview} />;
     if (active === "settings" && auth.isAdmin) {
       return (
@@ -1625,6 +1838,10 @@ function App() {
           onSave={saveSettings}
           onScan={scanNow}
           onChangePassword={changeAdminPassword}
+          onTestModel={testModel}
+          modelTest={modelTest}
+          onRebuildKnowledge={rebuildKnowledge}
+          knowledgeStatus={knowledgeStatus}
         />
       );
     }

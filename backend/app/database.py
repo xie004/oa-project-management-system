@@ -24,6 +24,19 @@ DEFAULT_INTELLIGENT_ANALYSIS = {
     "apiBaseUrl": "",
     "apiKey": "",
     "modelName": "",
+    "embeddingApiBaseUrl": "",
+    "embeddingApiKey": "",
+    "embeddingModelName": "",
+    "embeddingTextField": "text",
+    "embeddingModelField": "model",
+    "embeddingVectorPath": "embedding",
+    "rerankerEnabled": False,
+    "rerankerApiBaseUrl": "",
+    "rerankerApiKey": "",
+    "rerankerModelName": "",
+    "rerankerScorePath": "score",
+    "analysisMode": "auto_suggest",
+    "autoApplyLowRisk": True,
     "timeoutSeconds": 60,
     "maxTextLength": 12000,
     "reviewOnly": True,
@@ -442,7 +455,13 @@ def init_db() -> None:
                 status TEXT NOT NULL,
                 summary TEXT,
                 error TEXT,
-                last_indexed_at TEXT NOT NULL
+                last_indexed_at TEXT NOT NULL,
+                analysis_status TEXT NOT NULL DEFAULT 'not_analyzed',
+                analysis_at TEXT,
+                analysis_error TEXT,
+                knowledge_status TEXT NOT NULL DEFAULT 'not_indexed',
+                knowledge_indexed_at TEXT,
+                knowledge_error TEXT
             );
 
             CREATE TABLE IF NOT EXISTS weekly_reports (
@@ -554,19 +573,69 @@ def init_db() -> None:
                 updated_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS knowledge_chunks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+                chunk_index INTEGER NOT NULL,
+                text TEXT NOT NULL,
+                summary TEXT,
+                char_length INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(document_id, chunk_index)
+            );
+
+            CREATE TABLE IF NOT EXISTS knowledge_vectors (
+                chunk_id INTEGER PRIMARY KEY REFERENCES knowledge_chunks(id) ON DELETE CASCADE,
+                embedding_model TEXT NOT NULL,
+                vector_json TEXT NOT NULL,
+                dimension INTEGER NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
             CREATE INDEX IF NOT EXISTS idx_documents_category ON documents(doc_category);
             CREATE INDEX IF NOT EXISTS idx_suggestions_status ON update_suggestions(status);
             CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
             CREATE INDEX IF NOT EXISTS idx_milestones_status ON milestones(status);
             CREATE INDEX IF NOT EXISTS idx_deliverables_status ON deliverables(status);
+            CREATE INDEX IF NOT EXISTS idx_chunks_document ON knowledge_chunks(document_id);
             """
         )
+        ensure_schema(conn)
         seed_defaults(conn)
         ensure_project_plan(conn)
         ensure_deliverables(conn)
         conn.commit()
     finally:
         conn.close()
+
+
+def ensure_schema(conn: sqlite3.Connection) -> None:
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(documents)").fetchall()}
+    document_columns = {
+        "analysis_status": "TEXT NOT NULL DEFAULT 'not_analyzed'",
+        "analysis_at": "TEXT",
+        "analysis_error": "TEXT",
+        "knowledge_status": "TEXT NOT NULL DEFAULT 'not_indexed'",
+        "knowledge_indexed_at": "TEXT",
+        "knowledge_error": "TEXT",
+    }
+    for name, definition in document_columns.items():
+        if name not in columns:
+            conn.execute(f"ALTER TABLE documents ADD COLUMN {name} {definition}")
+    fts_row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'knowledge_chunks_fts'"
+    ).fetchone()
+    fts_sql = fts_row["sql"] if fts_row else ""
+    fts_columns = [row["name"] for row in conn.execute("PRAGMA table_info(knowledge_chunks_fts)").fetchall()]
+    if fts_columns and (fts_columns != ["text"] or "content=" in fts_sql):
+        conn.execute("DROP TABLE knowledge_chunks_fts")
+    conn.execute(
+        """
+        CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_chunks_fts
+        USING fts5(text)
+        """
+    )
 
 
 def seed_defaults(conn: sqlite3.Connection) -> None:

@@ -28,6 +28,7 @@ from app.services.extractors import (
     parse_meeting,
     parse_weekly_report,
 )
+from app.services.ai import ai_config, chat_completion, index_document_knowledge
 
 
 SUPPORTED_EXTENSIONS = {".docx", ".doc", ".xlsx", ".xls", ".pdf", ".txt", ".md", ".wpsonline"}
@@ -377,6 +378,86 @@ def save_resource_suggestions(conn: sqlite3.Connection, document_id: int, text: 
     )
 
 
+def save_ai_analysis_suggestions(conn: sqlite3.Connection, document_id: int, text: str, filename: str, category: str) -> None:
+    config = ai_config()
+    if not config.get("enabled"):
+        conn.execute(
+            "UPDATE documents SET analysis_status = 'not_analyzed', analysis_error = '' WHERE id = ?",
+            (document_id,),
+        )
+        return
+    conn.execute(
+        "UPDATE documents SET analysis_status = 'analyzing', analysis_error = '' WHERE id = ?",
+        (document_id,),
+    )
+    try:
+        prompt = f"""
+请基于以下项目文件内容，识别可能需要更新到项目管理系统的事项。
+只返回 JSON 数组，每项包含 type、title、description、confidence。
+type 只能是 task、risk、milestone、change_request、deliverable。
+文件名：{filename}
+分类：{category}
+内容：
+{compact_text(text, int(config.get('maxTextLength') or 12000))}
+"""
+        answer = chat_completion(
+            [
+                {"role": "system", "content": "你是项目管理资料分析助手，只输出 JSON。"},
+                {"role": "user", "content": prompt},
+            ],
+            config,
+        )
+        cleaned = answer.strip()
+        if cleaned.startswith("```"):
+            cleaned = cleaned.strip("`")
+            cleaned = cleaned.replace("json\n", "", 1).replace("JSON\n", "", 1)
+        items = json.loads(cleaned)
+        if not isinstance(items, list):
+            raise ValueError("模型未返回 JSON 数组")
+        for item in items[:12]:
+            suggestion_type = item.get("type")
+            if suggestion_type not in {"task", "risk", "milestone", "change_request", "deliverable"}:
+                continue
+            title = item.get("title") or ""
+            description = item.get("description") or title
+            create_suggestion(
+                conn,
+                document_id,
+                suggestion_type,
+                title,
+                description,
+                {
+                    "title": title,
+                    "description": description,
+                    "status": "pending" if suggestion_type == "change_request" else "not_started",
+                    "source": "大模型分析",
+                },
+                float(item.get("confidence") or 0.7),
+            )
+        conn.execute(
+            "UPDATE documents SET analysis_status = 'analyzed', analysis_at = ?, analysis_error = '' WHERE id = ?",
+            (now_iso(), document_id),
+        )
+    except Exception as exc:
+        conn.execute(
+            "UPDATE documents SET analysis_status = 'failed', analysis_at = ?, analysis_error = ? WHERE id = ?",
+            (now_iso(), str(exc), document_id),
+        )
+
+
+def auto_link_deliverables(conn: sqlite3.Connection, document_id: int, filename: str) -> None:
+    normalized = filename.lower()
+    rows = conn.execute("SELECT * FROM deliverables WHERE document_id IS NULL").fetchall()
+    for row in rows:
+        name = row["name"]
+        keywords = [part for part in re.split(r"[/、\s（）()]+", name) if len(part) >= 2]
+        if name in filename or any(keyword.lower() in normalized for keyword in keywords):
+            conn.execute(
+                "UPDATE deliverables SET document_id = ?, updated_at = ? WHERE id = ?",
+                (document_id, now_iso(), row["id"]),
+            )
+
+
 def index_document(path: Path, hint: str = "", force: bool = False) -> dict[str, Any]:
     path = path.resolve()
     conn = get_connection()
@@ -403,6 +484,8 @@ def index_document(path: Path, hint: str = "", force: bool = False) -> dict[str,
             conn.execute("DELETE FROM meetings WHERE document_id = ?", (document_id,))
 
         if result.text:
+            index_document_knowledge(document_id, result.text, path.name, conn=conn)
+            auto_link_deliverables(conn, document_id, path.name)
             if category == "weekly_report":
                 save_weekly_report(conn, document_id, result.text, path.name)
             elif category == "meeting":
@@ -427,6 +510,7 @@ def index_document(path: Path, hint: str = "", force: bool = False) -> dict[str,
                             },
                             0.65,
                         )
+            save_ai_analysis_suggestions(conn, document_id, result.text, path.name, category)
 
         conn.commit()
         return {"path": str(path), "status": result.status, "category": category}

@@ -971,6 +971,54 @@ main {
   flex-wrap: wrap;
 }
 
+.section-inline-action {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+}
+
+.knowledge-status-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(140px, 1fr));
+  gap: 12px;
+}
+
+.qa-form {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: end;
+}
+
+.source-list {
+  display: grid;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.source-card {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px;
+  background: var(--surface-alt);
+}
+
+.source-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+
+.source-card p {
+  margin: 0;
+  color: var(--muted);
+  line-height: 1.55;
+}
+
 input,
 select,
 textarea {
@@ -1361,7 +1409,9 @@ th {
   }
 
   .task-form,
-  .settings-grid {
+  .settings-grid,
+  .qa-form,
+  .knowledge-status-grid {
     grid-template-columns: 1fr 1fr;
   }
 }
@@ -1418,7 +1468,9 @@ th {
   }
 
   .task-form,
-  .settings-grid {
+  .settings-grid,
+  .qa-form,
+  .knowledge-status-grid {
     grid-template-columns: 1fr;
   }
 

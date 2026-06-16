@@ -34,6 +34,7 @@ from app.database import (
 )
 from app.services.exporter import build_weekly_summary, export_weekly_docx
 from app.services.extractors import extract_text
+from app.services.ai import answer_question, knowledge_status, rebuild_knowledge, test_chat_model
 from app.services.scanner import (
     apply_suggestion,
     dismiss_suggestion,
@@ -89,11 +90,17 @@ class GenericPatchPayload(BaseModel):
     values: dict[str, Any]
 
 
+class QuestionPayload(BaseModel):
+    question: str
+
+
 def merge_intelligent_analysis_config(payload: dict[str, Any]) -> dict[str, Any]:
     config = {**DEFAULT_INTELLIGENT_ANALYSIS, **(payload or {})}
     config["enabled"] = bool(config.get("enabled"))
     config["reviewOnly"] = bool(config.get("reviewOnly", True))
     config["allowExternalService"] = bool(config.get("allowExternalService"))
+    config["autoApplyLowRisk"] = bool(config.get("autoApplyLowRisk", True))
+    config["rerankerEnabled"] = bool(config.get("rerankerEnabled"))
     for key in ["timeoutSeconds", "maxTextLength"]:
         try:
             config[key] = int(config.get(key) or DEFAULT_INTELLIGENT_ANALYSIS[key])
@@ -196,6 +203,29 @@ def update_settings(payload: SettingsPayload, _: dict[str, Any] = Depends(admin_
 @app.post("/api/scan")
 def scan(force: bool = True) -> dict[str, Any]:
     return scan_all(force=force)
+
+
+@app.post("/api/ai/test")
+def ai_test(_: dict[str, Any] = Depends(admin_from_request)) -> dict[str, Any]:
+    return test_chat_model()
+
+
+@app.get("/api/knowledge/status")
+def api_knowledge_status(_: dict[str, Any] = Depends(admin_from_request)) -> dict[str, Any]:
+    return knowledge_status()
+
+
+@app.post("/api/knowledge/rebuild")
+def api_knowledge_rebuild(_: dict[str, Any] = Depends(admin_from_request)) -> dict[str, Any]:
+    return rebuild_knowledge()
+
+
+@app.post("/api/qa/ask")
+def qa_ask(payload: QuestionPayload) -> dict[str, Any]:
+    question = payload.question.strip()
+    if not question:
+        raise HTTPException(status_code=400, detail="请输入问题。")
+    return answer_question(question)
 
 
 def progress_from_tasks(tasks: list[dict[str, Any]]) -> int:
