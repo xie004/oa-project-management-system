@@ -461,7 +461,13 @@ def init_db() -> None:
                 analysis_error TEXT,
                 knowledge_status TEXT NOT NULL DEFAULT 'not_indexed',
                 knowledge_indexed_at TEXT,
-                knowledge_error TEXT
+                knowledge_error TEXT,
+                ocr_status TEXT NOT NULL DEFAULT 'not_required',
+                ocr_progress INTEGER NOT NULL DEFAULT 0,
+                ocr_pages_total INTEGER NOT NULL DEFAULT 0,
+                ocr_pages_done INTEGER NOT NULL DEFAULT 0,
+                ocr_error TEXT,
+                ocr_at TEXT
             );
 
             CREATE TABLE IF NOT EXISTS weekly_reports (
@@ -593,12 +599,46 @@ def init_db() -> None:
                 updated_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS ocr_pages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+                page_number INTEGER NOT NULL,
+                text TEXT,
+                status TEXT NOT NULL DEFAULT 'pending',
+                error TEXT,
+                updated_at TEXT NOT NULL,
+                UNIQUE(document_id, page_number)
+            );
+
+            CREATE TABLE IF NOT EXISTS wiki_pages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                page_key TEXT NOT NULL UNIQUE,
+                title TEXT NOT NULL,
+                content TEXT,
+                source_json TEXT NOT NULL DEFAULT '[]',
+                status TEXT NOT NULL DEFAULT 'draft',
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS wiki_suggestions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                page_key TEXT NOT NULL,
+                title TEXT NOT NULL,
+                content TEXT NOT NULL,
+                source_json TEXT NOT NULL DEFAULT '[]',
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TEXT NOT NULL,
+                applied_at TEXT
+            );
+
             CREATE INDEX IF NOT EXISTS idx_documents_category ON documents(doc_category);
             CREATE INDEX IF NOT EXISTS idx_suggestions_status ON update_suggestions(status);
             CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
             CREATE INDEX IF NOT EXISTS idx_milestones_status ON milestones(status);
             CREATE INDEX IF NOT EXISTS idx_deliverables_status ON deliverables(status);
             CREATE INDEX IF NOT EXISTS idx_chunks_document ON knowledge_chunks(document_id);
+            CREATE INDEX IF NOT EXISTS idx_ocr_pages_document ON ocr_pages(document_id);
+            CREATE INDEX IF NOT EXISTS idx_wiki_suggestions_status ON wiki_suggestions(status);
             """
         )
         ensure_schema(conn)
@@ -619,6 +659,12 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         "knowledge_status": "TEXT NOT NULL DEFAULT 'not_indexed'",
         "knowledge_indexed_at": "TEXT",
         "knowledge_error": "TEXT",
+        "ocr_status": "TEXT NOT NULL DEFAULT 'not_required'",
+        "ocr_progress": "INTEGER NOT NULL DEFAULT 0",
+        "ocr_pages_total": "INTEGER NOT NULL DEFAULT 0",
+        "ocr_pages_done": "INTEGER NOT NULL DEFAULT 0",
+        "ocr_error": "TEXT",
+        "ocr_at": "TEXT",
     }
     for name, definition in document_columns.items():
         if name not in columns:
@@ -634,6 +680,41 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         """
         CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_chunks_fts
         USING fts5(text)
+        """
+    )
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS ocr_pages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+            page_number INTEGER NOT NULL,
+            text TEXT,
+            status TEXT NOT NULL DEFAULT 'pending',
+            error TEXT,
+            updated_at TEXT NOT NULL,
+            UNIQUE(document_id, page_number)
+        );
+        CREATE TABLE IF NOT EXISTS wiki_pages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            page_key TEXT NOT NULL UNIQUE,
+            title TEXT NOT NULL,
+            content TEXT,
+            source_json TEXT NOT NULL DEFAULT '[]',
+            status TEXT NOT NULL DEFAULT 'draft',
+            updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS wiki_suggestions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            page_key TEXT NOT NULL,
+            title TEXT NOT NULL,
+            content TEXT NOT NULL,
+            source_json TEXT NOT NULL DEFAULT '[]',
+            status TEXT NOT NULL DEFAULT 'pending',
+            created_at TEXT NOT NULL,
+            applied_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_ocr_pages_document ON ocr_pages(document_id);
+        CREATE INDEX IF NOT EXISTS idx_wiki_suggestions_status ON wiki_suggestions(status);
         """
     )
 

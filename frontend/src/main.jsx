@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
   AlertTriangle,
+  BookOpen,
   CalendarDays,
   Check,
   Circle,
@@ -84,6 +85,7 @@ const navItems = [
   { id: "suggestions", label: "智能建议", icon: Sparkles },
   { id: "documents", label: "资料台账", icon: FolderCog },
   { id: "deliverables", label: "交付物清单", icon: ClipboardCheck },
+  { id: "wiki", label: "项目 Wiki", icon: BookOpen },
   { id: "qa", label: "智能问答", icon: MessageSquareText },
   { id: "weekly", label: "周报汇总", icon: ListChecks },
   { id: "settings", label: "系统设置", icon: Settings }
@@ -105,6 +107,15 @@ const statusText = {
   review: "评审中",
   finalized: "已定稿",
   submitted: "已提交"
+};
+
+const ocrStatusText = {
+  not_required: "不需要",
+  pending: "待OCR",
+  processing: "OCR中",
+  completed: "已OCR",
+  failed: "OCR失败",
+  partial: "部分完成"
 };
 
 const colorText = {
@@ -1052,7 +1063,7 @@ function SuggestionsView({ suggestions, onApply, onDismiss, onPreview }) {
   );
 }
 
-function DocumentsView({ documents, onPreview }) {
+function DocumentsView({ documents, onPreview, isAdmin, onStartOcr, onRetryOcr }) {
   return (
     <Section title="资料台账">
       <div className="table-wrap">
@@ -1062,6 +1073,7 @@ function DocumentsView({ documents, onPreview }) {
               <th>文件名</th>
               <th>类型</th>
               <th>状态</th>
+              <th>OCR</th>
               <th>修改时间</th>
               <th>路径</th>
             </tr>
@@ -1072,6 +1084,19 @@ function DocumentsView({ documents, onPreview }) {
                 <td><FileButton documentId={doc.id} name={doc.name} onPreview={onPreview} /></td>
                 <td>{typeText[doc.doc_category] || doc.doc_category}</td>
                 <td><StatusPill value={doc.status} color={doc.status === "error" ? "red" : "green"} /></td>
+                <td>
+                  <div className="ocr-cell">
+                    <span>{ocrStatusText[doc.ocr_status] || doc.ocr_status || "-"}</span>
+                    {!!doc.ocr_pages_total && <small>{doc.ocr_pages_done || 0}/{doc.ocr_pages_total} · {doc.ocr_progress || 0}%</small>}
+                    {doc.ocr_error && <small className="error">{doc.ocr_error}</small>}
+                    {isAdmin && doc.extension === ".pdf" && (
+                      <div className="button-row compact-buttons">
+                        <button className="ghost-button" onClick={() => onStartOcr(doc.id)}>OCR</button>
+                        {["failed", "partial"].includes(doc.ocr_status) && <button className="ghost-button" onClick={() => onRetryOcr(doc.id)}>重试</button>}
+                      </div>
+                    )}
+                  </div>
+                </td>
                 <td>{formatDate(doc.modified_at)}</td>
                 <td className="path-cell">
                   <FileButton documentId={doc.id} name={doc.path} onPreview={onPreview} />
@@ -1223,6 +1248,107 @@ function WeeklyView({ weekly, onPreview }) {
   );
 }
 
+function WikiView({ pages, suggestions, isAdmin, onRebuild, onApply }) {
+  return (
+    <div className="view-grid">
+      <Section
+        title="项目 Wiki"
+        action={
+          isAdmin && (
+            <button className="ghost-button" onClick={onRebuild}>
+              <RefreshCw size={16} />
+              生成更新建议
+            </button>
+          )
+        }
+      >
+        <div className="wiki-grid">
+          {pages.map((page) => (
+            <article className="wiki-card" key={page.page_key}>
+              <div className="wiki-card-head">
+                <strong>{page.title}</strong>
+                <span>{formatDate(page.updated_at)}</span>
+              </div>
+              <pre className="wiki-content">{page.content || "暂无内容，生成并确认 Wiki 更新建议后显示。"}</pre>
+            </article>
+          ))}
+          {!pages.length && <Empty />}
+        </div>
+      </Section>
+      {isAdmin && (
+        <Section title="Wiki 更新建议">
+          <div className="suggestion-list">
+            {suggestions.map((item) => (
+              <div className="suggestion" key={item.id}>
+                <div className="suggestion-main">
+                  <div className="suggestion-title">
+                    <StatusPill value="pending" color="blue" />
+                    <strong>{item.title}</strong>
+                  </div>
+                  <pre className="wiki-suggestion-content">{item.content}</pre>
+                </div>
+                <div className="suggestion-actions">
+                  <button className="primary-button" onClick={() => onApply(item.id)}>
+                    <Check size={16} />
+                    应用
+                  </button>
+                </div>
+              </div>
+            ))}
+            {!suggestions.length && <Empty text="暂无待确认 Wiki 建议" />}
+          </div>
+        </Section>
+      )}
+    </div>
+  );
+}
+
+function StructuredAnswer({ answer, onPreview }) {
+  const structured = answer.structured || {};
+  return (
+    <Section title="回答">
+      <div className="qa-answer-card">
+        <h3>结论</h3>
+        <p>{structured.answer_summary || answer.answer}</p>
+        {!!(structured.key_points || []).length && (
+          <>
+            <h3>要点</h3>
+            <ul>{structured.key_points.map((item, index) => <li key={index}>{item}</li>)}</ul>
+          </>
+        )}
+        {!!(structured.evidence || []).length && (
+          <>
+            <h3>依据</h3>
+            <ul>{structured.evidence.map((item, index) => <li key={index}>{item}</li>)}</ul>
+          </>
+        )}
+        {!!(structured.unknowns || []).length && (
+          <>
+            <h3>待确认</h3>
+            <ul>{structured.unknowns.map((item, index) => <li key={index}>{item}</li>)}</ul>
+          </>
+        )}
+      </div>
+      <div className="source-list">
+        {(answer.sources || []).map((source, index) => (
+          <div className="source-card" key={`${source.documentId || source.documentName || "wiki"}-${index}`}>
+            <div className="source-card-head">
+              <strong>来源 {index + 1}</strong>
+              {source.documentId ? (
+                <FileButton documentId={source.documentId} name={source.documentName} onPreview={onPreview} />
+              ) : (
+                <span>{source.documentName || "项目 Wiki"}</span>
+              )}
+            </div>
+            <p>{source.snippet}</p>
+          </div>
+        ))}
+        {!(answer.sources || []).length && <Empty text="暂无来源" />}
+      </div>
+    </Section>
+  );
+}
+
 function QAView({ onPreview }) {
   const [question, setQuestion] = useState("");
   const [answer, setAnswer] = useState(null);
@@ -1269,23 +1395,7 @@ function QAView({ onPreview }) {
         </div>
       )}
       {error && <div className="error">{error}</div>}
-      {answer && (
-        <Section title="回答">
-          <pre className="text-block">{answer.answer}</pre>
-          <div className="source-list">
-            {(answer.sources || []).map((source, index) => (
-              <div className="source-card" key={`${source.documentId}-${index}`}>
-                <div className="source-card-head">
-                  <strong>来源 {index + 1}</strong>
-                  <FileButton documentId={source.documentId} name={source.documentName} onPreview={onPreview} />
-                </div>
-                <p>{source.snippet}</p>
-              </div>
-            ))}
-            {!(answer.sources || []).length && <Empty text="暂无来源" />}
-          </div>
-        </Section>
-      )}
+      {answer && <StructuredAnswer answer={answer} onPreview={onPreview} />}
     </div>
   );
 }
@@ -1692,6 +1802,8 @@ function App() {
   const [documents, setDocuments] = useState([]);
   const [deliverables, setDeliverables] = useState([]);
   const [suggestions, setSuggestions] = useState([]);
+  const [wikiPages, setWikiPages] = useState([]);
+  const [wikiSuggestions, setWikiSuggestions] = useState([]);
   const [weekly, setWeekly] = useState({});
   const [settings, setSettings] = useState({ monitorTypes: {} });
   const [modelTest, setModelTest] = useState(null);
@@ -1708,7 +1820,7 @@ function App() {
 
   const refresh = async () => {
     setError("");
-    const [dashboard, taskList, milestoneList, meetingList, changeList, documentList, deliverableList, suggestionList, weeklyData] =
+    const [dashboard, taskList, milestoneList, meetingList, changeList, documentList, deliverableList, suggestionList, wikiPageList, weeklyData] =
       await Promise.all([
         api.get("/api/dashboard"),
         api.get("/api/tasks"),
@@ -1718,6 +1830,7 @@ function App() {
         api.get("/api/documents"),
         api.get("/api/deliverables"),
         api.get("/api/suggestions"),
+        api.get("/api/wiki/pages"),
         api.get("/api/weekly-summary")
       ]);
     setDashboardData(dashboard);
@@ -1728,6 +1841,7 @@ function App() {
     setDocuments(documentList);
     setDeliverables(deliverableList);
     setSuggestions(suggestionList);
+    setWikiPages(wikiPageList);
     setWeekly(weeklyData);
   };
 
@@ -1747,6 +1861,10 @@ function App() {
     setKnowledgeStatus(await api.get("/api/knowledge/status"));
   };
 
+  const loadWikiSuggestions = async () => {
+    if (auth.isAdmin) setWikiSuggestions(await api.get("/api/wiki/suggestions"));
+  };
+
   useEffect(() => {
     Promise.all([refresh(), refreshAuth()])
       .catch((err) => setError(err.message || "加载失败"))
@@ -1759,7 +1877,7 @@ function App() {
       if (active === "settings") setActive("dashboard");
       return;
     }
-    Promise.all([loadSettings(), loadKnowledgeStatus()]).catch((err) => setError(err.message || "系统设置加载失败"));
+    Promise.all([loadSettings(), loadKnowledgeStatus(), loadWikiSuggestions()]).catch((err) => setError(err.message || "系统设置加载失败"));
   }, [auth.isAdmin]);
 
   const runAction = async (action, success) => {
@@ -1848,6 +1966,16 @@ function App() {
   const createTask = (payload) => runAction(() => api.post("/api/tasks", payload), "任务已新增");
   const patchTask = (id, values) => runAction(() => api.patch(`/api/tasks/${id}`, { values }), "任务已更新");
   const patchDeliverable = (id, values) => runAction(() => api.patch(`/api/deliverables/${id}`, { values }), "交付物已更新");
+  const startOcr = (id) => runAction(() => api.post(`/api/ocr/documents/${id}/start`), "OCR 已启动");
+  const retryOcr = (id) => runAction(() => api.post(`/api/ocr/documents/${id}/retry`), "OCR 已重新入队");
+  const rebuildWikiSuggestions = async () => {
+    const ok = await runAction(() => api.post("/api/wiki/rebuild-suggestions"), "Wiki 更新建议已生成");
+    if (ok) await loadWikiSuggestions();
+  };
+  const applyWikiSuggestion = async (id) => {
+    const ok = await runAction(() => api.post(`/api/wiki/suggestions/${id}/apply`), "Wiki 建议已应用");
+    if (ok) await loadWikiSuggestions();
+  };
   const openPreview = async (documentId) => {
     if (!documentId) return;
     try {
@@ -1886,11 +2014,24 @@ function App() {
     if (active === "suggestions") {
       return <SuggestionsView suggestions={suggestions} onApply={applySuggestion} onDismiss={dismissSuggestion} onPreview={openPreview} />;
     }
-    if (active === "documents") return <DocumentsView documents={documents} onPreview={openPreview} />;
+    if (active === "documents") {
+      return <DocumentsView documents={documents} onPreview={openPreview} isAdmin={auth.isAdmin} onStartOcr={startOcr} onRetryOcr={retryOcr} />;
+    }
     if (active === "deliverables") {
       return <DeliverablesView deliverables={deliverables} documents={documents} onPatch={patchDeliverable} onPreview={openPreview} />;
     }
     if (active === "qa") return <QAView onPreview={openPreview} />;
+    if (active === "wiki") {
+      return (
+        <WikiView
+          pages={wikiPages}
+          suggestions={wikiSuggestions}
+          isAdmin={auth.isAdmin}
+          onRebuild={rebuildWikiSuggestions}
+          onApply={applyWikiSuggestion}
+        />
+      );
+    }
     if (active === "weekly") return <WeeklyView weekly={weekly} onPreview={openPreview} />;
     if (active === "settings" && auth.isAdmin) {
       return (

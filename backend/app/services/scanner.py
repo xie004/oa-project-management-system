@@ -29,6 +29,7 @@ from app.services.extractors import (
     parse_weekly_report,
 )
 from app.services.ai import ai_config, chat_completion, index_document_knowledge
+from app.services.ocr import enqueue_document_ocr, should_ocr_pdf
 
 
 SUPPORTED_EXTENSIONS = {".docx", ".doc", ".xlsx", ".xls", ".pdf", ".txt", ".md", ".wpsonline"}
@@ -482,6 +483,14 @@ def index_document(path: Path, hint: str = "", force: bool = False) -> dict[str,
             conn.execute("DELETE FROM weekly_reports WHERE document_id = ?", (document_id,))
         if category != "meeting":
             conn.execute("DELETE FROM meetings WHERE document_id = ?", (document_id,))
+
+        if should_ocr_pdf(path, result.text):
+            enqueue_document_ocr(document_id, path, conn=conn)
+        elif path.suffix.lower() == ".pdf":
+            conn.execute(
+                "UPDATE documents SET ocr_status = 'not_required', ocr_progress = 0, ocr_error = '' WHERE id = ?",
+                (document_id,),
+            )
 
         if result.text:
             index_document_knowledge(document_id, result.text, path.name, conn=conn)

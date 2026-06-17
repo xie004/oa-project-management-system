@@ -35,6 +35,7 @@ from app.database import (
 from app.services.exporter import build_weekly_summary, export_weekly_docx
 from app.services.extractors import extract_text
 from app.services.ai import answer_question, knowledge_status, list_chat_models, rebuild_knowledge, test_chat_model
+from app.services.ocr import combined_ocr_text, enqueue_document_ocr, ocr_pages, ocr_status, retry_document_ocr, worker
 from app.services.scanner import (
     apply_suggestion,
     dismiss_suggestion,
@@ -43,6 +44,7 @@ from app.services.scanner import (
     scan_all,
     watcher,
 )
+from app.services.wiki import apply_wiki_suggestion, list_wiki_pages, list_wiki_suggestions, rebuild_wiki_suggestions
 
 
 FRONTEND_DIST = SYSTEM_ROOT / "frontend" / "dist"
@@ -121,6 +123,10 @@ def startup() -> None:
         pass
     try:
         watcher.start()
+    except Exception:
+        pass
+    try:
+        worker.start()
     except Exception:
         pass
 
@@ -223,6 +229,64 @@ def api_knowledge_status(_: dict[str, Any] = Depends(admin_from_request)) -> dic
 @app.post("/api/knowledge/rebuild")
 def api_knowledge_rebuild(_: dict[str, Any] = Depends(admin_from_request)) -> dict[str, Any]:
     return rebuild_knowledge()
+
+
+@app.get("/api/ocr/status")
+def api_ocr_status(_: dict[str, Any] = Depends(admin_from_request)) -> dict[str, Any]:
+    return ocr_status()
+
+
+@app.post("/api/ocr/pause")
+def api_ocr_pause(_: dict[str, Any] = Depends(admin_from_request)) -> dict[str, Any]:
+    worker.pause()
+    return {"ok": True}
+
+
+@app.post("/api/ocr/documents/{document_id}/start")
+def api_ocr_start(document_id: int, _: dict[str, Any] = Depends(admin_from_request)) -> dict[str, Any]:
+    conn = get_connection()
+    try:
+        document = row_to_dict(conn.execute("SELECT * FROM documents WHERE id = ?", (document_id,)).fetchone())
+    finally:
+        conn.close()
+    if not document:
+        raise HTTPException(status_code=404, detail="文件记录不存在。")
+    path = Path(document["path"])
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="本地文件不存在。")
+    enqueue_document_ocr(document_id, path)
+    return {"ok": True}
+
+
+@app.post("/api/ocr/documents/{document_id}/retry")
+def api_ocr_retry(document_id: int, _: dict[str, Any] = Depends(admin_from_request)) -> dict[str, Any]:
+    result = retry_document_ocr(document_id)
+    if not result.get("ok"):
+        raise HTTPException(status_code=400, detail=result.get("error", "OCR 重试失败"))
+    return result
+
+
+@app.get("/api/wiki/pages")
+def api_wiki_pages() -> list[dict[str, Any]]:
+    return list_wiki_pages()
+
+
+@app.get("/api/wiki/suggestions")
+def api_wiki_suggestions(status: str = "pending", _: dict[str, Any] = Depends(admin_from_request)) -> list[dict[str, Any]]:
+    return list_wiki_suggestions(status)
+
+
+@app.post("/api/wiki/rebuild-suggestions")
+def api_wiki_rebuild_suggestions(_: dict[str, Any] = Depends(admin_from_request)) -> dict[str, Any]:
+    return rebuild_wiki_suggestions()
+
+
+@app.post("/api/wiki/suggestions/{suggestion_id}/apply")
+def api_wiki_apply(suggestion_id: int, _: dict[str, Any] = Depends(admin_from_request)) -> dict[str, Any]:
+    result = apply_wiki_suggestion(suggestion_id)
+    if not result.get("ok"):
+        raise HTTPException(status_code=400, detail=result.get("message", "应用 Wiki 建议失败"))
+    return result
 
 
 @app.post("/api/qa/ask")
@@ -589,12 +653,15 @@ def preview_document(document_id: int) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail="本地文件不存在，可能已移动或删除。")
 
     result = extract_text(path)
-    text = result.text or document.get("summary") or result.error or "该文件暂无法生成正文预览。"
+    ocr_text = combined_ocr_text(document_id)
+    pages = ocr_pages(document_id) if document.get("ocr_status") in {"completed", "partial", "failed", "processing", "pending"} else []
+    text = result.text or ocr_text or document.get("summary") or result.error or "该文件暂无法生成正文预览。"
     return {
         "document": document,
         "status": result.status,
         "error": result.error,
         "text": text,
+        "ocrPages": pages,
     }
 
 

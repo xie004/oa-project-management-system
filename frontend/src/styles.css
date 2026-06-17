@@ -1069,6 +1069,88 @@ main {
   line-height: 1.55;
 }
 
+.ocr-cell {
+  display: grid;
+  gap: 4px;
+  min-width: 120px;
+}
+
+.ocr-cell small {
+  color: var(--muted);
+}
+
+.compact-buttons {
+  gap: 6px;
+}
+
+.compact-buttons .ghost-button {
+  min-height: 28px;
+  padding: 0 8px;
+  font-size: 12px;
+}
+
+.wiki-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(260px, 1fr));
+  gap: 12px;
+}
+
+.wiki-card,
+.qa-answer-card {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-alt);
+  padding: 14px;
+}
+
+.wiki-card-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+
+.wiki-card-head span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.wiki-content,
+.wiki-suggestion-content {
+  margin: 0;
+  white-space: pre-wrap;
+  line-height: 1.6;
+  color: var(--text);
+  font-family: inherit;
+}
+
+.wiki-suggestion-content {
+  max-height: 220px;
+  overflow: auto;
+}
+
+.qa-answer-card h3 {
+  margin: 12px 0 6px;
+  font-size: 14px;
+}
+
+.qa-answer-card h3:first-child {
+  margin-top: 0;
+}
+
+.qa-answer-card p {
+  margin: 0;
+  line-height: 1.65;
+}
+
+.qa-answer-card ul {
+  margin: 0;
+  padding-left: 18px;
+  display: grid;
+  gap: 6px;
+  line-height: 1.55;
+}
+
 input,
 select,
 textarea {

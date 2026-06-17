@@ -118,7 +118,18 @@ def _field_path(data: Any, path: str) -> Any:
     return current
 
 
-def chat_completion(messages: list[dict[str, str]], config: dict[str, Any] | None = None, max_tokens: int = 1000) -> str:
+def _save_model_name(model_name: str) -> None:
+    conn = get_connection()
+    try:
+        current = {**DEFAULT_INTELLIGENT_ANALYSIS, **get_setting(conn, "intelligent_analysis", {})}
+        current["modelName"] = model_name
+        set_setting(conn, "intelligent_analysis", current)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def chat_completion(messages: list[dict[str, str]], config: dict[str, Any] | None = None, max_tokens: int = 1000, retry_on_model_error: bool = True) -> str:
     config = {**DEFAULT_INTELLIGENT_ANALYSIS, **(config or ai_config())}
     if not config.get("apiBaseUrl"):
         raise ValueError("聊天模型 API 地址未配置")
@@ -127,15 +138,7 @@ def chat_completion(messages: list[dict[str, str]], config: dict[str, Any] | Non
         models = list_chat_models(config)
         model_name = models.get("defaultModel")
         if model_name:
-            conn = get_connection()
-            try:
-                current = {**DEFAULT_INTELLIGENT_ANALYSIS, **get_setting(conn, "intelligent_analysis", {})}
-                if not current.get("modelName"):
-                    current["modelName"] = model_name
-                    set_setting(conn, "intelligent_analysis", current)
-                    conn.commit()
-            finally:
-                conn.close()
+            _save_model_name(model_name)
     if not model_name:
         raise ValueError("聊天模型名称未配置，且未能从 /models 自动读取模型")
     payload = {
@@ -144,12 +147,28 @@ def chat_completion(messages: list[dict[str, str]], config: dict[str, Any] | Non
         "temperature": 0.2,
         "max_tokens": max_tokens,
     }
-    data = _post_json(
-        _url(config["apiBaseUrl"], "/chat/completions"),
-        payload,
-        config.get("apiKey", ""),
-        int(config.get("timeoutSeconds") or 60),
-    )
+    try:
+        data = _post_json(
+            _url(config["apiBaseUrl"], "/chat/completions"),
+            payload,
+            config.get("apiKey", ""),
+            int(config.get("timeoutSeconds") or 60),
+        )
+    except RuntimeError as exc:
+        if not retry_on_model_error or "404" not in str(exc):
+            raise
+        refreshed = list_chat_models(config)
+        fallback_model = refreshed.get("defaultModel")
+        if not fallback_model or fallback_model == model_name:
+            raise
+        _save_model_name(fallback_model)
+        payload["model"] = fallback_model
+        data = _post_json(
+            _url(config["apiBaseUrl"], "/chat/completions"),
+            payload,
+            config.get("apiKey", ""),
+            int(config.get("timeoutSeconds") or 60),
+        )
     return data["choices"][0]["message"]["content"].strip()
 
 
@@ -478,9 +497,32 @@ def retrieve(query: str) -> list[dict[str, Any]]:
 
 def answer_question(question: str) -> dict[str, Any]:
     sources = retrieve(question)
+    fallback_sources = [
+        {
+            "documentId": item["document_id"],
+            "documentName": item["document_name"],
+            "snippet": compact_text(item["text"], 260),
+            "score": round(float(item.get("score") or 0), 4),
+        }
+        for item in sources
+    ]
+    try:
+        from app.services.wiki import answer_from_wiki
+
+        wiki_answer = answer_from_wiki(question, fallback_sources)
+        if wiki_answer:
+            return wiki_answer
+    except Exception:
+        pass
     if not sources:
         return {
             "answer": "未在项目资料中找到依据。",
+            "structured": {
+                "answer_summary": "未在项目资料中找到依据。",
+                "key_points": [],
+                "evidence": [],
+                "unknowns": ["当前 Wiki 和项目资料片段中未检索到足够依据。"],
+            },
             "sources": [],
             "retrievalMode": "hybrid",
         }
@@ -495,9 +537,10 @@ def answer_question(question: str) -> dict[str, Any]:
                     "role": "system",
                     "content": (
                         "你是项目资料问答助手，只能依据给定项目资料回答。"
-                        "请用中文回答，尽量结构化、具体、完整，但避免冗长；优先按要点列出结论、依据和待确认事项。"
-                        "每个关键结论后标注对应来源编号，例如“（来源1）”。"
+                        "请只输出 JSON 对象，字段为 answer_summary、key_points、evidence、unknowns、sources。"
+                        "key_points/evidence/unknowns 是字符串数组；sources 是来源数组。"
                         "不要编造资料中没有的信息；资料不足时必须回答：未在项目资料中找到依据。"
+                        "不要输出 Markdown，不要使用 # 或 *。"
                     ),
                 },
                 {
@@ -512,18 +555,38 @@ def answer_question(question: str) -> dict[str, Any]:
             ],
             max_tokens=900,
         )
+        structured = _parse_answer_json(answer)
     except Exception as exc:
         answer = f"已找到相关项目资料，但聊天模型暂不可用：{exc}"
+        structured = {
+            "answer_summary": answer,
+            "key_points": [],
+            "evidence": [],
+            "unknowns": [],
+        }
     return {
-        "answer": answer,
-        "sources": [
-            {
-                "documentId": item["document_id"],
-                "documentName": item["document_name"],
-                "snippet": compact_text(item["text"], 260),
-                "score": round(float(item.get("score") or 0), 4),
-            }
-            for item in sources
-        ],
+        "answer": structured.get("answer_summary") or answer,
+        "structured": structured,
+        "sources": fallback_sources,
         "retrievalMode": "hybrid",
+    }
+
+
+def _parse_answer_json(raw: str) -> dict[str, Any]:
+    cleaned = raw.strip()
+    if cleaned.startswith("```"):
+        cleaned = cleaned.strip("`").replace("json\n", "", 1).replace("JSON\n", "", 1)
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start >= 0 and end >= start:
+        cleaned = cleaned[start : end + 1]
+    try:
+        data = json.loads(cleaned)
+    except Exception:
+        return {"answer_summary": raw.replace("#", "").replace("*", ""), "key_points": [], "evidence": [], "unknowns": []}
+    return {
+        "answer_summary": str(data.get("answer_summary") or data.get("answer") or "").replace("#", "").replace("*", ""),
+        "key_points": [str(item).replace("#", "").replace("*", "") for item in data.get("key_points", []) if item],
+        "evidence": [str(item).replace("#", "").replace("*", "") for item in data.get("evidence", []) if item],
+        "unknowns": [str(item).replace("#", "").replace("*", "") for item in data.get("unknowns", []) if item],
     }
