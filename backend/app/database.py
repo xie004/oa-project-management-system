@@ -467,7 +467,17 @@ def init_db() -> None:
                 ocr_pages_total INTEGER NOT NULL DEFAULT 0,
                 ocr_pages_done INTEGER NOT NULL DEFAULT 0,
                 ocr_error TEXT,
-                ocr_at TEXT
+                ocr_at TEXT,
+                authority_level INTEGER NOT NULL DEFAULT 5,
+                authority_score REAL NOT NULL DEFAULT 45,
+                authority_scope TEXT NOT NULL DEFAULT '项目过程资料',
+                version_label TEXT,
+                effective_date TEXT,
+                is_current INTEGER NOT NULL DEFAULT 1,
+                authority_reason TEXT,
+                authority_status TEXT NOT NULL DEFAULT 'pending',
+                authority_note TEXT,
+                authority_updated_at TEXT
             );
 
             CREATE TABLE IF NOT EXISTS weekly_reports (
@@ -631,6 +641,23 @@ def init_db() -> None:
                 applied_at TEXT
             );
 
+            CREATE TABLE IF NOT EXISTS document_authority_suggestions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+                authority_level INTEGER NOT NULL,
+                authority_score REAL NOT NULL DEFAULT 50,
+                authority_scope TEXT,
+                version_label TEXT,
+                effective_date TEXT,
+                is_current INTEGER NOT NULL DEFAULT 1,
+                authority_reason TEXT,
+                authority_note TEXT,
+                confidence REAL NOT NULL DEFAULT 0.7,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TEXT NOT NULL,
+                applied_at TEXT
+            );
+
             CREATE INDEX IF NOT EXISTS idx_documents_category ON documents(doc_category);
             CREATE INDEX IF NOT EXISTS idx_suggestions_status ON update_suggestions(status);
             CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
@@ -639,6 +666,7 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_chunks_document ON knowledge_chunks(document_id);
             CREATE INDEX IF NOT EXISTS idx_ocr_pages_document ON ocr_pages(document_id);
             CREATE INDEX IF NOT EXISTS idx_wiki_suggestions_status ON wiki_suggestions(status);
+            CREATE INDEX IF NOT EXISTS idx_document_authority_suggestions_status ON document_authority_suggestions(status);
             """
         )
         ensure_schema(conn)
@@ -665,6 +693,16 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         "ocr_pages_done": "INTEGER NOT NULL DEFAULT 0",
         "ocr_error": "TEXT",
         "ocr_at": "TEXT",
+        "authority_level": "INTEGER NOT NULL DEFAULT 5",
+        "authority_score": "REAL NOT NULL DEFAULT 45",
+        "authority_scope": "TEXT NOT NULL DEFAULT '项目过程资料'",
+        "version_label": "TEXT",
+        "effective_date": "TEXT",
+        "is_current": "INTEGER NOT NULL DEFAULT 1",
+        "authority_reason": "TEXT",
+        "authority_status": "TEXT NOT NULL DEFAULT 'pending'",
+        "authority_note": "TEXT",
+        "authority_updated_at": "TEXT",
     }
     for name, definition in document_columns.items():
         if name not in columns:
@@ -713,8 +751,26 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
             created_at TEXT NOT NULL,
             applied_at TEXT
         );
+        CREATE TABLE IF NOT EXISTS document_authority_suggestions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+            authority_level INTEGER NOT NULL,
+            authority_score REAL NOT NULL DEFAULT 50,
+            authority_scope TEXT,
+            version_label TEXT,
+            effective_date TEXT,
+            is_current INTEGER NOT NULL DEFAULT 1,
+            authority_reason TEXT,
+            authority_note TEXT,
+            confidence REAL NOT NULL DEFAULT 0.7,
+            status TEXT NOT NULL DEFAULT 'pending',
+            created_at TEXT NOT NULL,
+            applied_at TEXT
+        );
         CREATE INDEX IF NOT EXISTS idx_ocr_pages_document ON ocr_pages(document_id);
         CREATE INDEX IF NOT EXISTS idx_wiki_suggestions_status ON wiki_suggestions(status);
+        CREATE INDEX IF NOT EXISTS idx_documents_authority ON documents(authority_level, authority_score);
+        CREATE INDEX IF NOT EXISTS idx_document_authority_suggestions_status ON document_authority_suggestions(status);
         """
     )
 

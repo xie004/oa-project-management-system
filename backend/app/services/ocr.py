@@ -294,8 +294,10 @@ def process_document_ocr(document_id: int) -> dict[str, Any]:
         text = combined_ocr_text(document_id, conn)
         if text:
             from app.services.ai import index_document_knowledge
+            from app.services.authority import analyze_document_authority
 
             index_document_knowledge(document_id, text, document["name"], conn=conn)
+            analyze_document_authority(document_id, text, conn=conn)
             conn.execute(
                 """
                 UPDATE documents

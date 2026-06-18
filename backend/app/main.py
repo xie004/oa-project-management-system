@@ -34,9 +34,19 @@ from app.database import (
 )
 from app.services.exporter import build_weekly_summary, export_weekly_docx
 from app.services.extractors import extract_text
-from app.services.ai import answer_question, knowledge_status, list_chat_models, rebuild_knowledge, test_chat_model
+from app.services.ai import answer_question, knowledge_rebuild_status, knowledge_status, list_chat_models, start_knowledge_rebuild_job, test_chat_model
+from app.services.authority import (
+    apply_authority_suggestion,
+    authority_analyze_status,
+    dismiss_authority_suggestion,
+    list_authority_suggestions,
+    list_document_authority,
+    start_authority_analyze_job,
+    update_document_authority,
+)
 from app.services.ocr import combined_ocr_text, enqueue_document_ocr, ocr_pages, ocr_status, retry_document_ocr, worker
 from app.services.scanner import (
+    apply_all_suggestions,
     apply_suggestion,
     dismiss_suggestion,
     list_documents,
@@ -44,7 +54,7 @@ from app.services.scanner import (
     scan_all,
     watcher,
 )
-from app.services.wiki import apply_wiki_suggestion, list_wiki_pages, list_wiki_suggestions, rebuild_wiki_suggestions
+from app.services.wiki import apply_all_wiki_suggestions, apply_wiki_suggestion, list_wiki_pages, list_wiki_suggestions, start_wiki_rebuild_job, wiki_job_status
 
 
 FRONTEND_DIST = SYSTEM_ROOT / "frontend" / "dist"
@@ -228,7 +238,66 @@ def api_knowledge_status(_: dict[str, Any] = Depends(admin_from_request)) -> dic
 
 @app.post("/api/knowledge/rebuild")
 def api_knowledge_rebuild(_: dict[str, Any] = Depends(admin_from_request)) -> dict[str, Any]:
-    return rebuild_knowledge()
+    return start_knowledge_rebuild_job()
+
+
+@app.get("/api/knowledge/rebuild-status")
+def api_knowledge_rebuild_status(_: dict[str, Any] = Depends(admin_from_request)) -> dict[str, Any]:
+    return knowledge_rebuild_status()
+
+
+@app.get("/api/document-authority")
+def api_document_authority(_: dict[str, Any] = Depends(admin_from_request)) -> list[dict[str, Any]]:
+    return list_document_authority()
+
+
+@app.patch("/api/document-authority/{document_id}")
+def api_update_document_authority(
+    document_id: int,
+    payload: GenericPatchPayload,
+    _: dict[str, Any] = Depends(admin_from_request),
+) -> dict[str, Any]:
+    result = update_document_authority(document_id, payload.values)
+    if not result.get("ok"):
+        raise HTTPException(status_code=400, detail=result.get("message", "文档权威更新失败"))
+    return result
+
+
+@app.post("/api/document-authority/analyze")
+def api_analyze_document_authority(_: dict[str, Any] = Depends(admin_from_request)) -> dict[str, Any]:
+    return start_authority_analyze_job()
+
+
+@app.get("/api/document-authority/analyze-status")
+def api_document_authority_analyze_status(_: dict[str, Any] = Depends(admin_from_request)) -> dict[str, Any]:
+    return authority_analyze_status()
+
+
+@app.get("/api/document-authority/suggestions")
+def api_document_authority_suggestions(
+    status: str = "pending",
+    _: dict[str, Any] = Depends(admin_from_request),
+) -> list[dict[str, Any]]:
+    return list_authority_suggestions(status)
+
+
+@app.post("/api/document-authority/suggestions/{suggestion_id}/apply")
+def api_apply_document_authority_suggestion(
+    suggestion_id: int,
+    _: dict[str, Any] = Depends(admin_from_request),
+) -> dict[str, Any]:
+    result = apply_authority_suggestion(suggestion_id)
+    if not result.get("ok"):
+        raise HTTPException(status_code=400, detail=result.get("message", "权威建议应用失败"))
+    return result
+
+
+@app.post("/api/document-authority/suggestions/{suggestion_id}/dismiss")
+def api_dismiss_document_authority_suggestion(
+    suggestion_id: int,
+    _: dict[str, Any] = Depends(admin_from_request),
+) -> dict[str, Any]:
+    return dismiss_authority_suggestion(suggestion_id)
 
 
 @app.get("/api/ocr/status")
@@ -278,7 +347,12 @@ def api_wiki_suggestions(status: str = "pending", _: dict[str, Any] = Depends(ad
 
 @app.post("/api/wiki/rebuild-suggestions")
 def api_wiki_rebuild_suggestions(_: dict[str, Any] = Depends(admin_from_request)) -> dict[str, Any]:
-    return rebuild_wiki_suggestions()
+    return start_wiki_rebuild_job()
+
+
+@app.get("/api/wiki/rebuild-status")
+def api_wiki_rebuild_status(_: dict[str, Any] = Depends(admin_from_request)) -> dict[str, Any]:
+    return wiki_job_status()
 
 
 @app.post("/api/wiki/suggestions/{suggestion_id}/apply")
@@ -287,6 +361,11 @@ def api_wiki_apply(suggestion_id: int, _: dict[str, Any] = Depends(admin_from_re
     if not result.get("ok"):
         raise HTTPException(status_code=400, detail=result.get("message", "应用 Wiki 建议失败"))
     return result
+
+
+@app.post("/api/wiki/suggestions/apply-all")
+def api_wiki_apply_all(_: dict[str, Any] = Depends(admin_from_request)) -> dict[str, Any]:
+    return apply_all_wiki_suggestions()
 
 
 @app.post("/api/qa/ask")
@@ -676,6 +755,11 @@ def api_apply_suggestion(suggestion_id: int) -> dict[str, Any]:
     if not result.get("ok"):
         raise HTTPException(status_code=400, detail=result.get("message", "应用建议失败。"))
     return result
+
+
+@app.post("/api/suggestions/apply-all")
+def api_apply_all_suggestions() -> dict[str, Any]:
+    return apply_all_suggestions()
 
 
 @app.post("/api/suggestions/{suggestion_id}/dismiss")

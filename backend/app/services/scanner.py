@@ -29,6 +29,7 @@ from app.services.extractors import (
     parse_weekly_report,
 )
 from app.services.ai import ai_config, chat_completion, index_document_knowledge
+from app.services.authority import analyze_document_authority
 from app.services.ocr import enqueue_document_ocr, should_ocr_pdf
 
 
@@ -494,6 +495,7 @@ def index_document(path: Path, hint: str = "", force: bool = False) -> dict[str,
 
         if result.text:
             index_document_knowledge(document_id, result.text, path.name, conn=conn)
+            analyze_document_authority(document_id, result.text, conn=conn, force=force)
             auto_link_deliverables(conn, document_id, path.name)
             if category == "weekly_report":
                 save_weekly_report(conn, document_id, result.text, path.name)
@@ -520,6 +522,8 @@ def index_document(path: Path, hint: str = "", force: bool = False) -> dict[str,
                             0.65,
                         )
             save_ai_analysis_suggestions(conn, document_id, result.text, path.name, category)
+        else:
+            analyze_document_authority(document_id, "", conn=conn, force=force)
 
         conn.commit()
         return {"path": str(path), "status": result.status, "category": category}
@@ -586,6 +590,146 @@ def list_suggestions(status: str = "pending") -> list[dict[str, Any]]:
         return suggestions
     finally:
         conn.close()
+
+
+DELIVERABLE_GENERIC_TERMS = {
+    "报告",
+    "材料",
+    "文档",
+    "清单",
+    "方案",
+    "手册",
+    "记录",
+    "文件",
+    "测评",
+    "项目",
+    "交付",
+    "交付物",
+}
+
+
+def _normalize_deliverable_title(value: str) -> str:
+    return re.sub(r"[^\w\u4e00-\u9fff]+", "", (value or "").lower())
+
+
+def _deliverable_title_tokens(value: str) -> set[str]:
+    normalized = _normalize_deliverable_title(value)
+    tokens = {term for term in re.findall(r"[\u4e00-\u9fffA-Za-z0-9]{2,}", value or "") if term not in DELIVERABLE_GENERIC_TERMS}
+    tokens.update(
+        normalized[index : index + 2]
+        for index in range(max(0, len(normalized) - 1))
+        if normalized[index : index + 2] not in DELIVERABLE_GENERIC_TERMS
+    )
+    return {token for token in tokens if len(token) >= 2}
+
+
+def _deliverable_match_score(suggestion_title: str, existing_name: str) -> float:
+    left = _normalize_deliverable_title(suggestion_title)
+    right = _normalize_deliverable_title(existing_name)
+    if not left or not right:
+        return 0
+    if left == right:
+        return 1.0
+    shorter, longer = sorted([left, right], key=len)
+    if len(shorter) >= 6 and shorter in longer:
+        return 0.92
+    left_tokens = _deliverable_title_tokens(suggestion_title)
+    right_tokens = _deliverable_title_tokens(existing_name)
+    if not left_tokens or not right_tokens:
+        return 0
+    overlap = len(left_tokens & right_tokens)
+    union = len(left_tokens | right_tokens)
+    coverage = overlap / min(len(left_tokens), len(right_tokens))
+    jaccard = overlap / union
+    return max(jaccard, coverage * 0.78)
+
+
+def _find_matching_deliverable(conn: sqlite3.Connection, title: str) -> dict[str, Any] | None:
+    rows = rows_to_dicts(conn.execute("SELECT * FROM deliverables ORDER BY sort_order, id").fetchall())
+    scored = sorted(
+        ((_deliverable_match_score(title, row["name"]), row) for row in rows),
+        reverse=True,
+        key=lambda item: item[0],
+    )
+    if not scored:
+        return None
+    score, row = scored[0]
+    return row if score >= 0.86 else None
+
+
+def _append_suggestion_description(existing: str, addition: str) -> str:
+    existing = (existing or "").strip()
+    addition = compact_text(addition or "", 900)
+    if not addition:
+        return existing
+    if not existing:
+        return addition
+    if addition in existing:
+        return existing
+    return compact_text(f"{existing}\n\n智能建议补充：{addition}", 1800)
+
+
+def _apply_deliverable_suggestion(
+    conn: sqlite3.Connection,
+    suggestion: sqlite3.Row,
+    payload: dict[str, Any],
+    now: str,
+) -> dict[str, Any]:
+    title = compact_text(payload.get("title") or suggestion["title"], 160)
+    description = compact_text(payload.get("description") or suggestion["description"], 1200)
+    if not title:
+        return {"ok": False, "message": "交付物建议缺少标题。"}
+
+    source_document_id = payload.get("source_document_id") or suggestion["document_id"]
+    status = payload.get("status") or "not_started"
+    owner = payload.get("owner") or ""
+    requirement_source = payload.get("source") or "智能建议"
+    matched = _find_matching_deliverable(conn, title)
+
+    if matched:
+        updates: dict[str, Any] = {
+            "description": _append_suggestion_description(matched.get("description") or "", description),
+        }
+        if not matched.get("owner") and owner:
+            updates["owner"] = owner
+        if not matched.get("requirement_source") and requirement_source:
+            updates["requirement_source"] = requirement_source
+        if not matched.get("document_id") and source_document_id:
+            updates["document_id"] = source_document_id
+        if (matched.get("status") or "not_started") == "not_started" and status:
+            updates["status"] = status
+
+        assignments = ", ".join([f"{key} = ?" for key in updates])
+        conn.execute(
+            f"UPDATE deliverables SET {assignments}, updated_at = ? WHERE id = ?",
+            [*updates.values(), now, matched["id"]],
+        )
+        return {"ok": True, "deliverableId": matched["id"], "action": "updated"}
+
+    next_order = conn.execute("SELECT COALESCE(MAX(sort_order), 0) + 1 AS value FROM deliverables").fetchone()["value"]
+    cursor = conn.execute(
+        """
+        INSERT INTO deliverables(
+            name, requirement_source, description, status, owner, planned_date,
+            submitted_date, document_id, sort_order, created_at, updated_at
+        )
+        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            title,
+            requirement_source,
+            description,
+            status,
+            owner,
+            payload.get("planned_date", ""),
+            payload.get("submitted_date", ""),
+            source_document_id,
+            next_order,
+            now,
+            now,
+        ),
+    )
+    return {"ok": True, "deliverableId": cursor.lastrowid, "action": "created"}
 
 
 def apply_suggestion(suggestion_id: int) -> dict[str, Any]:
@@ -690,6 +834,10 @@ def apply_suggestion(suggestion_id: int) -> dict[str, Any]:
                     now,
                 ),
             )
+        elif suggestion_type == "deliverable":
+            deliverable_result = _apply_deliverable_suggestion(conn, suggestion, payload, now)
+            if not deliverable_result.get("ok"):
+                return deliverable_result
         else:
             return {"ok": False, "message": f"暂不支持应用 {suggestion_type} 类型。"}
 
@@ -698,12 +846,37 @@ def apply_suggestion(suggestion_id: int) -> dict[str, Any]:
             (now, suggestion_id),
         )
         conn.commit()
+        if suggestion_type == "deliverable":
+            return {"ok": True, **deliverable_result}
         return {"ok": True}
     except Exception as exc:
         conn.rollback()
         return {"ok": False, "message": str(exc)}
     finally:
         conn.close()
+
+
+def apply_all_suggestions() -> dict[str, Any]:
+    conn = get_connection()
+    try:
+        ids = [
+            row["id"]
+            for row in conn.execute(
+                "SELECT id FROM update_suggestions WHERE status = 'pending' ORDER BY created_at, id"
+            ).fetchall()
+        ]
+    finally:
+        conn.close()
+
+    applied = 0
+    failed: list[dict[str, Any]] = []
+    for suggestion_id in ids:
+        result = apply_suggestion(int(suggestion_id))
+        if result.get("ok"):
+            applied += 1
+        else:
+            failed.append({"id": suggestion_id, "message": result.get("message", "应用失败")})
+    return {"ok": not failed, "applied": applied, "failed": failed, "total": len(ids)}
 
 
 def dismiss_suggestion(suggestion_id: int) -> dict[str, Any]:

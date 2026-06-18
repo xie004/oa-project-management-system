@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
   AlertTriangle,
@@ -26,6 +26,7 @@ import {
   RefreshCw,
   RotateCcw,
   Settings,
+  ShieldCheck,
   Sparkles,
   X
 } from "lucide-react";
@@ -85,6 +86,7 @@ const navItems = [
   { id: "suggestions", label: "智能建议", icon: Sparkles },
   { id: "documents", label: "资料台账", icon: FolderCog },
   { id: "deliverables", label: "交付物清单", icon: ClipboardCheck },
+  { id: "authority", label: "文档权威", icon: ShieldCheck, adminOnly: true },
   { id: "wiki", label: "项目 Wiki", icon: BookOpen },
   { id: "qa", label: "智能问答", icon: MessageSquareText },
   { id: "weekly", label: "周报汇总", icon: ListChecks },
@@ -116,6 +118,20 @@ const ocrStatusText = {
   completed: "已OCR",
   failed: "OCR失败",
   partial: "部分完成"
+};
+
+const authorityLabels = {
+  1: "合同正文",
+  2: "合同附件/招投标/投标响应",
+  3: "正式变更/确认文件",
+  4: "会议纪要/决议",
+  5: "周报/过程资料"
+};
+
+const authorityStatusText = {
+  confirmed: "已确认",
+  pending: "待确认",
+  manual: "手动调整"
 };
 
 const colorText = {
@@ -648,7 +664,7 @@ function DashboardWorkspace({ widgets, renderWidget, resetSignal }) {
   );
 }
 
-function Dashboard({ data, onScan, onPreview, resetLayoutSignal }) {
+function Dashboard({ data, onScan, onPreview, resetLayoutSignal, scanLoading }) {
   const [taskStatusView, setTaskStatusView] = useState(loadTaskStatusView);
 
   useEffect(() => {
@@ -690,8 +706,8 @@ function Dashboard({ data, onScan, onPreview, resetLayoutSignal }) {
     suggestions: {
       title: "智能更新",
       action: (
-        <button className="icon-button" onClick={onScan} title="重新扫描">
-          <RefreshCw size={17} />
+        <button className="icon-button" onClick={onScan} title="重新扫描" disabled={scanLoading}>
+          {scanLoading ? <span className="button-spinner" /> : <RefreshCw size={17} />}
         </button>
       )
     },
@@ -1028,9 +1044,17 @@ function ChangesView({ changes, onPreview }) {
   );
 }
 
-function SuggestionsView({ suggestions, onApply, onDismiss, onPreview }) {
+function SuggestionsView({ suggestions, onApply, onApplyAll, onDismiss, onPreview, actionStates = {} }) {
   return (
-    <Section title="待确认智能建议">
+    <Section
+      title="待确认智能建议"
+      action={
+        <button className="primary-button" onClick={onApplyAll} disabled={!suggestions.length || actionStates["apply-all-suggestions"]}>
+          {actionStates["apply-all-suggestions"] ? <span className="button-spinner" /> : <Check size={16} />}
+          {actionStates["apply-all-suggestions"] ? "应用中" : "全部应用"}
+        </button>
+      }
+    >
       <div className="suggestion-list">
         {suggestions.map((item) => (
           <div className="suggestion" key={item.id}>
@@ -1046,13 +1070,13 @@ function SuggestionsView({ suggestions, onApply, onDismiss, onPreview }) {
               </small>
             </div>
             <div className="suggestion-actions">
-              <button className="primary-button" onClick={() => onApply(item.id)}>
-                <Check size={16} />
-                应用
+              <button className="primary-button" onClick={() => onApply(item.id)} disabled={actionStates[`apply-suggestion-${item.id}`]}>
+                {actionStates[`apply-suggestion-${item.id}`] ? <span className="button-spinner" /> : <Check size={16} />}
+                {actionStates[`apply-suggestion-${item.id}`] ? "应用中" : "应用"}
               </button>
-              <button className="ghost-button" onClick={() => onDismiss(item.id)}>
-                <X size={16} />
-                忽略
+              <button className="ghost-button" onClick={() => onDismiss(item.id)} disabled={actionStates[`dismiss-suggestion-${item.id}`]}>
+                {actionStates[`dismiss-suggestion-${item.id}`] ? <span className="button-spinner" /> : <X size={16} />}
+                {actionStates[`dismiss-suggestion-${item.id}`] ? "处理中" : "忽略"}
               </button>
             </div>
           </div>
@@ -1063,7 +1087,7 @@ function SuggestionsView({ suggestions, onApply, onDismiss, onPreview }) {
   );
 }
 
-function DocumentsView({ documents, onPreview, isAdmin, onStartOcr, onRetryOcr }) {
+function DocumentsView({ documents, onPreview, isAdmin, onStartOcr, onRetryOcr, actionStates = {} }) {
   return (
     <Section title="资料台账">
       <div className="table-wrap">
@@ -1091,8 +1115,16 @@ function DocumentsView({ documents, onPreview, isAdmin, onStartOcr, onRetryOcr }
                     {doc.ocr_error && <small className="error">{doc.ocr_error}</small>}
                     {isAdmin && doc.extension === ".pdf" && (
                       <div className="button-row compact-buttons">
-                        <button className="ghost-button" onClick={() => onStartOcr(doc.id)}>OCR</button>
-                        {["failed", "partial"].includes(doc.ocr_status) && <button className="ghost-button" onClick={() => onRetryOcr(doc.id)}>重试</button>}
+                        <button className="ghost-button" onClick={() => onStartOcr(doc.id)} disabled={actionStates[`ocr-start-${doc.id}`]}>
+                          {actionStates[`ocr-start-${doc.id}`] ? <span className="button-spinner" /> : null}
+                          {actionStates[`ocr-start-${doc.id}`] ? "启动中" : "OCR"}
+                        </button>
+                        {["failed", "partial"].includes(doc.ocr_status) && (
+                          <button className="ghost-button" onClick={() => onRetryOcr(doc.id)} disabled={actionStates[`ocr-retry-${doc.id}`]}>
+                            {actionStates[`ocr-retry-${doc.id}`] ? <span className="button-spinner" /> : null}
+                            {actionStates[`ocr-retry-${doc.id}`] ? "重试中" : "重试"}
+                          </button>
+                        )}
                       </div>
                     )}
                   </div>
@@ -1192,6 +1224,182 @@ function DeliverablesView({ deliverables, documents, onPatch, onPreview }) {
   );
 }
 
+function AuthorityView({
+  authorityDocs,
+  authoritySuggestions,
+  analyzeStatus,
+  onAnalyze,
+  onPatch,
+  onApplySuggestion,
+  onDismissSuggestion,
+  onPreview,
+  actionStates = {}
+}) {
+  const running = !!analyzeStatus?.running || !!actionStates["analyze-authority"];
+  const pending = authoritySuggestions.length;
+  const confirmed = authorityDocs.filter((doc) => ["confirmed", "manual"].includes(doc.authority_status)).length;
+  const high = authorityDocs.filter((doc) => Number(doc.authority_level || 5) <= 2).length;
+  const indexed = authorityDocs.filter((doc) => Number(doc.chunk_count || 0) > 0).length;
+
+  return (
+    <div className="view-grid">
+      <div className="stats-grid deliverable-stats">
+        <Stat label="权威已确认" value={confirmed} icon={ShieldCheck} tone="green" />
+        <Stat label="高权威资料" value={high} icon={Flag} tone="blue" />
+        <Stat label="待确认建议" value={pending} icon={AlertTriangle} tone="amber" />
+        <Stat label="已入知识库" value={indexed} icon={BookOpen} tone="neutral" />
+      </div>
+      <Section
+        title="文档权威分析"
+        action={
+          <button className="ghost-button" onClick={onAnalyze} disabled={running}>
+            {running ? <span className="button-spinner" /> : <RefreshCw size={16} />}
+            {running ? "分析中" : "重新分析"}
+          </button>
+        }
+      >
+        {running ? (
+          <div className="wiki-job-banner">
+            <span className="qa-spinner" />
+            <div>
+              <strong>正在后台分析文档权威层级</strong>
+              <p>
+                进度 {analyzeStatus.progress || 0}/{analyzeStatus.total || 0}，
+                自动确认 {analyzeStatus.autoApplied || 0} 个，
+                生成建议 {analyzeStatus.suggested || 0} 个。
+              </p>
+            </div>
+          </div>
+        ) : (
+          <p className="muted-text">系统会优先按文件名、目录、资料分类和正文特征判断权威层级。高置信自动生效，模糊资料进入待确认建议。</p>
+        )}
+        {!!analyzeStatus?.error && <div className="error">权威分析失败：{analyzeStatus.error}</div>}
+      </Section>
+
+      <Section title="待确认权威建议">
+        <div className="suggestion-list">
+          {authoritySuggestions.map((item) => (
+            <div className="suggestion" key={item.id}>
+              <div className="suggestion-main">
+                <div className="suggestion-title">
+                  <StatusPill value={item.authority_label} color="blue" />
+                  <strong>{item.document_name}</strong>
+                </div>
+                <p>{item.authority_reason}</p>
+                <small>
+                  适用范围：{item.authority_scope || "-"} · 置信度 {Math.round((item.confidence || 0) * 100)}%
+                </small>
+                <small>
+                  <FileButton documentId={item.document_id} name={item.document_path} onPreview={onPreview} />
+                </small>
+              </div>
+              <div className="suggestion-actions">
+                <button className="primary-button" onClick={() => onApplySuggestion(item.id)} disabled={actionStates[`apply-authority-${item.id}`]}>
+                  {actionStates[`apply-authority-${item.id}`] ? <span className="button-spinner" /> : <Check size={16} />}
+                  {actionStates[`apply-authority-${item.id}`] ? "应用中" : "应用"}
+                </button>
+                <button className="ghost-button" onClick={() => onDismissSuggestion(item.id)} disabled={actionStates[`dismiss-authority-${item.id}`]}>
+                  {actionStates[`dismiss-authority-${item.id}`] ? <span className="button-spinner" /> : <X size={16} />}
+                  {actionStates[`dismiss-authority-${item.id}`] ? "处理中" : "忽略"}
+                </button>
+              </div>
+            </div>
+          ))}
+          {!authoritySuggestions.length && <Empty text="暂无待确认权威建议" />}
+        </div>
+      </Section>
+
+      <Section title="文档权威台账">
+        <div className="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>文件</th>
+                <th>权威等级</th>
+                <th>权威分</th>
+                <th>当前有效</th>
+                <th>适用范围</th>
+                <th>版本/日期</th>
+                <th>状态</th>
+                <th>判断依据与备注</th>
+              </tr>
+            </thead>
+            <tbody>
+              {authorityDocs.map((doc) => (
+                <tr key={doc.id}>
+                  <td className="wide-cell">
+                    <FileButton documentId={doc.id} name={doc.name} onPreview={onPreview} />
+                    <p>{typeText[doc.doc_category] || doc.doc_category} · {doc.chunk_count || 0} 个片段</p>
+                  </td>
+                  <td>
+                    <select
+                      value={doc.authority_level || 5}
+                      onChange={(e) => onPatch(doc.id, { authority_level: Number(e.target.value) })}
+                    >
+                      {Object.entries(authorityLabels).map(([value, label]) => (
+                        <option value={value} key={value}>{value}. {label}</option>
+                      ))}
+                    </select>
+                  </td>
+                  <td>
+                    <input
+                      type="number"
+                      min="0"
+                      max="100"
+                      value={Math.round(doc.authority_score || 0)}
+                      onChange={(e) => onPatch(doc.id, { authority_score: Number(e.target.value) })}
+                    />
+                  </td>
+                  <td>
+                    <label className="checkbox-row">
+                      <input
+                        type="checkbox"
+                        checked={!!doc.is_current}
+                        onChange={(e) => onPatch(doc.id, { is_current: e.target.checked })}
+                      />
+                      有效
+                    </label>
+                  </td>
+                  <td>
+                    <textarea
+                      rows={2}
+                      value={doc.authority_scope || ""}
+                      onChange={(e) => onPatch(doc.id, { authority_scope: e.target.value })}
+                    />
+                  </td>
+                  <td>
+                    <input
+                      value={doc.version_label || ""}
+                      placeholder="版本"
+                      onChange={(e) => onPatch(doc.id, { version_label: e.target.value })}
+                    />
+                    <input
+                      type="date"
+                      value={formatDate(doc.effective_date) === "-" ? "" : formatDate(doc.effective_date)}
+                      onChange={(e) => onPatch(doc.id, { effective_date: e.target.value })}
+                    />
+                  </td>
+                  <td><StatusPill value={authorityStatusText[doc.authority_status] || doc.authority_status} color={doc.authority_status === "pending" ? "amber" : "green"} /></td>
+                  <td className="wide-cell">
+                    <p>{doc.authority_reason || "-"}</p>
+                    <textarea
+                      rows={2}
+                      value={doc.authority_note || ""}
+                      placeholder="管理员备注"
+                      onChange={(e) => onPatch(doc.id, { authority_note: e.target.value })}
+                    />
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          {!authorityDocs.length && <Empty />}
+        </div>
+      </Section>
+    </div>
+  );
+}
+
 function WeeklyView({ weekly, onPreview }) {
   const latest = weekly.latest_weekly || {};
   const profile = weekly.profile || {};
@@ -1248,20 +1456,49 @@ function WeeklyView({ weekly, onPreview }) {
   );
 }
 
-function WikiView({ pages, suggestions, isAdmin, onRebuild, onApply }) {
+function WikiView({ pages, suggestions, isAdmin, onRebuild, onApply, onApplyAll, rebuildStatus, actionStates = {}, onPreview }) {
+  const running = !!rebuildStatus?.running || !!actionStates["rebuild-wiki"];
+  const renderSources = (sources = []) => (
+    <div className="wiki-source-list">
+      {sources.slice(0, 5).map((source, index) => (
+        <div className="wiki-source-item" key={`${source.documentId || source.documentName || "baseline"}-${index}`}>
+          <div className="source-title-line">
+            <StatusPill value={source.authorityLabel || source.sourceType || "来源"} color={source.isPrimaryBasis ? "green" : "blue"} />
+            {source.isPrimaryBasis && <span className="mini-badge">主依据</span>}
+          </div>
+          {source.documentId ? (
+            <FileButton documentId={source.documentId} name={source.documentName} onPreview={onPreview} />
+          ) : (
+            <strong>{source.documentName || "项目计划基线"}</strong>
+          )}
+          {source.snippet && <p>{source.snippet}</p>}
+        </div>
+      ))}
+      {!sources.length && <p className="muted-text">暂无来源记录</p>}
+    </div>
+  );
   return (
     <div className="view-grid">
       <Section
         title="项目 Wiki"
         action={
           isAdmin && (
-            <button className="ghost-button" onClick={onRebuild}>
-              <RefreshCw size={16} />
-              生成更新建议
+            <button className="ghost-button" onClick={onRebuild} disabled={running}>
+              {running ? <span className="button-spinner" /> : <RefreshCw size={16} />}
+              {running ? "生成中" : "生成更新建议"}
             </button>
           )
         }
       >
+        {running && (
+          <div className="wiki-job-banner">
+            <span className="qa-spinner" />
+            <div>
+              <strong>Wiki 更新建议正在后台生成</strong>
+              <p>进度 {rebuildStatus.progress || 0}/{rebuildStatus.total || 9}，可切换页面或关闭浏览器，不影响后台任务。</p>
+            </div>
+          </div>
+        )}
         <div className="wiki-grid">
           {pages.map((page) => (
             <article className="wiki-card" key={page.page_key}>
@@ -1269,6 +1506,7 @@ function WikiView({ pages, suggestions, isAdmin, onRebuild, onApply }) {
                 <strong>{page.title}</strong>
                 <span>{formatDate(page.updated_at)}</span>
               </div>
+              {renderSources(page.sources || [])}
               <pre className="wiki-content">{page.content || "暂无内容，生成并确认 Wiki 更新建议后显示。"}</pre>
             </article>
           ))}
@@ -1276,7 +1514,15 @@ function WikiView({ pages, suggestions, isAdmin, onRebuild, onApply }) {
         </div>
       </Section>
       {isAdmin && (
-        <Section title="Wiki 更新建议">
+        <Section
+          title="Wiki 更新建议"
+          action={
+            <button className="primary-button" onClick={onApplyAll} disabled={!suggestions.length || actionStates["apply-all-wiki"]}>
+              {actionStates["apply-all-wiki"] ? <span className="button-spinner" /> : <Check size={16} />}
+              {actionStates["apply-all-wiki"] ? "应用中" : "全部应用"}
+            </button>
+          }
+        >
           <div className="suggestion-list">
             {suggestions.map((item) => (
               <div className="suggestion" key={item.id}>
@@ -1286,11 +1532,12 @@ function WikiView({ pages, suggestions, isAdmin, onRebuild, onApply }) {
                     <strong>{item.title}</strong>
                   </div>
                   <pre className="wiki-suggestion-content">{item.content}</pre>
+                  {renderSources(item.sources || [])}
                 </div>
                 <div className="suggestion-actions">
-                  <button className="primary-button" onClick={() => onApply(item.id)}>
-                    <Check size={16} />
-                    应用
+                  <button className="primary-button" onClick={() => onApply(item.id)} disabled={actionStates[`apply-wiki-${item.id}`]}>
+                    {actionStates[`apply-wiki-${item.id}`] ? <span className="button-spinner" /> : <Check size={16} />}
+                    {actionStates[`apply-wiki-${item.id}`] ? "应用中" : "应用"}
                   </button>
                 </div>
               </div>
@@ -1333,7 +1580,11 @@ function StructuredAnswer({ answer, onPreview }) {
         {(answer.sources || []).map((source, index) => (
           <div className="source-card" key={`${source.documentId || source.documentName || "wiki"}-${index}`}>
             <div className="source-card-head">
-              <strong>来源 {index + 1}</strong>
+              <div className="source-title-line">
+                <strong>来源 {index + 1}</strong>
+                {source.authorityLabel && <StatusPill value={source.authorityLabel} color={source.isPrimaryBasis ? "green" : "blue"} />}
+                {source.isPrimaryBasis && <span className="mini-badge">主依据</span>}
+              </div>
               {source.documentId ? (
                 <FileButton documentId={source.documentId} name={source.documentName} onPreview={onPreview} />
               ) : (
@@ -1341,6 +1592,7 @@ function StructuredAnswer({ answer, onPreview }) {
               )}
             </div>
             <p>{source.snippet}</p>
+            {source.conflictNote && <p className="conflict-note">{source.conflictNote}</p>}
           </div>
         ))}
         {!(answer.sources || []).length && <Empty text="暂无来源" />}
@@ -1411,11 +1663,14 @@ function SettingsView({
   onLoadModels,
   modelList,
   onRebuildKnowledge,
-  knowledgeStatus
+  knowledgeStatus,
+  knowledgeRebuildStatus,
+  actionStates = {}
 }) {
   const [passwordDraft, setPasswordDraft] = useState({ currentPassword: "", newPassword: "", confirmPassword: "" });
   const [passwordError, setPasswordError] = useState("");
   const intelligentAnalysis = { ...defaultIntelligentAnalysis, ...(settings.intelligentAnalysis || {}) };
+  const knowledgeRunning = !!knowledgeRebuildStatus?.running;
   const updateType = (key, patch) => {
     setSettings({
       ...settings,
@@ -1459,13 +1714,13 @@ function SettingsView({
         title="系统设置"
         action={
           <div className="button-row">
-            <button className="ghost-button" onClick={onScan}>
-              <RefreshCw size={16} />
-              扫描
+            <button className="ghost-button" onClick={onScan} disabled={actionStates["scan"]}>
+              {actionStates["scan"] ? <span className="button-spinner" /> : <RefreshCw size={16} />}
+              {actionStates["scan"] ? "扫描中" : "扫描"}
             </button>
-            <button className="primary-button" onClick={onSave}>
-              <Check size={16} />
-              保存
+            <button className="primary-button" onClick={onSave} disabled={actionStates["save-settings"]}>
+              {actionStates["save-settings"] ? <span className="button-spinner" /> : <Check size={16} />}
+              {actionStates["save-settings"] ? "保存中" : "保存"}
             </button>
           </div>
         }
@@ -1487,9 +1742,9 @@ function SettingsView({
 
       <Section title="智能文件分析">
         <div className="section-inline-action">
-          <button className="ghost-button" onClick={onTestModel} type="button">
-            <Sparkles size={16} />
-            测试连接
+          <button className="ghost-button" onClick={onTestModel} type="button" disabled={actionStates["test-model"]}>
+            {actionStates["test-model"] ? <span className="button-spinner" /> : <Sparkles size={16} />}
+            {actionStates["test-model"] ? "测试中" : "测试连接"}
           </button>
           {modelTest && (
             <span className={modelTest.ok ? "notice" : "error"}>
@@ -1546,9 +1801,9 @@ function SettingsView({
             />
           </label>
           <div className="model-picker">
-            <button className="ghost-button" onClick={onLoadModels} type="button">
-              <RefreshCw size={16} />
-              读取模型
+            <button className="ghost-button" onClick={onLoadModels} type="button" disabled={actionStates["load-models"]}>
+              {actionStates["load-models"] ? <span className="button-spinner" /> : <RefreshCw size={16} />}
+              {actionStates["load-models"] ? "读取中" : "读取模型"}
             </button>
             <select
               value={intelligentAnalysis.modelName || ""}
@@ -1701,12 +1956,30 @@ function SettingsView({
       <Section
         title="知识库索引"
         action={
-          <button className="ghost-button" onClick={onRebuildKnowledge} type="button">
-            <RefreshCw size={16} />
-            重建索引
+          <button className="ghost-button" onClick={onRebuildKnowledge} type="button" disabled={knowledgeRunning || actionStates["rebuild-knowledge"]}>
+            {knowledgeRunning || actionStates["rebuild-knowledge"] ? <span className="button-spinner" /> : <RefreshCw size={16} />}
+            {knowledgeRunning || actionStates["rebuild-knowledge"] ? "重建中" : "重建索引"}
           </button>
         }
       >
+        {knowledgeRunning && (
+          <div className="wiki-job-banner">
+            <span className="qa-spinner" />
+            <div>
+              <strong>知识库索引正在后台重建</strong>
+              <p>
+                进度 {knowledgeRebuildStatus.progress || 0}/{knowledgeRebuildStatus.total || 0}，
+                已索引 {knowledgeRebuildStatus.indexedDocuments || 0} 个文档，
+                片段 {knowledgeRebuildStatus.chunks || 0}，
+                向量 {knowledgeRebuildStatus.vectors || 0}，
+                失败 {knowledgeRebuildStatus.failed || 0}。
+              </p>
+            </div>
+          </div>
+        )}
+        {!!knowledgeRebuildStatus?.error && (
+          <div className="error">知识库重建失败：{knowledgeRebuildStatus.error}</div>
+        )}
         <div className="knowledge-status-grid">
           <Stat label="已索引文档" value={knowledgeStatus?.indexed_documents || 0} icon={FileText} tone="blue" />
           <Stat label="知识片段" value={knowledgeStatus?.chunks || 0} icon={ListChecks} tone="green" />
@@ -1781,9 +2054,9 @@ function SettingsView({
           </label>
           <div className="password-actions">
             {passwordError && <span className="error">{passwordError}</span>}
-            <button className="ghost-button" type="submit">
-              <KeyRound size={16} />
-              修改密码
+            <button className="ghost-button" type="submit" disabled={actionStates["change-password"]}>
+              {actionStates["change-password"] ? <span className="button-spinner" /> : <KeyRound size={16} />}
+              {actionStates["change-password"] ? "修改中" : "修改密码"}
             </button>
           </div>
         </form>
@@ -1804,11 +2077,19 @@ function App() {
   const [suggestions, setSuggestions] = useState([]);
   const [wikiPages, setWikiPages] = useState([]);
   const [wikiSuggestions, setWikiSuggestions] = useState([]);
+  const [wikiRebuildStatus, setWikiRebuildStatus] = useState({});
+  const wikiWasRunningRef = useRef(false);
+  const [authorityDocs, setAuthorityDocs] = useState([]);
+  const [authoritySuggestions, setAuthoritySuggestions] = useState([]);
+  const [authorityAnalyzeStatus, setAuthorityAnalyzeStatus] = useState({});
+  const authorityWasRunningRef = useRef(false);
   const [weekly, setWeekly] = useState({});
   const [settings, setSettings] = useState({ monitorTypes: {} });
   const [modelTest, setModelTest] = useState(null);
   const [modelList, setModelList] = useState([]);
   const [knowledgeStatus, setKnowledgeStatus] = useState({});
+  const [knowledgeRebuildStatus, setKnowledgeRebuildStatus] = useState({});
+  const knowledgeWasRunningRef = useRef(false);
   const [auth, setAuth] = useState({ isAdmin: false, username: "" });
   const [loginOpen, setLoginOpen] = useState(false);
   const [preview, setPreview] = useState(null);
@@ -1817,6 +2098,12 @@ function App() {
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
   const [dashboardResetSignal, setDashboardResetSignal] = useState(0);
+  const [actionStates, setActionStates] = useState({});
+
+  const isActionLoading = (key) => !!actionStates[key];
+  const setActionLoading = (key, value) => {
+    setActionStates((current) => ({ ...current, [key]: value }));
+  };
 
   const refresh = async () => {
     setError("");
@@ -1861,8 +2148,28 @@ function App() {
     setKnowledgeStatus(await api.get("/api/knowledge/status"));
   };
 
+  const loadKnowledgeRebuildStatus = async () => {
+    if (auth.isAdmin) setKnowledgeRebuildStatus(await api.get("/api/knowledge/rebuild-status"));
+  };
+
   const loadWikiSuggestions = async () => {
     if (auth.isAdmin) setWikiSuggestions(await api.get("/api/wiki/suggestions"));
+  };
+
+  const loadWikiRebuildStatus = async () => {
+    if (auth.isAdmin) setWikiRebuildStatus(await api.get("/api/wiki/rebuild-status"));
+  };
+
+  const loadAuthority = async () => {
+    if (!auth.isAdmin) return;
+    const [docs, items, status] = await Promise.all([
+      api.get("/api/document-authority"),
+      api.get("/api/document-authority/suggestions"),
+      api.get("/api/document-authority/analyze-status")
+    ]);
+    setAuthorityDocs(docs);
+    setAuthoritySuggestions(items);
+    setAuthorityAnalyzeStatus(status);
   };
 
   useEffect(() => {
@@ -1874,14 +2181,74 @@ function App() {
   useEffect(() => {
     if (!auth.isAdmin) {
       setSettings({ monitorTypes: {} });
+      setAuthorityDocs([]);
+      setAuthoritySuggestions([]);
       if (active === "settings") setActive("dashboard");
+      if (active === "authority") setActive("dashboard");
       return;
     }
-    Promise.all([loadSettings(), loadKnowledgeStatus(), loadWikiSuggestions()]).catch((err) => setError(err.message || "系统设置加载失败"));
+    Promise.all([loadSettings(), loadKnowledgeStatus(), loadKnowledgeRebuildStatus(), loadWikiSuggestions(), loadWikiRebuildStatus(), loadAuthority()]).catch((err) => setError(err.message || "系统设置加载失败"));
   }, [auth.isAdmin]);
 
-  const runAction = async (action, success) => {
+  useEffect(() => {
+    if (!auth.isAdmin) return undefined;
+    const timer = window.setInterval(async () => {
+      try {
+        const status = await api.get("/api/wiki/rebuild-status");
+        setWikiRebuildStatus(status);
+        if (status.running || wikiWasRunningRef.current) {
+          await loadWikiSuggestions();
+        }
+        wikiWasRunningRef.current = !!status.running;
+      } catch {
+        // keep the main page calm if a polling request fails once
+      }
+    }, 2500);
+    return () => window.clearInterval(timer);
+  }, [auth.isAdmin]);
+
+  useEffect(() => {
+    if (!auth.isAdmin) return undefined;
+    const timer = window.setInterval(async () => {
+      try {
+        const status = await api.get("/api/document-authority/analyze-status");
+        setAuthorityAnalyzeStatus(status);
+        if (status.running || authorityWasRunningRef.current) {
+          const [docs, items] = await Promise.all([
+            api.get("/api/document-authority"),
+            api.get("/api/document-authority/suggestions")
+          ]);
+          setAuthorityDocs(docs);
+          setAuthoritySuggestions(items);
+        }
+        authorityWasRunningRef.current = !!status.running;
+      } catch {
+        // keep polling quiet on transient admin/session/network issues
+      }
+    }, 2500);
+    return () => window.clearInterval(timer);
+  }, [auth.isAdmin]);
+
+  useEffect(() => {
+    if (!auth.isAdmin) return undefined;
+    const timer = window.setInterval(async () => {
+      try {
+        const status = await api.get("/api/knowledge/rebuild-status");
+        setKnowledgeRebuildStatus(status);
+        if (status.running || knowledgeWasRunningRef.current) {
+          await loadKnowledgeStatus();
+        }
+        knowledgeWasRunningRef.current = !!status.running;
+      } catch {
+        // keep polling quiet on transient admin/session/network issues
+      }
+    }, 2500);
+    return () => window.clearInterval(timer);
+  }, [auth.isAdmin]);
+
+  const runAction = async (key, action, success) => {
     try {
+      setActionLoading(key, true);
       setNotice("");
       setError("");
       await action();
@@ -1891,12 +2258,14 @@ function App() {
     } catch (err) {
       setError(err.message || "操作失败");
       return false;
+    } finally {
+      setActionLoading(key, false);
     }
   };
 
-  const scanNow = () => runAction(() => api.post("/api/scan"), "扫描完成");
+  const scanNow = () => runAction("scan", () => api.post("/api/scan"), "扫描完成");
   const saveSettings = async () => {
-    const ok = await runAction(() => api.put("/api/settings", settings), "设置已保存");
+    const ok = await runAction("save-settings", () => api.put("/api/settings", settings), "设置已保存");
     if (ok) await loadSettings();
     return ok;
   };
@@ -1928,17 +2297,21 @@ function App() {
       setError(err.message || "退出失败");
     }
   };
-  const changeAdminPassword = (payload) => runAction(() => api.post("/api/auth/change-password", payload), "管理员密码已修改");
+  const changeAdminPassword = (payload) => runAction("change-password", () => api.post("/api/auth/change-password", payload), "管理员密码已修改");
   const testModel = async () => {
     try {
+      setActionLoading("test-model", true);
       setModelTest(null);
       setModelTest(await api.post("/api/ai/test"));
     } catch (err) {
       setModelTest({ ok: false, error: err.message || "测试失败" });
+    } finally {
+      setActionLoading("test-model", false);
     }
   };
   const loadModels = async () => {
     try {
+      setActionLoading("load-models", true);
       setError("");
       const data = await api.get("/api/ai/models");
       setModelList(data.models || []);
@@ -1955,25 +2328,108 @@ function App() {
       setNotice(data.models?.length ? `已读取 ${data.models.length} 个模型` : "未读取到可用模型");
     } catch (err) {
       setError(err.message || "读取模型失败");
+    } finally {
+      setActionLoading("load-models", false);
     }
   };
   const rebuildKnowledge = async () => {
-    const ok = await runAction(() => api.post("/api/knowledge/rebuild"), "知识库索引已重建");
-    if (ok) await loadKnowledgeStatus();
+    try {
+      setActionLoading("rebuild-knowledge", true);
+      setNotice("");
+      setError("");
+      const status = await api.post("/api/knowledge/rebuild");
+      setKnowledgeRebuildStatus(status);
+      setNotice(status.alreadyRunning ? "知识库索引已在后台重建中" : "知识库索引已开始后台重建");
+      await loadKnowledgeStatus();
+    } catch (err) {
+      setError(err.message || "启动知识库重建失败");
+    } finally {
+      setActionLoading("rebuild-knowledge", false);
+    }
   };
-  const applySuggestion = (id) => runAction(() => api.post(`/api/suggestions/${id}/apply`), "建议已应用");
-  const dismissSuggestion = (id) => runAction(() => api.post(`/api/suggestions/${id}/dismiss`), "建议已忽略");
-  const createTask = (payload) => runAction(() => api.post("/api/tasks", payload), "任务已新增");
-  const patchTask = (id, values) => runAction(() => api.patch(`/api/tasks/${id}`, { values }), "任务已更新");
-  const patchDeliverable = (id, values) => runAction(() => api.patch(`/api/deliverables/${id}`, { values }), "交付物已更新");
-  const startOcr = (id) => runAction(() => api.post(`/api/ocr/documents/${id}/start`), "OCR 已启动");
-  const retryOcr = (id) => runAction(() => api.post(`/api/ocr/documents/${id}/retry`), "OCR 已重新入队");
+  const applySuggestion = (id) => runAction(`apply-suggestion-${id}`, () => api.post(`/api/suggestions/${id}/apply`), "建议已应用");
+  const applyAllSuggestions = async () => {
+    try {
+      setActionLoading("apply-all-suggestions", true);
+      setNotice("");
+      setError("");
+      const result = await api.post("/api/suggestions/apply-all");
+      await refresh();
+      const total = result.total || 0;
+      const applied = result.applied || 0;
+      const failed = result.failed || [];
+      if (!total) {
+        setNotice("暂无待应用的智能建议");
+      } else if (!failed.length) {
+        setNotice(`智能建议已全部应用，共 ${applied} 条`);
+      } else if (applied > 0) {
+        setNotice(`已应用 ${applied}/${total} 条，${failed.length} 条失败仍保留`);
+        setError(failed.map((item) => `#${item.id}：${item.message}`).join("；"));
+      } else {
+        setError(`全部应用失败：${failed.map((item) => `#${item.id}：${item.message}`).join("；")}`);
+      }
+      return !failed.length;
+    } catch (err) {
+      setError(err.message || "智能建议批量应用失败");
+      return false;
+    } finally {
+      setActionLoading("apply-all-suggestions", false);
+    }
+  };
+  const dismissSuggestion = (id) => runAction(`dismiss-suggestion-${id}`, () => api.post(`/api/suggestions/${id}/dismiss`), "建议已忽略");
+  const createTask = (payload) => runAction("create-task", () => api.post("/api/tasks", payload), "任务已新增");
+  const patchTask = (id, values) => runAction(`patch-task-${id}`, () => api.patch(`/api/tasks/${id}`, { values }), "任务已更新");
+  const patchDeliverable = (id, values) => runAction(`patch-deliverable-${id}`, () => api.patch(`/api/deliverables/${id}`, { values }), "交付物已更新");
+  const analyzeAuthority = async () => {
+    try {
+      setActionLoading("analyze-authority", true);
+      setNotice("");
+      setError("");
+      const status = await api.post("/api/document-authority/analyze");
+      setAuthorityAnalyzeStatus(status);
+      setNotice(status.alreadyRunning ? "文档权威分析已在后台运行" : "文档权威分析已开始后台运行");
+      await loadAuthority();
+    } catch (err) {
+      setError(err.message || "启动文档权威分析失败");
+    } finally {
+      setActionLoading("analyze-authority", false);
+    }
+  };
+  const patchAuthority = async (id, values) => {
+    const ok = await runAction(`patch-authority-${id}`, () => api.patch(`/api/document-authority/${id}`, { values }), "文档权威已更新");
+    if (ok) await loadAuthority();
+  };
+  const applyAuthoritySuggestion = async (id) => {
+    const ok = await runAction(`apply-authority-${id}`, () => api.post(`/api/document-authority/suggestions/${id}/apply`), "权威建议已应用");
+    if (ok) await loadAuthority();
+  };
+  const dismissAuthoritySuggestion = async (id) => {
+    const ok = await runAction(`dismiss-authority-${id}`, () => api.post(`/api/document-authority/suggestions/${id}/dismiss`), "权威建议已忽略");
+    if (ok) await loadAuthority();
+  };
+  const startOcr = (id) => runAction(`ocr-start-${id}`, () => api.post(`/api/ocr/documents/${id}/start`), "OCR 已启动");
+  const retryOcr = (id) => runAction(`ocr-retry-${id}`, () => api.post(`/api/ocr/documents/${id}/retry`), "OCR 已重新入队");
   const rebuildWikiSuggestions = async () => {
-    const ok = await runAction(() => api.post("/api/wiki/rebuild-suggestions"), "Wiki 更新建议已生成");
-    if (ok) await loadWikiSuggestions();
+    try {
+      setActionLoading("rebuild-wiki", true);
+      setNotice("");
+      setError("");
+      const status = await api.post("/api/wiki/rebuild-suggestions");
+      setWikiRebuildStatus(status);
+      setNotice(status.alreadyRunning ? "Wiki 更新建议已在后台生成中" : "Wiki 更新建议已开始后台生成");
+      await loadWikiSuggestions();
+    } catch (err) {
+      setError(err.message || "启动 Wiki 生成失败");
+    } finally {
+      setActionLoading("rebuild-wiki", false);
+    }
   };
   const applyWikiSuggestion = async (id) => {
-    const ok = await runAction(() => api.post(`/api/wiki/suggestions/${id}/apply`), "Wiki 建议已应用");
+    const ok = await runAction(`apply-wiki-${id}`, () => api.post(`/api/wiki/suggestions/${id}/apply`), "Wiki 建议已应用");
+    if (ok) await loadWikiSuggestions();
+  };
+  const applyAllWikiSuggestions = async () => {
+    const ok = await runAction("apply-all-wiki", () => api.post("/api/wiki/suggestions/apply-all"), "Wiki 建议已全部应用");
     if (ok) await loadWikiSuggestions();
   };
   const openPreview = async (documentId) => {
@@ -1994,7 +2450,7 @@ function App() {
   const content = () => {
     if (loading) return <div className="loading">加载中</div>;
     if (active === "dashboard") {
-      return <Dashboard data={dashboardData} onScan={scanNow} onPreview={openPreview} resetLayoutSignal={dashboardResetSignal} />;
+      return <Dashboard data={dashboardData} onScan={scanNow} onPreview={openPreview} resetLayoutSignal={dashboardResetSignal} scanLoading={isActionLoading("scan")} />;
     }
     if (active === "gantt") return <Gantt tasks={tasks} />;
     if (active === "board") return <TaskBoard tasks={tasks} onCreate={createTask} onPatch={patchTask} onPreview={openPreview} />;
@@ -2012,13 +2468,28 @@ function App() {
     if (active === "meetings") return <MeetingView meetings={meetings} onPreview={openPreview} />;
     if (active === "changes") return <ChangesView changes={changes} onPreview={openPreview} />;
     if (active === "suggestions") {
-      return <SuggestionsView suggestions={suggestions} onApply={applySuggestion} onDismiss={dismissSuggestion} onPreview={openPreview} />;
+      return <SuggestionsView suggestions={suggestions} onApply={applySuggestion} onApplyAll={applyAllSuggestions} onDismiss={dismissSuggestion} onPreview={openPreview} actionStates={actionStates} />;
     }
     if (active === "documents") {
-      return <DocumentsView documents={documents} onPreview={openPreview} isAdmin={auth.isAdmin} onStartOcr={startOcr} onRetryOcr={retryOcr} />;
+      return <DocumentsView documents={documents} onPreview={openPreview} isAdmin={auth.isAdmin} onStartOcr={startOcr} onRetryOcr={retryOcr} actionStates={actionStates} />;
     }
     if (active === "deliverables") {
       return <DeliverablesView deliverables={deliverables} documents={documents} onPatch={patchDeliverable} onPreview={openPreview} />;
+    }
+    if (active === "authority" && auth.isAdmin) {
+      return (
+        <AuthorityView
+          authorityDocs={authorityDocs}
+          authoritySuggestions={authoritySuggestions}
+          analyzeStatus={authorityAnalyzeStatus}
+          onAnalyze={analyzeAuthority}
+          onPatch={patchAuthority}
+          onApplySuggestion={applyAuthoritySuggestion}
+          onDismissSuggestion={dismissAuthoritySuggestion}
+          onPreview={openPreview}
+          actionStates={actionStates}
+        />
+      );
     }
     if (active === "qa") return <QAView onPreview={openPreview} />;
     if (active === "wiki") {
@@ -2029,6 +2500,10 @@ function App() {
           isAdmin={auth.isAdmin}
           onRebuild={rebuildWikiSuggestions}
           onApply={applyWikiSuggestion}
+          onApplyAll={applyAllWikiSuggestions}
+          rebuildStatus={wikiRebuildStatus}
+          actionStates={actionStates}
+          onPreview={openPreview}
         />
       );
     }
@@ -2047,12 +2522,14 @@ function App() {
           modelList={modelList}
           onRebuildKnowledge={rebuildKnowledge}
           knowledgeStatus={knowledgeStatus}
+          knowledgeRebuildStatus={knowledgeRebuildStatus}
+          actionStates={actionStates}
         />
       );
     }
     return null;
   };
-  const visibleNavItems = navItems.filter((item) => item.id !== "settings" || auth.isAdmin);
+  const visibleNavItems = navItems.filter((item) => !item.adminOnly && item.id !== "settings" || auth.isAdmin);
 
   return (
     <div className="app-shell">
@@ -2104,8 +2581,8 @@ function App() {
                 恢复布局
               </button>
             )}
-            <button className="icon-button" onClick={() => runAction(refresh, "已刷新")} title="刷新">
-              <RefreshCw size={18} />
+            <button className="icon-button" onClick={() => runAction("refresh", refresh, "已刷新")} title="刷新" disabled={isActionLoading("refresh")}>
+              {isActionLoading("refresh") ? <span className="button-spinner" /> : <RefreshCw size={18} />}
             </button>
           </div>
         </header>

@@ -1063,10 +1063,43 @@ main {
   margin-bottom: 8px;
 }
 
+.source-title-line {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.mini-badge {
+  display: inline-flex;
+  align-items: center;
+  min-height: 22px;
+  padding: 0 7px;
+  border-radius: 6px;
+  color: var(--green);
+  background: var(--green-soft);
+  font-size: 12px;
+  font-weight: 700;
+}
+
 .source-card p {
   margin: 0;
   color: var(--muted);
   line-height: 1.55;
+}
+
+.conflict-note {
+  margin-top: 8px !important;
+  color: var(--amber) !important;
+  background: var(--amber-soft);
+  border-radius: 8px;
+  padding: 8px 10px;
+}
+
+.muted-text {
+  margin: 0;
+  color: var(--muted);
+  line-height: 1.6;
 }
 
 .ocr-cell {
@@ -1095,6 +1128,22 @@ main {
   gap: 12px;
 }
 
+.wiki-job-banner {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 14px 16px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #f7faf9;
+  margin-bottom: 12px;
+}
+
+.wiki-job-banner p {
+  margin: 4px 0 0;
+  color: var(--muted);
+}
+
 .wiki-card,
 .qa-answer-card {
   border: 1px solid var(--border);
@@ -1112,6 +1161,28 @@ main {
 
 .wiki-card-head span {
   color: var(--muted);
+  font-size: 12px;
+}
+
+.wiki-source-list {
+  display: grid;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.wiki-source-item {
+  display: grid;
+  gap: 5px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.wiki-source-item p {
+  margin: 0;
+  color: var(--muted);
+  line-height: 1.5;
   font-size: 12px;
 }
 
