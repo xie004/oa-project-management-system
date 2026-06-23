@@ -102,6 +102,11 @@ class GenericPatchPayload(BaseModel):
     values: dict[str, Any]
 
 
+class TaskBulkPatchPayload(BaseModel):
+    ids: list[int] = Field(default_factory=list)
+    values: dict[str, Any]
+
+
 class QuestionPayload(BaseModel):
     question: str
 
@@ -531,9 +536,9 @@ def create_task(payload: TaskPayload) -> dict[str, Any]:
             """
             INSERT INTO tasks(
                 title, description, owner, status, priority, color_status, start_date,
-                due_date, progress, source, created_at, updated_at
+                due_date, progress, source, show_in_gantt, created_at, updated_at
             )
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, '手动新增', ?, ?)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, '手动新增', 1, ?, ?)
             """,
             (
                 payload.title,
@@ -555,6 +560,28 @@ def create_task(payload: TaskPayload) -> dict[str, Any]:
         conn.close()
 
 
+@app.patch("/api/tasks/bulk")
+def bulk_update_tasks(payload: TaskBulkPatchPayload) -> dict[str, Any]:
+    ids = [int(item) for item in payload.ids if int(item) > 0]
+    values = {key: payload.values[key] for key in payload.values if key in {"show_in_gantt"}}
+    if "show_in_gantt" in values:
+        values["show_in_gantt"] = 1 if values["show_in_gantt"] else 0
+    if not ids or not values:
+        return {"ok": True, "updated": 0}
+    placeholders = ",".join(["?"] * len(ids))
+    conn = get_connection()
+    try:
+        assignments = ", ".join([f"{key} = ?" for key in values])
+        cursor = conn.execute(
+            f"UPDATE tasks SET {assignments}, updated_at = ? WHERE id IN ({placeholders})",
+            [*values.values(), now_iso(), *ids],
+        )
+        conn.commit()
+        return {"ok": True, "updated": cursor.rowcount}
+    finally:
+        conn.close()
+
+
 @app.patch("/api/tasks/{task_id}")
 def update_task(task_id: int, payload: GenericPatchPayload) -> dict[str, Any]:
     allowed = {
@@ -567,8 +594,11 @@ def update_task(task_id: int, payload: GenericPatchPayload) -> dict[str, Any]:
         "start_date",
         "due_date",
         "progress",
+        "show_in_gantt",
     }
     values = {key: value for key, value in payload.values.items() if key in allowed}
+    if "show_in_gantt" in values:
+        values["show_in_gantt"] = 1 if values["show_in_gantt"] else 0
     if not values:
         return {"ok": True}
     conn = get_connection()

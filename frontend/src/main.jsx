@@ -192,6 +192,52 @@ function statusLabel(value) {
   return statusText[value] || value || "-";
 }
 
+const ganttPhases = [
+  { key: "startup", title: "启动准备", keywords: ["合同", "启动", "主计划", "调研", "准备"] },
+  { key: "environment", title: "环境部署", keywords: ["环境", "服务器", "资源", "部署", "安装"] },
+  { key: "migration", title: "数据迁移", keywords: ["迁移", "公文", "历史数据", "台账", "档案"] },
+  { key: "forms", title: "表单流程", keywords: ["表单", "流程", "节点", "财务", "报销", "预算"] },
+  { key: "integration", title: "联调测试", keywords: ["集成", "联调", "接口", "测试", "验证"] },
+  { key: "launch", title: "上线试运行", keywords: ["上线", "切换", "试运行", "培训", "UAT"] },
+  { key: "acceptance", title: "验收归档", keywords: ["验收", "测评", "报告", "归档", "资料"] },
+  { key: "other", title: "其他计划", keywords: [] }
+];
+
+function taskText(task) {
+  return `${task.title || ""}\n${task.description || ""}`;
+}
+
+function phaseForTask(task) {
+  const text = taskText(task);
+  return ganttPhases.find((phase) => phase.key !== "other" && phase.keywords.some((keyword) => text.includes(keyword))) || ganttPhases[ganttPhases.length - 1];
+}
+
+function dateRangeForItems(items, fallbackStart = "2026-03-01", fallbackEnd = "2026-10-31") {
+  const dated = items.filter((item) => safeDate(item.start_date || item.planned_date) || safeDate(item.due_date || item.actual_date));
+  const starts = dated.map((item) => safeDate(item.start_date || item.planned_date) || safeDate(item.due_date || item.actual_date));
+  const ends = dated.map((item) => safeDate(item.due_date || item.actual_date) || safeDate(item.start_date || item.planned_date));
+  const minDate = starts.length ? new Date(Math.min(...starts.map((date) => date.getTime()))) : new Date(fallbackStart);
+  const maxDate = ends.length ? new Date(Math.max(...ends.map((date) => date.getTime()))) : new Date(fallbackEnd);
+  minDate.setDate(minDate.getDate() - 7);
+  maxDate.setDate(maxDate.getDate() + 14);
+  return { minDate, maxDate, totalDays: Math.max(1, Math.ceil((maxDate - minDate) / 86400000)) };
+}
+
+function timelineStyle(item, range) {
+  const start = safeDate(item.start_date || item.planned_date) || safeDate(item.due_date || item.actual_date) || range.minDate;
+  const end = safeDate(item.due_date || item.actual_date) || safeDate(item.start_date || item.planned_date) || range.maxDate;
+  const left = Math.max(0, Math.round(((start - range.minDate) / 86400000 / range.totalDays) * 100));
+  const width = Math.max(3, Math.round((((end - start) / 86400000 + 1) / range.totalDays) * 100));
+  return { left: `${left}%`, width: `${Math.min(width, 100 - left)}%` };
+}
+
+function todayLineStyle(range) {
+  const today = new Date();
+  const left = Math.round(((today - range.minDate) / 86400000 / range.totalDays) * 100);
+  if (left < 0 || left > 100) return null;
+  return { left: `${left}%` };
+}
+
 function Stat({ label, value, icon: Icon, tone = "neutral" }) {
   return (
     <div className={`stat stat-${tone}`}>
@@ -818,52 +864,136 @@ function Dashboard({ data, onScan, onPreview, resetLayoutSignal, scanLoading }) 
   );
 }
 
-function Gantt({ tasks }) {
-  const dated = tasks.filter((task) => safeDate(task.start_date) || safeDate(task.due_date));
-  const starts = dated.map((task) => safeDate(task.start_date) || safeDate(task.due_date));
-  const ends = dated.map((task) => safeDate(task.due_date) || safeDate(task.start_date));
-  const minDate = starts.length ? new Date(Math.min(...starts.map((date) => date.getTime()))) : new Date("2026-03-01");
-  const maxDate = ends.length ? new Date(Math.max(...ends.map((date) => date.getTime()))) : new Date("2026-07-31");
-  minDate.setDate(minDate.getDate() - 7);
-  maxDate.setDate(maxDate.getDate() + 14);
-  const totalDays = Math.max(1, Math.ceil((maxDate - minDate) / 86400000));
+function Gantt({ tasks, milestones = [], onTaskFocus }) {
+  const [mode, setMode] = useState("phase");
+  const [scale, setScale] = useState("week");
+  const [showAllDated, setShowAllDated] = useState(false);
+  const [collapsed, setCollapsed] = useState({});
+  const ganttTasks = tasks.filter((task) => Number(task.show_in_gantt || 0) === 1);
+  const datedHidden = tasks.filter((task) => Number(task.show_in_gantt || 0) !== 1 && (safeDate(task.start_date) || safeDate(task.due_date)));
+  const visibleTasks = showAllDated ? tasks.filter((task) => safeDate(task.start_date) || safeDate(task.due_date)) : ganttTasks;
+  const grouped = ganttPhases.map((phase) => {
+    const phaseTasks = visibleTasks.filter((task) => phaseForTask(task).key === phase.key);
+    return { ...phase, tasks: phaseTasks };
+  }).filter((phase) => phase.tasks.length);
+  const summaryItems = grouped.map((phase) => {
+    const range = dateRangeForItems(phase.tasks);
+    const completed = phase.tasks.filter((task) => task.status === "completed").length;
+    return {
+      ...phase,
+      start_date: range.minDate.toISOString(),
+      due_date: range.maxDate.toISOString(),
+      progress: phase.tasks.length ? Math.round(phase.tasks.reduce((sum, task) => sum + Number(task.progress || 0), 0) / phase.tasks.length) : 0,
+      color_status: completed === phase.tasks.length ? "green" : phase.tasks.some((task) => task.color_status === "red") ? "red" : "amber",
+      count: phase.tasks.length,
+      completed
+    };
+  });
+  const milestoneItems = milestones
+    .filter((item) => safeDate(item.planned_date || item.actual_date))
+    .map((item) => ({ ...item, start_date: item.actual_date || item.planned_date, due_date: item.actual_date || item.planned_date, progress: item.status === "completed" ? 100 : 0 }));
+  const timelineItems = mode === "phase" ? summaryItems : mode === "milestone" ? milestoneItems : visibleTasks;
+  const range = dateRangeForItems(timelineItems.length ? timelineItems : visibleTasks);
+  const todayStyle = todayLineStyle(range);
+  const minWidth = scale === "day" ? 1320 : scale === "month" ? 760 : 980;
+  const toggleCollapse = (key) => setCollapsed((current) => ({ ...current, [key]: !current[key] }));
 
-  const barStyle = (task) => {
-    const start = safeDate(task.start_date) || safeDate(task.due_date) || minDate;
-    const end = safeDate(task.due_date) || safeDate(task.start_date) || maxDate;
-    const left = Math.max(0, Math.round(((start - minDate) / 86400000 / totalDays) * 100));
-    const width = Math.max(4, Math.round((((end - start) / 86400000 + 1) / totalDays) * 100));
-    return { left: `${left}%`, width: `${Math.min(width, 100 - left)}%` };
-  };
+  const renderTimelineTrack = (item, children) => (
+    <div className="gantt-track">
+      {todayStyle && <span className="today-line" style={todayStyle} />}
+      <div className={`gantt-bar ${item.color_status || "green"}`} style={timelineStyle(item, range)}>
+        <span>{children}</span>
+      </div>
+    </div>
+  );
 
   return (
-    <Section title="甘特图">
-      <div className="gantt">
-        <div className="gantt-scale">
-          <span>{formatDate(minDate.toISOString())}</span>
-          <span>{formatDate(maxDate.toISOString())}</span>
+    <Section
+      title="甘特图"
+      action={
+        <div className="gantt-toolbar">
+          <div className="segmented">
+            {[
+              ["phase", "阶段总览"],
+              ["detail", "任务明细"],
+              ["milestone", "里程碑"]
+            ].map(([value, label]) => (
+              <button key={value} className={mode === value ? "active" : ""} onClick={() => setMode(value)}>{label}</button>
+            ))}
+          </div>
+          <div className="segmented">
+            {[
+              ["month", "月"],
+              ["week", "周"],
+              ["day", "日"]
+            ].map(([value, label]) => (
+              <button key={value} className={scale === value ? "active" : ""} onClick={() => setScale(value)}>{label}</button>
+            ))}
+          </div>
         </div>
-        {tasks.map((task) => (
-          <div className="gantt-row" key={task.id}>
+      }
+    >
+      <div className="gantt-hint">
+        默认显示 {ganttTasks.length} 条计划级任务，已隐藏 {tasks.length - ganttTasks.length} 条过程任务。
+        {datedHidden.length > 0 && (
+          <label>
+            <input type="checkbox" checked={showAllDated} onChange={(event) => setShowAllDated(event.target.checked)} />
+            查看全部有日期任务（含隐藏 {datedHidden.length} 条）
+          </label>
+        )}
+      </div>
+      <div className="gantt" style={{ "--gantt-min-width": `${minWidth}px` }}>
+        <div className="gantt-scale">
+          <span>{formatDate(range.minDate.toISOString())}</span>
+          <span>今天</span>
+          <span>{formatDate(range.maxDate.toISOString())}</span>
+        </div>
+        {mode === "phase" && summaryItems.map((phase) => (
+          <div className="gantt-row phase-row" key={phase.key}>
             <div className="gantt-info">
-              <strong>{task.title}</strong>
-              <span>{task.owner || "-"} · {statusLabel(task.status)}</span>
+              <strong>{phase.title}</strong>
+              <span>{phase.completed}/{phase.count} 完成 · {phase.progress}%</span>
             </div>
-            <div className="gantt-track">
-              <div className={`gantt-bar ${task.color_status || "green"}`} style={barStyle(task)}>
-                <span>{task.progress || 0}%</span>
-              </div>
-            </div>
+            {renderTimelineTrack(phase, `${phase.progress}%`)}
           </div>
         ))}
-        {!tasks.length && <Empty />}
+        {mode === "detail" && grouped.map((phase) => (
+          <div className="gantt-group" key={phase.key}>
+            <button className="gantt-group-head" onClick={() => toggleCollapse(phase.key)}>
+              <span>{collapsed[phase.key] ? "展开" : "收起"}</span>
+              <strong>{phase.title}</strong>
+              <small>{phase.tasks.length} 个任务</small>
+            </button>
+            {!collapsed[phase.key] && phase.tasks.map((task) => (
+              <div className="gantt-row" key={task.id}>
+                <button className="gantt-info clickable" onClick={() => onTaskFocus?.(task.id)}>
+                  <strong>{task.title}</strong>
+                  <span>{task.owner || "-"} · {statusLabel(task.status)} · {formatDate(task.start_date)} 至 {formatDate(task.due_date)}</span>
+                </button>
+                {renderTimelineTrack(task, `${task.progress || 0}%`)}
+              </div>
+            ))}
+          </div>
+        ))}
+        {mode === "milestone" && milestoneItems.map((item) => (
+          <div className="gantt-row milestone-row" key={item.id}>
+            <div className="gantt-info">
+              <strong>{item.title}</strong>
+              <span>{statusLabel(item.status)} · {formatDate(item.actual_date || item.planned_date)}</span>
+            </div>
+            {renderTimelineTrack(item, "●")}
+          </div>
+        ))}
+        {!timelineItems.length && <Empty />}
       </div>
     </Section>
   );
 }
 
-function TaskBoard({ tasks, onCreate, onPatch, onPreview }) {
+function TaskBoard({ tasks, onCreate, onPatch, onBulkPatch, onPreview, focusedTaskId, onFocusedTaskHandled }) {
   const [draft, setDraft] = useState({ title: "", owner: "", due_date: "", priority: "medium" });
+  const [selected, setSelected] = useState([]);
+  const selectedSet = new Set(selected);
   const columns = [
     ["not_started", "待开始"],
     ["in_progress", "进行中"],
@@ -878,10 +1008,33 @@ function TaskBoard({ tasks, onCreate, onPatch, onPreview }) {
       ...draft,
       status: "not_started",
       color_status: draft.priority === "high" ? "amber" : "green",
+      show_in_gantt: 1,
       progress: 0
     });
     setDraft({ title: "", owner: "", due_date: "", priority: "medium" });
   };
+  const toggleSelected = (id) => {
+    setSelected((current) => current.includes(id) ? current.filter((item) => item !== id) : [...current, id]);
+  };
+  const bulkSetGantt = async (value) => {
+    if (!selected.length) return;
+    await onBulkPatch(selected, { show_in_gantt: value ? 1 : 0 });
+    setSelected([]);
+  };
+  useEffect(() => {
+    if (!focusedTaskId) return;
+    const selector = `[data-task-id="${focusedTaskId}"]`;
+    const timer = window.setTimeout(() => {
+      const node = document.querySelector(selector);
+      if (node) {
+        node.scrollIntoView({ behavior: "smooth", block: "center" });
+        node.classList.add("focused");
+        window.setTimeout(() => node.classList.remove("focused"), 2400);
+      }
+      onFocusedTaskHandled?.();
+    }, 120);
+    return () => window.clearTimeout(timer);
+  }, [focusedTaskId, onFocusedTaskHandled]);
 
   return (
     <div className="view-grid">
@@ -901,20 +1054,48 @@ function TaskBoard({ tasks, onCreate, onPatch, onPreview }) {
           </button>
         </form>
       </Section>
+      <Section
+        title="甘特图任务治理"
+        action={
+          <div className="board-bulk-actions">
+            <span>已选 {selected.length} 条</span>
+            <button className="ghost-button" disabled={!selected.length} onClick={() => bulkSetGantt(true)}>批量进入甘特图</button>
+            <button className="ghost-button" disabled={!selected.length} onClick={() => bulkSetGantt(false)}>批量移出甘特图</button>
+          </div>
+        }
+      >
+        <div className="gantt-hint">
+          项目计划分解和手动新增任务默认进入甘特图；周报、会议纪要、大模型分析等过程任务默认留在看板。
+        </div>
+      </Section>
       <div className="board">
         {columns.map(([status, label]) => (
           <div className="board-column" key={status}>
             <div className="board-head">{label}</div>
             {tasks.filter((task) => task.status === status).map((task) => (
-              <div className="task-card" key={task.id}>
+              <div className="task-card" key={task.id} data-task-id={task.id}>
                 <div className="task-card-top">
-                  <strong>{task.title}</strong>
+                  <label className="task-select">
+                    <input type="checkbox" checked={selectedSet.has(task.id)} onChange={() => toggleSelected(task.id)} />
+                    <strong>{task.title}</strong>
+                  </label>
                   <StatusPill color={task.color_status} value={task.color_status} />
                 </div>
                 <p>{task.description || task.source || ""}</p>
                 <div className="task-meta">
                   <span>{task.owner || "-"}</span>
                   <span>{formatDate(task.due_date)}</span>
+                </div>
+                <div className="task-meta">
+                  <span>{task.source || "任务"}</span>
+                  <label className="inline-toggle">
+                    <input
+                      type="checkbox"
+                      checked={Number(task.show_in_gantt || 0) === 1}
+                      onChange={(event) => onPatch(task.id, { show_in_gantt: event.target.checked ? 1 : 0 })}
+                    />
+                    进入甘特图
+                  </label>
                 </div>
                 {task.document_name && (
                   <div className="source-line">
@@ -2099,6 +2280,7 @@ function App() {
   const [error, setError] = useState("");
   const [dashboardResetSignal, setDashboardResetSignal] = useState(0);
   const [actionStates, setActionStates] = useState({});
+  const [focusedTaskId, setFocusedTaskId] = useState(null);
 
   const isActionLoading = (key) => !!actionStates[key];
   const setActionLoading = (key, value) => {
@@ -2379,6 +2561,7 @@ function App() {
   const dismissSuggestion = (id) => runAction(`dismiss-suggestion-${id}`, () => api.post(`/api/suggestions/${id}/dismiss`), "建议已忽略");
   const createTask = (payload) => runAction("create-task", () => api.post("/api/tasks", payload), "任务已新增");
   const patchTask = (id, values) => runAction(`patch-task-${id}`, () => api.patch(`/api/tasks/${id}`, { values }), "任务已更新");
+  const bulkPatchTasks = (ids, values) => runAction("bulk-patch-tasks", () => api.patch("/api/tasks/bulk", { ids, values }), "任务已批量更新");
   const patchDeliverable = (id, values) => runAction(`patch-deliverable-${id}`, () => api.patch(`/api/deliverables/${id}`, { values }), "交付物已更新");
   const analyzeAuthority = async () => {
     try {
@@ -2452,8 +2635,31 @@ function App() {
     if (active === "dashboard") {
       return <Dashboard data={dashboardData} onScan={scanNow} onPreview={openPreview} resetLayoutSignal={dashboardResetSignal} scanLoading={isActionLoading("scan")} />;
     }
-    if (active === "gantt") return <Gantt tasks={tasks} />;
-    if (active === "board") return <TaskBoard tasks={tasks} onCreate={createTask} onPatch={patchTask} onPreview={openPreview} />;
+    if (active === "gantt") {
+      return (
+        <Gantt
+          tasks={tasks}
+          milestones={milestones}
+          onTaskFocus={(taskId) => {
+            setFocusedTaskId(taskId);
+            setActive("board");
+          }}
+        />
+      );
+    }
+    if (active === "board") {
+      return (
+        <TaskBoard
+          tasks={tasks}
+          onCreate={createTask}
+          onPatch={patchTask}
+          onBulkPatch={bulkPatchTasks}
+          onPreview={openPreview}
+          focusedTaskId={focusedTaskId}
+          onFocusedTaskHandled={() => setFocusedTaskId(null)}
+        />
+      );
+    }
     if (active === "milestones") {
       return (
         <MilestoneView

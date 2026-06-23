@@ -835,19 +835,25 @@ main {
   display: grid;
   gap: 10px;
   overflow-x: auto;
+  position: relative;
 }
 
 .gantt-scale {
-  min-width: 860px;
-  display: flex;
-  justify-content: space-between;
+  min-width: var(--gantt-min-width, 980px);
+  display: grid;
+  grid-template-columns: 250px 1fr 1fr 1fr;
+  gap: 12px;
   color: var(--muted);
   font-size: 12px;
-  padding-left: 260px;
+  align-items: center;
+}
+
+.gantt-scale span:first-child {
+  grid-column: 2;
 }
 
 .gantt-row {
-  min-width: 860px;
+  min-width: var(--gantt-min-width, 980px);
   display: grid;
   grid-template-columns: 250px minmax(500px, 1fr);
   gap: 12px;
@@ -857,11 +863,24 @@ main {
 .gantt-info {
   display: grid;
   gap: 4px;
+  text-align: left;
+  color: var(--text);
+  background: transparent;
+  border: 0;
+  padding: 0;
 }
 
 .gantt-info span {
   color: var(--muted);
   font-size: 12px;
+}
+
+.gantt-info.clickable {
+  cursor: pointer;
+}
+
+.gantt-info.clickable:hover strong {
+  color: var(--primary);
 }
 
 .gantt-track {
@@ -870,6 +889,16 @@ main {
   background: #edf1f5;
   border-radius: 8px;
   overflow: hidden;
+}
+
+.today-line {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  background: #111827;
+  opacity: 0.35;
+  z-index: 2;
 }
 
 .gantt-bar {
@@ -892,6 +921,97 @@ main {
 
 .gantt-bar.red {
   background: var(--red);
+}
+
+.gantt-toolbar,
+.board-bulk-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.segmented {
+  display: inline-flex;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+  background: var(--surface);
+}
+
+.segmented button {
+  border: 0;
+  border-right: 1px solid var(--border);
+  border-radius: 0;
+  padding: 7px 10px;
+  background: transparent;
+  color: var(--muted);
+}
+
+.segmented button:last-child {
+  border-right: 0;
+}
+
+.segmented button.active {
+  background: var(--primary);
+  color: #ffffff;
+}
+
+.gantt-hint {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 10px 12px;
+  margin-bottom: 12px;
+  color: var(--muted);
+  background: var(--surface-alt);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-size: 13px;
+}
+
+.gantt-hint label,
+.inline-toggle,
+.task-select {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.gantt-group {
+  display: grid;
+  gap: 8px;
+  min-width: var(--gantt-min-width, 980px);
+}
+
+.gantt-group-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 250px;
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  text-align: left;
+  padding: 4px 0;
+}
+
+.gantt-group-head span,
+.gantt-group-head small {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.phase-row .gantt-track {
+  height: 38px;
+}
+
+.milestone-row .gantt-bar {
+  min-width: 24px;
+  width: 24px !important;
+  border-radius: 999px;
 }
 
 .board {
@@ -917,6 +1037,13 @@ main {
 .task-card {
   padding: 12px;
   margin-bottom: 10px;
+  transition: border-color 0.2s ease, box-shadow 0.2s ease, transform 0.2s ease;
+}
+
+.task-card.focused {
+  border-color: var(--blue);
+  box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.16), 0 8px 24px rgba(15, 23, 42, 0.12);
+  transform: translateY(-1px);
 }
 
 .task-card-top,
@@ -940,6 +1067,18 @@ main {
 
 .task-actions {
   margin-top: 10px;
+}
+
+.task-select {
+  min-width: 0;
+}
+
+.task-select strong {
+  overflow-wrap: anywhere;
+}
+
+.inline-toggle {
+  color: var(--muted);
 }
 
 .source-line {

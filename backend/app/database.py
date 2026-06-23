@@ -519,6 +519,7 @@ def init_db() -> None:
                 due_date TEXT,
                 progress INTEGER NOT NULL DEFAULT 0,
                 source TEXT,
+                show_in_gantt INTEGER NOT NULL DEFAULT 0,
                 source_document_id INTEGER REFERENCES documents(id) ON DELETE SET NULL,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
@@ -707,6 +708,19 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     for name, definition in document_columns.items():
         if name not in columns:
             conn.execute(f"ALTER TABLE documents ADD COLUMN {name} {definition}")
+
+    task_columns = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)").fetchall()}
+    if "show_in_gantt" not in task_columns:
+        conn.execute("ALTER TABLE tasks ADD COLUMN show_in_gantt INTEGER NOT NULL DEFAULT 0")
+        conn.execute(
+            """
+            UPDATE tasks
+            SET show_in_gantt = CASE
+                WHEN COALESCE(source, '') IN ('项目计划分解', '初始计划') THEN 1
+                ELSE 0
+            END
+            """
+        )
     fts_row = conn.execute(
         "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'knowledge_chunks_fts'"
     ).fetchone()
@@ -958,9 +972,17 @@ def ensure_project_plan(conn: sqlite3.Connection) -> None:
             """
             INSERT INTO tasks(
                 title, description, owner, status, priority, color_status, start_date,
-                due_date, progress, source, created_at, updated_at
+                due_date, progress, source, show_in_gantt, created_at, updated_at
             )
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, '项目计划分解', ?, ?)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, '项目计划分解', 1, ?, ?)
             """,
             [(*item, now, now) for item in PROJECT_PLAN_TASKS],
         )
+    conn.execute(
+        """
+        UPDATE tasks
+        SET show_in_gantt = 1
+        WHERE COALESCE(source, '') = '项目计划分解'
+          AND COALESCE(show_in_gantt, 0) = 0
+        """
+    )
