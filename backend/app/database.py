@@ -36,6 +36,7 @@ DEFAULT_INTELLIGENT_ANALYSIS = {
     "rerankerModelName": "",
     "rerankerScorePath": "score",
     "analysisMode": "auto_suggest",
+    "reviewPolicy": "balanced",
     "autoApplyLowRisk": True,
     "timeoutSeconds": 60,
     "maxTextLength": 12000,
@@ -459,6 +460,7 @@ def init_db() -> None:
                 analysis_status TEXT NOT NULL DEFAULT 'not_analyzed',
                 analysis_at TEXT,
                 analysis_error TEXT,
+                analysis_raw_response TEXT,
                 knowledge_status TEXT NOT NULL DEFAULT 'not_indexed',
                 knowledge_indexed_at TEXT,
                 knowledge_error TEXT,
@@ -477,7 +479,11 @@ def init_db() -> None:
                 authority_reason TEXT,
                 authority_status TEXT NOT NULL DEFAULT 'pending',
                 authority_note TEXT,
-                authority_updated_at TEXT
+                authority_updated_at TEXT,
+                content_hash TEXT,
+                version_group TEXT,
+                primary_version_id INTEGER,
+                extraction_quality REAL NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS weekly_reports (
@@ -521,6 +527,9 @@ def init_db() -> None:
                 source TEXT,
                 show_in_gantt INTEGER NOT NULL DEFAULT 0,
                 source_document_id INTEGER REFERENCES documents(id) ON DELETE SET NULL,
+                is_archived INTEGER NOT NULL DEFAULT 0,
+                merged_into_id INTEGER,
+                archive_reason TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
@@ -534,6 +543,9 @@ def init_db() -> None:
                 status TEXT NOT NULL DEFAULT 'planned',
                 color_status TEXT NOT NULL DEFAULT 'green',
                 source_document_id INTEGER REFERENCES documents(id) ON DELETE SET NULL,
+                is_archived INTEGER NOT NULL DEFAULT 0,
+                merged_into_id INTEGER,
+                archive_reason TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
@@ -546,6 +558,9 @@ def init_db() -> None:
                 status TEXT NOT NULL DEFAULT 'open',
                 mitigation TEXT,
                 source_document_id INTEGER REFERENCES documents(id) ON DELETE SET NULL,
+                is_archived INTEGER NOT NULL DEFAULT 0,
+                merged_into_id INTEGER,
+                archive_reason TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
@@ -558,6 +573,9 @@ def init_db() -> None:
                 impact TEXT,
                 status TEXT NOT NULL DEFAULT 'pending',
                 source_document_id INTEGER REFERENCES documents(id) ON DELETE SET NULL,
+                is_archived INTEGER NOT NULL DEFAULT 0,
+                merged_into_id INTEGER,
+                archive_reason TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
@@ -571,8 +589,30 @@ def init_db() -> None:
                 confidence REAL NOT NULL DEFAULT 0.7,
                 payload_json TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'pending',
+                normalized_title TEXT,
+                fingerprint TEXT,
+                candidate_action TEXT NOT NULL DEFAULT 'create',
+                matched_entity_type TEXT,
+                matched_entity_id INTEGER,
+                similarity REAL NOT NULL DEFAULT 0,
+                quality_score REAL NOT NULL DEFAULT 0,
+                quality_warnings_json TEXT NOT NULL DEFAULT '[]',
+                evidence_text TEXT,
+                evidence_locator TEXT,
                 created_at TEXT NOT NULL,
                 applied_at TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS suggestion_sources (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                suggestion_id INTEGER NOT NULL REFERENCES update_suggestions(id) ON DELETE CASCADE,
+                document_id INTEGER REFERENCES documents(id) ON DELETE SET NULL,
+                evidence_hash TEXT NOT NULL,
+                evidence_text TEXT,
+                locator TEXT,
+                observed_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                UNIQUE(suggestion_id, evidence_hash)
             );
 
             CREATE TABLE IF NOT EXISTS deliverables (
@@ -586,6 +626,9 @@ def init_db() -> None:
                 submitted_date TEXT,
                 document_id INTEGER REFERENCES documents(id) ON DELETE SET NULL,
                 sort_order INTEGER NOT NULL DEFAULT 0,
+                is_archived INTEGER NOT NULL DEFAULT 0,
+                merged_into_id INTEGER,
+                archive_reason TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
@@ -659,6 +702,58 @@ def init_db() -> None:
                 applied_at TEXT
             );
 
+            CREATE TABLE IF NOT EXISTS project_entities (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                entity_type TEXT NOT NULL,
+                record_id INTEGER NOT NULL,
+                canonical_title TEXT NOT NULL,
+                normalized_key TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active',
+                merged_into_entity_id INTEGER REFERENCES project_entities(id) ON DELETE SET NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(entity_type, record_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS entity_evidence (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                entity_id INTEGER NOT NULL REFERENCES project_entities(id) ON DELETE CASCADE,
+                document_id INTEGER REFERENCES documents(id) ON DELETE SET NULL,
+                suggestion_id INTEGER REFERENCES update_suggestions(id) ON DELETE SET NULL,
+                evidence_hash TEXT NOT NULL,
+                snippet TEXT NOT NULL,
+                locator TEXT,
+                observed_json TEXT NOT NULL DEFAULT '{}',
+                confidence REAL NOT NULL DEFAULT 0.7,
+                extraction_method TEXT NOT NULL DEFAULT 'system',
+                created_at TEXT NOT NULL,
+                UNIQUE(entity_id, evidence_hash)
+            );
+
+            CREATE TABLE IF NOT EXISTS data_quality_suggestions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                suggestion_kind TEXT NOT NULL,
+                entity_type TEXT NOT NULL,
+                primary_record_id INTEGER,
+                related_record_ids_json TEXT NOT NULL DEFAULT '[]',
+                title TEXT NOT NULL,
+                description TEXT,
+                confidence REAL NOT NULL DEFAULT 0.7,
+                details_json TEXT NOT NULL DEFAULT '{}',
+                safe_auto INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TEXT NOT NULL,
+                applied_at TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS data_quality_actions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                suggestion_id INTEGER REFERENCES data_quality_suggestions(id) ON DELETE SET NULL,
+                action TEXT NOT NULL,
+                details_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL
+            );
+
             CREATE INDEX IF NOT EXISTS idx_documents_category ON documents(doc_category);
             CREATE INDEX IF NOT EXISTS idx_suggestions_status ON update_suggestions(status);
             CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
@@ -668,6 +763,9 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_ocr_pages_document ON ocr_pages(document_id);
             CREATE INDEX IF NOT EXISTS idx_wiki_suggestions_status ON wiki_suggestions(status);
             CREATE INDEX IF NOT EXISTS idx_document_authority_suggestions_status ON document_authority_suggestions(status);
+            CREATE INDEX IF NOT EXISTS idx_entities_key ON project_entities(entity_type, normalized_key, status);
+            CREATE INDEX IF NOT EXISTS idx_entity_evidence_entity ON entity_evidence(entity_id, created_at);
+            CREATE INDEX IF NOT EXISTS idx_quality_suggestions_status ON data_quality_suggestions(status, suggestion_kind);
             """
         )
         ensure_schema(conn)
@@ -685,6 +783,7 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         "analysis_status": "TEXT NOT NULL DEFAULT 'not_analyzed'",
         "analysis_at": "TEXT",
         "analysis_error": "TEXT",
+        "analysis_raw_response": "TEXT",
         "knowledge_status": "TEXT NOT NULL DEFAULT 'not_indexed'",
         "knowledge_indexed_at": "TEXT",
         "knowledge_error": "TEXT",
@@ -704,6 +803,10 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         "authority_status": "TEXT NOT NULL DEFAULT 'pending'",
         "authority_note": "TEXT",
         "authority_updated_at": "TEXT",
+        "content_hash": "TEXT",
+        "version_group": "TEXT",
+        "primary_version_id": "INTEGER",
+        "extraction_quality": "REAL NOT NULL DEFAULT 0",
     }
     for name, definition in document_columns.items():
         if name not in columns:
@@ -721,6 +824,35 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
             END
             """
         )
+    archive_columns = {
+        "is_archived": "INTEGER NOT NULL DEFAULT 0",
+        "merged_into_id": "INTEGER",
+        "archive_reason": "TEXT",
+    }
+    for table in ["tasks", "milestones", "risks", "change_requests", "deliverables"]:
+        table_columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        for name, definition in archive_columns.items():
+            if name not in table_columns:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+
+    suggestion_columns = {
+        "normalized_title": "TEXT",
+        "fingerprint": "TEXT",
+        "candidate_action": "TEXT NOT NULL DEFAULT 'create'",
+        "matched_entity_type": "TEXT",
+        "matched_entity_id": "INTEGER",
+        "similarity": "REAL NOT NULL DEFAULT 0",
+        "quality_score": "REAL NOT NULL DEFAULT 0",
+        "quality_warnings_json": "TEXT NOT NULL DEFAULT '[]'",
+        "evidence_text": "TEXT",
+        "evidence_locator": "TEXT",
+    }
+    current_suggestion_columns = {
+        row["name"] for row in conn.execute("PRAGMA table_info(update_suggestions)").fetchall()
+    }
+    for name, definition in suggestion_columns.items():
+        if name not in current_suggestion_columns:
+            conn.execute(f"ALTER TABLE update_suggestions ADD COLUMN {name} {definition}")
     fts_row = conn.execute(
         "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'knowledge_chunks_fts'"
     ).fetchone()
@@ -781,10 +913,91 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
             created_at TEXT NOT NULL,
             applied_at TEXT
         );
+        CREATE TABLE IF NOT EXISTS project_entities (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            entity_type TEXT NOT NULL,
+            record_id INTEGER NOT NULL,
+            canonical_title TEXT NOT NULL,
+            normalized_key TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'active',
+            merged_into_entity_id INTEGER REFERENCES project_entities(id) ON DELETE SET NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(entity_type, record_id)
+        );
+        CREATE TABLE IF NOT EXISTS suggestion_sources (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            suggestion_id INTEGER NOT NULL REFERENCES update_suggestions(id) ON DELETE CASCADE,
+            document_id INTEGER REFERENCES documents(id) ON DELETE SET NULL,
+            evidence_hash TEXT NOT NULL,
+            evidence_text TEXT,
+            locator TEXT,
+            observed_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL,
+            UNIQUE(suggestion_id, evidence_hash)
+        );
+        CREATE TABLE IF NOT EXISTS entity_evidence (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            entity_id INTEGER NOT NULL REFERENCES project_entities(id) ON DELETE CASCADE,
+            document_id INTEGER REFERENCES documents(id) ON DELETE SET NULL,
+            suggestion_id INTEGER REFERENCES update_suggestions(id) ON DELETE SET NULL,
+            evidence_hash TEXT NOT NULL,
+            snippet TEXT NOT NULL,
+            locator TEXT,
+            observed_json TEXT NOT NULL DEFAULT '{}',
+            confidence REAL NOT NULL DEFAULT 0.7,
+            extraction_method TEXT NOT NULL DEFAULT 'system',
+            created_at TEXT NOT NULL,
+            UNIQUE(entity_id, evidence_hash)
+        );
+        CREATE TABLE IF NOT EXISTS data_quality_suggestions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            suggestion_kind TEXT NOT NULL,
+            entity_type TEXT NOT NULL,
+            primary_record_id INTEGER,
+            related_record_ids_json TEXT NOT NULL DEFAULT '[]',
+            title TEXT NOT NULL,
+            description TEXT,
+            confidence REAL NOT NULL DEFAULT 0.7,
+            details_json TEXT NOT NULL DEFAULT '{}',
+            safe_auto INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'pending',
+            created_at TEXT NOT NULL,
+            applied_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS data_quality_actions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            suggestion_id INTEGER REFERENCES data_quality_suggestions(id) ON DELETE SET NULL,
+            action TEXT NOT NULL,
+            details_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL
+        );
         CREATE INDEX IF NOT EXISTS idx_ocr_pages_document ON ocr_pages(document_id);
         CREATE INDEX IF NOT EXISTS idx_wiki_suggestions_status ON wiki_suggestions(status);
         CREATE INDEX IF NOT EXISTS idx_documents_authority ON documents(authority_level, authority_score);
         CREATE INDEX IF NOT EXISTS idx_document_authority_suggestions_status ON document_authority_suggestions(status);
+        CREATE INDEX IF NOT EXISTS idx_entities_key ON project_entities(entity_type, normalized_key, status);
+        CREATE INDEX IF NOT EXISTS idx_suggestion_sources_suggestion ON suggestion_sources(suggestion_id, created_at);
+        CREATE INDEX IF NOT EXISTS idx_entity_evidence_entity ON entity_evidence(entity_id, created_at);
+        CREATE INDEX IF NOT EXISTS idx_quality_suggestions_status ON data_quality_suggestions(status, suggestion_kind);
+        """
+    )
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO suggestion_sources(
+            suggestion_id, document_id, evidence_hash, evidence_text, locator, observed_json, created_at
+        )
+        SELECT id, document_id,
+               lower(hex(randomblob(16))),
+               COALESCE(evidence_text, description, title),
+               COALESCE(evidence_locator, ''),
+               payload_json,
+               created_at
+        FROM update_suggestions
+        WHERE document_id IS NOT NULL
+          AND NOT EXISTS (
+              SELECT 1 FROM suggestion_sources ss WHERE ss.suggestion_id = update_suggestions.id
+          )
         """
     )
 
@@ -798,8 +1011,15 @@ def seed_defaults(conn: sqlite3.Connection) -> None:
         set_setting(conn, "monitor_types", default_monitor_types(DEFAULT_MONITOR_ROOT))
         set_setting(conn, "ignored_directories", ["oa-project-management-system", ".venv", "node_modules", "dist"])
         set_setting(conn, "last_scan_at", "")
-    if get_setting(conn, "intelligent_analysis") is None:
+    intelligent_analysis = get_setting(conn, "intelligent_analysis")
+    if intelligent_analysis is None:
         set_setting(conn, "intelligent_analysis", DEFAULT_INTELLIGENT_ANALYSIS)
+    elif "reviewPolicy" not in intelligent_analysis:
+        intelligent_analysis = {**DEFAULT_INTELLIGENT_ANALYSIS, **intelligent_analysis}
+        intelligent_analysis["reviewPolicy"] = "balanced"
+        intelligent_analysis["reviewOnly"] = False
+        intelligent_analysis["autoApplyLowRisk"] = True
+        set_setting(conn, "intelligent_analysis", intelligent_analysis)
 
     profile = conn.execute("SELECT id FROM project_profile WHERE id = 1").fetchone()
     if not profile:

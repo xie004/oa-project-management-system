@@ -27,7 +27,21 @@ class ExtractResult:
 def compact_text(text: str, limit: int = MAX_TEXT_CHARS) -> str:
     lines = [clean_line(line) for line in text.splitlines()]
     lines = [line for line in lines if is_meaningful_line(line)]
-    text = "\n".join(lines)
+    counts: dict[str, int] = {}
+    for line in lines:
+        content = re.sub(r"^\[[^\]]+\]\s*", "", line)
+        if len(content) <= 50:
+            counts[content] = counts.get(content, 0) + 1
+    retained: set[str] = set()
+    cleaned_lines: list[str] = []
+    for line in lines:
+        content = re.sub(r"^\[[^\]]+\]\s*", "", line)
+        if counts.get(content, 0) >= 3:
+            if content in retained:
+                continue
+            retained.add(content)
+        cleaned_lines.append(line)
+    text = "\n".join(cleaned_lines)
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()[:limit]
@@ -36,6 +50,10 @@ def compact_text(text: str, limit: int = MAX_TEXT_CHARS) -> str:
 def clean_line(line: str) -> str:
     line = line.replace("\u3000", " ").replace("\xa0", " ")
     line = re.sub(r"[ \t]+", " ", line)
+    if re.fullmatch(r"\s*第\s*\d+\s*页\s*共\s*\d+\s*页\s*", line, re.I):
+        return ""
+    if re.fullmatch(r"\s*(?:共\s*)?\d+\s*页\s*", line, re.I):
+        return ""
     line = re.sub(r"(?:\s*\|\s*)+$", "", line)
     line = re.sub(r"^\s*(?:\|\s*)+", "", line)
     line = re.sub(r"\s*\|\s*(?:\|\s*)+", " | ", line)
@@ -45,7 +63,10 @@ def clean_line(line: str) -> str:
 def is_meaningful_line(line: str) -> bool:
     if not line:
         return False
-    content = re.sub(r"[\s|/\\._\-:：;；,，。]+", "", line)
+    content = re.sub(r"^\[[^\]]+\]\s*", "", line)
+    if re.fullmatch(r"[\d一二三四五六七八九十]+[.、）)]?", content.strip()):
+        return False
+    content = re.sub(r"[\s|/\\._\-:：;；,，。]+", "", content)
     return bool(re.search(r"[\w\u4e00-\u9fff]", content)) and len(content) >= 2
 
 
@@ -124,16 +145,16 @@ def extract_docx(path: Path) -> ExtractResult:
     try:
         doc = Document(str(path))
         parts: list[str] = []
-        for para in doc.paragraphs:
+        for paragraph_index, para in enumerate(doc.paragraphs, 1):
             line = clean_line(para.text)
             if is_meaningful_line(line):
-                parts.append(line)
-        for table in doc.tables:
-            for row in table.rows:
+                parts.append(f"[段落 {paragraph_index}] {line}")
+        for table_index, table in enumerate(doc.tables, 1):
+            for row_index, row in enumerate(table.rows, 1):
                 values = [cell.text.strip().replace("\n", " / ") for cell in row.cells]
                 rendered = render_table_row(values)
                 if is_meaningful_line(rendered):
-                    parts.append(rendered)
+                    parts.append(f"[表 {table_index}/行 {row_index}] {rendered}")
         return ExtractResult(compact_text("\n".join(parts)), "indexed")
     except Exception as exc:
         return ExtractResult("", "error", str(exc))
@@ -154,13 +175,12 @@ def extract_xlsx(path: Path) -> ExtractResult:
         workbook = load_workbook(str(path), data_only=True, read_only=True)
         parts: list[str] = []
         for sheet in workbook.worksheets[:5]:
-            parts.append(f"工作表：{sheet.title}")
             row_count = 0
-            for row in sheet.iter_rows(values_only=True):
+            for row_index, row in enumerate(sheet.iter_rows(values_only=True), 1):
                 values = ["" if value is None else str(value).strip() for value in row[:18]]
                 rendered = render_table_row(values)
                 if is_meaningful_line(rendered):
-                    parts.append(rendered)
+                    parts.append(f"[工作表 {sheet.title}/行 {row_index}] {rendered}")
                     row_count += 1
                 if row_count >= 180:
                     break
@@ -185,8 +205,11 @@ def extract_pdf(path: Path) -> ExtractResult:
     try:
         reader = PdfReader(str(path))
         pages = []
-        for page in reader.pages[:MAX_PDF_PAGES]:
-            pages.append(page.extract_text() or "")
+        for page_number, page in enumerate(reader.pages[:MAX_PDF_PAGES], 1):
+            for line in (page.extract_text() or "").splitlines():
+                cleaned = clean_line(line)
+                if is_meaningful_line(cleaned):
+                    pages.append(f"[第 {page_number} 页] {cleaned}")
         return ExtractResult(compact_text("\n".join(pages)), "indexed")
     except Exception as exc:
         return ExtractResult("", "error", str(exc))
@@ -257,8 +280,9 @@ def bullet_lines(text: str, limit: int = 8) -> list[str]:
     lines = []
     for line in re.split(r"[\n\r]+", text):
         cleaned = clean_line(line)
+        cleaned = re.sub(r"^\[[^\]]+\]\s*", "", cleaned)
         cleaned = re.sub(
-            r"^\s*(?:[\d一二三四五六七八九十]+[.、）)]|[（(]?[一二三四五六七八九十]+[）)])\s*",
+            r"^\s*(?:[\d一二三四五六七八九十]+[.、）)]|[（(]?[\d一二三四五六七八九十]+[）)])\s*",
             "",
             cleaned,
         )

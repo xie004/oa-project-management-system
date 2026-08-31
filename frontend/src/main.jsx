@@ -7,6 +7,7 @@ import {
   Check,
   Circle,
   ClipboardCheck,
+  Database,
   Download,
   FileText,
   Flag,
@@ -87,6 +88,7 @@ const navItems = [
   { id: "documents", label: "资料台账", icon: FolderCog },
   { id: "deliverables", label: "交付物清单", icon: ClipboardCheck },
   { id: "authority", label: "文档权威", icon: ShieldCheck, adminOnly: true },
+  { id: "quality", label: "数据治理", icon: Database, adminOnly: true },
   { id: "wiki", label: "项目 Wiki", icon: BookOpen },
   { id: "qa", label: "智能问答", icon: MessageSquareText },
   { id: "weekly", label: "周报汇总", icon: ListChecks },
@@ -476,6 +478,7 @@ const defaultIntelligentAnalysis = {
   rerankerModelName: "",
   rerankerScorePath: "score",
   analysisMode: "auto_suggest",
+  reviewPolicy: "balanced",
   autoApplyLowRisk: true,
   timeoutSeconds: 60,
   maxTextLength: 12000,
@@ -710,7 +713,7 @@ function DashboardWorkspace({ widgets, renderWidget, resetSignal }) {
   );
 }
 
-function Dashboard({ data, onScan, onPreview, resetLayoutSignal, scanLoading }) {
+function Dashboard({ data, onScan, onPreview, onEvidence, resetLayoutSignal, scanLoading }) {
   const [taskStatusView, setTaskStatusView] = useState(loadTaskStatusView);
 
   useEffect(() => {
@@ -771,6 +774,7 @@ function Dashboard({ data, onScan, onPreview, resetLayoutSignal, scanLoading }) 
                 <strong>{risk.title}</strong>
                 <p>{risk.description}</p>
                 {risk.document_name && <p><FileButton documentId={risk.source_document_id} name={risk.document_name} onPreview={onPreview} /></p>}
+                <EvidenceButton entityType="risk" record={risk} onEvidence={onEvidence} />
               </div>
               <StatusPill value={risk.status} color={risk.level === "high" ? "red" : "amber"} />
             </div>
@@ -990,7 +994,61 @@ function Gantt({ tasks, milestones = [], onTaskFocus }) {
   );
 }
 
-function TaskBoard({ tasks, onCreate, onPatch, onBulkPatch, onPreview, focusedTaskId, onFocusedTaskHandled }) {
+function EvidenceButton({ entityType, record, onEvidence }) {
+  const count = Number(record?.source_count || 0);
+  return (
+    <span className="evidence-controls">
+      <button className="evidence-link" onClick={() => onEvidence(entityType, record.id)} title="查看识别依据">
+        <BookOpen size={14} />
+        {count ? `${count} 个来源` : "查看识别依据"}
+      </button>
+      {Number(record?.quality_issue_count || 0) > 0 && <span className="duplicate-flag">疑似重复</span>}
+    </span>
+  );
+}
+
+function EvidenceModal({ data, loading, onClose, onPreview }) {
+  if (!data && !loading) return null;
+  const evidence = data?.evidence || [];
+  return (
+    <div className="modal-backdrop" role="dialog" aria-modal="true">
+      <div className="modal evidence-modal">
+        <div className="modal-head">
+          <div>
+            <h2>{data?.entity?.canonical_title || "事项识别依据"}</h2>
+            <p>保留每次识别的原文、位置和观察到的状态变化。</p>
+          </div>
+          <button className="icon-button" onClick={onClose} title="关闭"><X size={18} /></button>
+        </div>
+        <div className="modal-meta">
+          <StatusPill value={data?.entity?.status || "active"} color={data?.entity?.status === "archived" ? "amber" : "green"} />
+          <span>{evidence.length} 条来源证据</span>
+        </div>
+        <div className="evidence-list">
+          {loading && <div className="empty"><span className="button-spinner" /> 正在读取来源</div>}
+          {!loading && evidence.map((item) => (
+            <article className="evidence-item" key={item.id}>
+              <div className="evidence-head">
+                <FileButton documentId={item.document_id} name={item.document_name || "系统基线"} onPreview={onPreview} />
+                <span>{item.locator || "未标注位置"}</span>
+              </div>
+              <p>{item.snippet}</p>
+              {!!Object.keys(item.observed || {}).length && (
+                <div className="evidence-observed">
+                  {Object.entries(item.observed).map(([key, value]) => <span key={key}>{key}: {String(value)}</span>)}
+                </div>
+              )}
+              <small>{item.extraction_method || "system"} · 置信度 {Math.round(Number(item.confidence || 0) * 100)}% · {formatDate(item.created_at)}</small>
+            </article>
+          ))}
+          {!loading && !evidence.length && <Empty text="该事项暂无文件来源证据" />}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function TaskBoard({ tasks, onCreate, onPatch, onBulkPatch, onPreview, onEvidence, focusedTaskId, onFocusedTaskHandled }) {
   const [draft, setDraft] = useState({ title: "", owner: "", due_date: "", priority: "medium" });
   const [selected, setSelected] = useState([]);
   const selectedSet = new Set(selected);
@@ -1102,6 +1160,7 @@ function TaskBoard({ tasks, onCreate, onPatch, onBulkPatch, onPreview, focusedTa
                     <FileButton documentId={task.source_document_id} name={task.document_name} onPreview={onPreview} />
                   </div>
                 )}
+                <EvidenceButton entityType="task" record={task} onEvidence={onEvidence} />
                 <div className="task-actions">
                   <select value={task.status} onChange={(e) => onPatch(task.id, { status: e.target.value })}>
                     {columns.map(([value, text]) => <option value={value} key={value}>{text}</option>)}
@@ -1123,7 +1182,7 @@ function TaskBoard({ tasks, onCreate, onPatch, onBulkPatch, onPreview, focusedTa
   );
 }
 
-function MilestoneView({ milestones, profile, goals, breakdown, onPreview }) {
+function MilestoneView({ milestones, profile, goals, breakdown, onPreview, onEvidence }) {
   const plannedMilestones = milestones.filter((item) => refinedMilestoneTitles.has(item.title));
   return (
     <Section title="关键里程碑">
@@ -1158,6 +1217,7 @@ function MilestoneView({ milestones, profile, goals, breakdown, onPreview }) {
               {item.document_name && (
                 <p><FileButton documentId={item.source_document_id} name={item.document_name} onPreview={onPreview} /></p>
               )}
+              <EvidenceButton entityType="milestone" record={item} onEvidence={onEvidence} />
               <span>{formatDate(item.actual_date || item.planned_date)}</span>
             </div>
           </div>
@@ -1200,7 +1260,7 @@ function MeetingView({ meetings, onPreview }) {
   );
 }
 
-function ChangesView({ changes, onPreview }) {
+function ChangesView({ changes, onPreview, onEvidence }) {
   return (
     <Section title="变更需求">
       <div className="list">
@@ -1215,6 +1275,7 @@ function ChangesView({ changes, onPreview }) {
                   <FileButton documentId={item.source_document_id} name={item.document_name} onPreview={onPreview} />
                 </div>
               )}
+              <EvidenceButton entityType="change_request" record={item} onEvidence={onEvidence} />
             </div>
             <StatusPill value={item.status} color={item.status === "pending" ? "amber" : "green"} />
           </div>
@@ -1245,8 +1306,17 @@ function SuggestionsView({ suggestions, onApply, onApplyAll, onDismiss, onPrevie
                 <strong>{item.title}</strong>
               </div>
               <p>{item.description}</p>
+              <div className="suggestion-quality">
+                <span>{item.candidate_action === "propose_update" ? "建议更新现有事项" : item.candidate_action === "review_match" ? "疑似已有事项" : "建议新增事项"}</span>
+                {Number(item.similarity || 0) > 0 && <span>相似度 {Math.round(Number(item.similarity) * 100)}%</span>}
+                <span>质量分 {Math.round(Number(item.quality_score || item.confidence || 0) * 100)}%</span>
+              </div>
+              {!!item.quality_warnings?.length && <p className="quality-warning">{item.quality_warnings.join("；")}</p>}
+              {item.evidence_text && <blockquote className="evidence-quote">{item.evidence_text}</blockquote>}
+              {item.evidence_locator && <small>位置：{item.evidence_locator}</small>}
               <small>
                 <FileButton documentId={item.document_id} name={item.document_name || "无来源文件"} onPreview={onPreview} />
+                {Number(item.source_count || 0) > 1 && <span> · 已聚合 {item.source_count} 份来源</span>}
                 <span> · 置信度 {Math.round((item.confidence || 0) * 100)}%</span>
               </small>
             </div>
@@ -1332,7 +1402,7 @@ const deliverableStatuses = [
   ["submitted", "已提交", "green"]
 ];
 
-function DeliverablesView({ deliverables, documents, onPatch, onPreview }) {
+function DeliverablesView({ deliverables, documents, onPatch, onPreview, onEvidence }) {
   const total = deliverables.length;
   const submitted = deliverables.filter((item) => item.status === "submitted").length;
   const ready = deliverables.filter((item) => ["finalized", "submitted"].includes(item.status)).length;
@@ -1393,6 +1463,7 @@ function DeliverablesView({ deliverables, documents, onPatch, onPreview }) {
                     {item.document_name && (
                       <FileButton documentId={item.document_id} name={item.document_name} onPreview={onPreview} />
                     )}
+                    <EvidenceButton entityType="deliverable" record={item} onEvidence={onEvidence} />
                   </td>
                 </tr>
               ))}
@@ -1833,6 +1904,158 @@ function QAView({ onPreview }) {
   );
 }
 
+const qualityKindLabels = {
+  exact_duplicate: "完全重复",
+  near_duplicate: "高度近似",
+  invalid_record: "疑似误识别",
+  document_version: "版本冲突",
+  authority_anomaly: "权威异常",
+  analysis_failure: "模型分析失败"
+};
+
+const entityTypeLabels = {
+  task: "任务",
+  risk: "风险",
+  milestone: "里程碑",
+  change_request: "变更",
+  deliverable: "交付物",
+  document: "文档"
+};
+
+function qualityRecordTitle(record = {}) {
+  return record.entity_title || record.title || record.name || `记录 #${record.id}`;
+}
+
+function QualitySuggestionCard({ item, onApply, onDismiss, actionStates }) {
+  const records = item.details?.records || [];
+  const documents = item.details?.documents || [];
+  const candidates = records.length ? records : documents;
+  const [primaryRecordId, setPrimaryRecordId] = useState(item.primary_record_id || candidates[0]?.id || 0);
+  const [fieldChoices, setFieldChoices] = useState({});
+  const conflicts = item.details?.fieldConflicts || {};
+  const applyKey = `apply-quality-${item.id}`;
+  const dismissKey = `dismiss-quality-${item.id}`;
+  const apply = () => onApply(item.id, {
+    primaryRecordId: Number(primaryRecordId || item.primary_record_id || 0),
+    relatedRecordIds: candidates.map((candidate) => Number(candidate.id)).filter((id) => id !== Number(primaryRecordId)),
+    fieldChoices
+  });
+
+  return (
+    <article className="quality-card">
+      <div className="quality-card-head">
+        <div>
+          <div className="suggestion-title">
+            <StatusPill value={qualityKindLabels[item.suggestion_kind]} color={item.safe_auto ? "green" : "amber"} />
+            <span className="quality-entity-label">{entityTypeLabels[item.entity_type] || item.entity_type}</span>
+          </div>
+          <strong>{item.title}</strong>
+          <p>{item.description}</p>
+        </div>
+        <div className="quality-score">{Math.round(Number(item.confidence || 0) * 100)}%</div>
+      </div>
+
+      {candidates.length > 1 && (
+        <div className="quality-resolution">
+          <label>
+            主记录/当前版本
+            <select value={primaryRecordId} onChange={(event) => setPrimaryRecordId(Number(event.target.value))}>
+              {candidates.map((candidate) => <option value={candidate.id} key={candidate.id}>{qualityRecordTitle(candidate)}</option>)}
+            </select>
+          </label>
+          <div className="quality-candidates">
+            {candidates.map((candidate) => (
+              <span key={candidate.id} className={Number(candidate.id) === Number(primaryRecordId) ? "primary" : ""}>
+                #{candidate.id} {qualityRecordTitle(candidate)}
+              </span>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {!!Object.keys(conflicts).length && (
+        <div className="quality-conflicts">
+          <strong>字段冲突</strong>
+          {Object.entries(conflicts).map(([field, values]) => (
+            <label key={field}>
+              {field}
+              <select value={fieldChoices[field] ?? ""} onChange={(event) => setFieldChoices({ ...fieldChoices, [field]: event.target.value })}>
+                <option value="">保留主记录值</option>
+                {values.map((value) => <option value={value} key={String(value)}>{String(value)}</option>)}
+              </select>
+            </label>
+          ))}
+        </div>
+      )}
+
+      {item.details?.warnings?.length > 0 && <p className="quality-warning">{item.details.warnings.join("；")}</p>}
+      {item.details?.document && <p className="quality-document">{item.details.document.name}：{item.details.document.analysis_error || "待处理"}</p>}
+      <div className="quality-card-actions">
+        <span>{item.safe_auto ? "无字段冲突，可安全批量处理" : "需要管理员确认"}</span>
+        <button className="primary-button" onClick={apply} disabled={actionStates[applyKey]}>
+          {actionStates[applyKey] ? <span className="button-spinner" /> : <Check size={16} />}
+          {actionStates[applyKey] ? "处理中" : item.suggestion_kind === "invalid_record" ? "归档误识别" : "应用治理"}
+        </button>
+        <button className="ghost-button" onClick={() => onDismiss(item.id)} disabled={actionStates[dismissKey]}>
+          {actionStates[dismissKey] ? <span className="button-spinner" /> : <X size={16} />}
+          {actionStates[dismissKey] ? "处理中" : "保持独立"}
+        </button>
+      </div>
+    </article>
+  );
+}
+
+function DataQualityView({ status, suggestions, onAnalyze, onApply, onDismiss, onApplyAllSafe, actionStates = {} }) {
+  const running = !!status?.running || !!actionStates["analyze-quality"];
+  const counts = status?.pendingCounts || {};
+  return (
+    <div className="view-grid">
+      <div className="stats-grid deliverable-stats">
+        <Stat label="待治理" value={status?.pending || suggestions.length} icon={Database} tone="blue" />
+        <Stat label="重复/近似" value={(counts.exact_duplicate || 0) + (counts.near_duplicate || 0)} icon={GitPullRequest} tone="amber" />
+        <Stat label="疑似误识别" value={counts.invalid_record || 0} icon={AlertTriangle} tone="red" />
+        <Stat label="版本/权威" value={(counts.document_version || 0) + (counts.authority_anomaly || 0)} icon={ShieldCheck} tone="neutral" />
+      </div>
+      <Section
+        title="历史数据质量分析"
+        action={
+          <div className="button-row">
+            <button className="ghost-button" onClick={onApplyAllSafe} disabled={running || actionStates["apply-all-safe-quality"]}>
+              {actionStates["apply-all-safe-quality"] ? <span className="button-spinner" /> : <Check size={16} />}
+              {actionStates["apply-all-safe-quality"] ? "处理中" : "应用全部安全建议"}
+            </button>
+            <button className="primary-button" onClick={onAnalyze} disabled={running}>
+              {running ? <span className="button-spinner" /> : <RefreshCw size={16} />}
+              {running ? "分析中" : "重新分析"}
+            </button>
+          </div>
+        }
+      >
+        {running ? (
+          <div className="wiki-job-banner">
+            <span className="qa-spinner" />
+            <div>
+              <strong>正在后台检查重复、误识别、版本与权威异常</strong>
+              <p>进度 {status.progress || 0}/{status.total || 0}，可切换页面或关闭网页，后台任务会继续。</p>
+            </div>
+          </div>
+        ) : (
+          <p className="muted-text">治理操作只会归档或建立合并关系，不物理删除历史记录；来源证据和操作记录均保留。</p>
+        )}
+        {status?.error && <div className="error">质量分析失败：{status.error}</div>}
+      </Section>
+      <Section title="待确认治理建议">
+        <div className="quality-list">
+          {suggestions.map((item) => (
+            <QualitySuggestionCard key={item.id} item={item} onApply={onApply} onDismiss={onDismiss} actionStates={actionStates} />
+          ))}
+          {!suggestions.length && <Empty text="当前没有待确认的数据治理建议" />}
+        </div>
+      </Section>
+    </div>
+  );
+}
+
 function SettingsView({
   settings,
   setSettings,
@@ -1841,6 +2064,8 @@ function SettingsView({
   onChangePassword,
   onTestModel,
   modelTest,
+  onTestExtraction,
+  extractionTest,
   onLoadModels,
   modelList,
   onRebuildKnowledge,
@@ -1927,9 +2152,18 @@ function SettingsView({
             {actionStates["test-model"] ? <span className="button-spinner" /> : <Sparkles size={16} />}
             {actionStates["test-model"] ? "测试中" : "测试连接"}
           </button>
+          <button className="ghost-button" onClick={onTestExtraction} type="button" disabled={actionStates["test-extraction"]}>
+            {actionStates["test-extraction"] ? <span className="button-spinner" /> : <ListChecks size={16} />}
+            {actionStates["test-extraction"] ? "测试中" : "测试结构化抽取"}
+          </button>
           {modelTest && (
             <span className={modelTest.ok ? "notice" : "error"}>
               {modelTest.ok ? `连接正常：${modelTest.modelName || "已自动选择模型"}，${modelTest.elapsedMs}ms` : modelTest.error}
+            </span>
+          )}
+          {extractionTest && (
+            <span className={extractionTest.ok ? "notice" : "error"}>
+              {extractionTest.ok ? `结构合规：返回 ${extractionTest.items?.length || 0} 条测试事项` : (extractionTest.errors || [extractionTest.error]).filter(Boolean).join("；")}
             </span>
           )}
         </div>
@@ -2018,13 +2252,13 @@ function SettingsView({
               onChange={(e) => updateAnalysis({ maxTextLength: Number(e.target.value) })}
             />
           </label>
-          <label className="checkbox-row">
-            <input
-              type="checkbox"
-              checked={!!intelligentAnalysis.reviewOnly}
-              onChange={(e) => updateAnalysis({ reviewOnly: e.target.checked })}
-            />
-            仅生成待确认建议
+          <label>
+            审核策略
+            <select value={intelligentAnalysis.reviewPolicy || "balanced"} onChange={(e) => updateAnalysis({ reviewPolicy: e.target.value })}>
+              <option value="strict">严格审核：所有正式事项均需确认</option>
+              <option value="balanced">平衡模式：证据自动累积，字段变化需确认</option>
+              <option value="automatic">自动模式：低风险内容自动更新</option>
+            </select>
           </label>
           <label className="checkbox-row">
             <input
@@ -2034,14 +2268,7 @@ function SettingsView({
             />
             允许发送内容到外部模型服务
           </label>
-          <label className="checkbox-row">
-            <input
-              type="checkbox"
-              checked={!!intelligentAnalysis.autoApplyLowRisk}
-              onChange={(e) => updateAnalysis({ autoApplyLowRisk: e.target.checked })}
-            />
-            自动更新低风险内容
-          </label>
+          <p className="settings-note">平衡模式下，摘要、索引和来源证据自动更新；任务、风险、里程碑、变更和交付物字段仍需确认。</p>
         </div>
       </Section>
 
@@ -2264,9 +2491,13 @@ function App() {
   const [authoritySuggestions, setAuthoritySuggestions] = useState([]);
   const [authorityAnalyzeStatus, setAuthorityAnalyzeStatus] = useState({});
   const authorityWasRunningRef = useRef(false);
+  const [qualitySuggestions, setQualitySuggestions] = useState([]);
+  const [qualityStatus, setQualityStatus] = useState({});
+  const qualityWasRunningRef = useRef(false);
   const [weekly, setWeekly] = useState({});
   const [settings, setSettings] = useState({ monitorTypes: {} });
   const [modelTest, setModelTest] = useState(null);
+  const [extractionTest, setExtractionTest] = useState(null);
   const [modelList, setModelList] = useState([]);
   const [knowledgeStatus, setKnowledgeStatus] = useState({});
   const [knowledgeRebuildStatus, setKnowledgeRebuildStatus] = useState({});
@@ -2275,6 +2506,8 @@ function App() {
   const [loginOpen, setLoginOpen] = useState(false);
   const [preview, setPreview] = useState(null);
   const [previewLoading, setPreviewLoading] = useState(false);
+  const [evidenceData, setEvidenceData] = useState(null);
+  const [evidenceLoading, setEvidenceLoading] = useState(false);
   const [loading, setLoading] = useState(true);
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
@@ -2354,6 +2587,16 @@ function App() {
     setAuthorityAnalyzeStatus(status);
   };
 
+  const loadDataQuality = async () => {
+    if (!auth.isAdmin) return;
+    const [status, items] = await Promise.all([
+      api.get("/api/data-quality/status"),
+      api.get("/api/data-quality/suggestions")
+    ]);
+    setQualityStatus(status);
+    setQualitySuggestions(items);
+  };
+
   useEffect(() => {
     Promise.all([refresh(), refreshAuth()])
       .catch((err) => setError(err.message || "加载失败"))
@@ -2365,11 +2608,13 @@ function App() {
       setSettings({ monitorTypes: {} });
       setAuthorityDocs([]);
       setAuthoritySuggestions([]);
+      setQualitySuggestions([]);
       if (active === "settings") setActive("dashboard");
       if (active === "authority") setActive("dashboard");
+      if (active === "quality") setActive("dashboard");
       return;
     }
-    Promise.all([loadSettings(), loadKnowledgeStatus(), loadKnowledgeRebuildStatus(), loadWikiSuggestions(), loadWikiRebuildStatus(), loadAuthority()]).catch((err) => setError(err.message || "系统设置加载失败"));
+    Promise.all([loadSettings(), loadKnowledgeStatus(), loadKnowledgeRebuildStatus(), loadWikiSuggestions(), loadWikiRebuildStatus(), loadAuthority(), loadDataQuality()]).catch((err) => setError(err.message || "系统设置加载失败"));
   }, [auth.isAdmin]);
 
   useEffect(() => {
@@ -2428,6 +2673,24 @@ function App() {
     return () => window.clearInterval(timer);
   }, [auth.isAdmin]);
 
+  useEffect(() => {
+    if (!auth.isAdmin) return undefined;
+    const timer = window.setInterval(async () => {
+      try {
+        const status = await api.get("/api/data-quality/status");
+        setQualityStatus(status);
+        if (status.running || qualityWasRunningRef.current) {
+          setQualitySuggestions(await api.get("/api/data-quality/suggestions"));
+          if (!status.running && qualityWasRunningRef.current) await refresh();
+        }
+        qualityWasRunningRef.current = !!status.running;
+      } catch {
+        // Explicit actions surface errors; polling remains quiet on a transient failure.
+      }
+    }, 2500);
+    return () => window.clearInterval(timer);
+  }, [auth.isAdmin]);
+
   const runAction = async (key, action, success) => {
     try {
       setActionLoading(key, true);
@@ -2473,7 +2736,7 @@ function App() {
       await api.post("/api/auth/logout");
       await refreshAuth();
       setSettings({ monitorTypes: {} });
-      if (active === "settings") setActive("dashboard");
+      if (["settings", "authority", "quality"].includes(active)) setActive("dashboard");
       setNotice("已退出管理员");
     } catch (err) {
       setError(err.message || "退出失败");
@@ -2489,6 +2752,17 @@ function App() {
       setModelTest({ ok: false, error: err.message || "测试失败" });
     } finally {
       setActionLoading("test-model", false);
+    }
+  };
+  const testExtraction = async () => {
+    try {
+      setActionLoading("test-extraction", true);
+      setExtractionTest(null);
+      setExtractionTest(await api.post("/api/ai/extraction-test"));
+    } catch (err) {
+      setExtractionTest({ ok: false, error: err.message || "结构化抽取测试失败" });
+    } finally {
+      setActionLoading("test-extraction", false);
     }
   };
   const loadModels = async () => {
@@ -2590,6 +2864,44 @@ function App() {
     const ok = await runAction(`dismiss-authority-${id}`, () => api.post(`/api/document-authority/suggestions/${id}/dismiss`), "权威建议已忽略");
     if (ok) await loadAuthority();
   };
+  const analyzeDataQuality = async () => {
+    try {
+      setActionLoading("analyze-quality", true);
+      setNotice("");
+      setError("");
+      const status = await api.post("/api/data-quality/analyze");
+      setQualityStatus(status);
+      setNotice(status.alreadyRunning ? "数据质量分析已在后台运行" : "数据质量分析已开始后台运行");
+      await loadDataQuality();
+    } catch (err) {
+      setError(err.message || "启动数据质量分析失败");
+    } finally {
+      setActionLoading("analyze-quality", false);
+    }
+  };
+  const applyQualitySuggestion = async (id, values) => {
+    const ok = await runAction(`apply-quality-${id}`, () => api.post(`/api/data-quality/suggestions/${id}/apply`, { values }), "数据治理建议已应用");
+    if (ok) await loadDataQuality();
+  };
+  const dismissQualitySuggestion = async (id) => {
+    const ok = await runAction(`dismiss-quality-${id}`, () => api.post(`/api/data-quality/suggestions/${id}/dismiss`), "已保留为独立记录");
+    if (ok) await loadDataQuality();
+  };
+  const applyAllSafeQuality = async () => {
+    try {
+      setActionLoading("apply-all-safe-quality", true);
+      setNotice("");
+      setError("");
+      const result = await api.post("/api/data-quality/suggestions/apply-all-safe");
+      await Promise.all([refresh(), loadDataQuality()]);
+      setNotice(`已处理 ${result.applied || 0}/${result.total || 0} 条安全治理建议`);
+      if (result.failed?.length) setError(result.failed.map((item) => `#${item.id}：${item.message}`).join("；"));
+    } catch (err) {
+      setError(err.message || "批量治理失败");
+    } finally {
+      setActionLoading("apply-all-safe-quality", false);
+    }
+  };
   const startOcr = (id) => runAction(`ocr-start-${id}`, () => api.post(`/api/ocr/documents/${id}/start`), "OCR 已启动");
   const retryOcr = (id) => runAction(`ocr-retry-${id}`, () => api.post(`/api/ocr/documents/${id}/retry`), "OCR 已重新入队");
   const rebuildWikiSuggestions = async () => {
@@ -2629,11 +2941,23 @@ function App() {
       setPreviewLoading(false);
     }
   };
+  const openEvidence = async (entityType, recordId) => {
+    try {
+      setEvidenceLoading(true);
+      setEvidenceData(null);
+      setError("");
+      setEvidenceData(await api.get(`/api/entities/${entityType}/${recordId}/evidence`));
+    } catch (err) {
+      setError(err.message || "识别依据加载失败");
+    } finally {
+      setEvidenceLoading(false);
+    }
+  };
 
   const content = () => {
     if (loading) return <div className="loading">加载中</div>;
     if (active === "dashboard") {
-      return <Dashboard data={dashboardData} onScan={scanNow} onPreview={openPreview} resetLayoutSignal={dashboardResetSignal} scanLoading={isActionLoading("scan")} />;
+      return <Dashboard data={dashboardData} onScan={scanNow} onPreview={openPreview} onEvidence={openEvidence} resetLayoutSignal={dashboardResetSignal} scanLoading={isActionLoading("scan")} />;
     }
     if (active === "gantt") {
       return (
@@ -2655,6 +2979,7 @@ function App() {
           onPatch={patchTask}
           onBulkPatch={bulkPatchTasks}
           onPreview={openPreview}
+          onEvidence={openEvidence}
           focusedTaskId={focusedTaskId}
           onFocusedTaskHandled={() => setFocusedTaskId(null)}
         />
@@ -2668,11 +2993,12 @@ function App() {
           goals={dashboardData.projectGoals || []}
           breakdown={dashboardData.projectPlanBreakdown || []}
           onPreview={openPreview}
+          onEvidence={openEvidence}
         />
       );
     }
     if (active === "meetings") return <MeetingView meetings={meetings} onPreview={openPreview} />;
-    if (active === "changes") return <ChangesView changes={changes} onPreview={openPreview} />;
+    if (active === "changes") return <ChangesView changes={changes} onPreview={openPreview} onEvidence={openEvidence} />;
     if (active === "suggestions") {
       return <SuggestionsView suggestions={suggestions} onApply={applySuggestion} onApplyAll={applyAllSuggestions} onDismiss={dismissSuggestion} onPreview={openPreview} actionStates={actionStates} />;
     }
@@ -2680,7 +3006,7 @@ function App() {
       return <DocumentsView documents={documents} onPreview={openPreview} isAdmin={auth.isAdmin} onStartOcr={startOcr} onRetryOcr={retryOcr} actionStates={actionStates} />;
     }
     if (active === "deliverables") {
-      return <DeliverablesView deliverables={deliverables} documents={documents} onPatch={patchDeliverable} onPreview={openPreview} />;
+      return <DeliverablesView deliverables={deliverables} documents={documents} onPatch={patchDeliverable} onPreview={openPreview} onEvidence={openEvidence} />;
     }
     if (active === "authority" && auth.isAdmin) {
       return (
@@ -2693,6 +3019,19 @@ function App() {
           onApplySuggestion={applyAuthoritySuggestion}
           onDismissSuggestion={dismissAuthoritySuggestion}
           onPreview={openPreview}
+          actionStates={actionStates}
+        />
+      );
+    }
+    if (active === "quality" && auth.isAdmin) {
+      return (
+        <DataQualityView
+          status={qualityStatus}
+          suggestions={qualitySuggestions}
+          onAnalyze={analyzeDataQuality}
+          onApply={applyQualitySuggestion}
+          onDismiss={dismissQualitySuggestion}
+          onApplyAllSafe={applyAllSafeQuality}
           actionStates={actionStates}
         />
       );
@@ -2724,6 +3063,8 @@ function App() {
           onChangePassword={changeAdminPassword}
           onTestModel={testModel}
           modelTest={modelTest}
+          onTestExtraction={testExtraction}
+          extractionTest={extractionTest}
           onLoadModels={loadModels}
           modelList={modelList}
           onRebuildKnowledge={rebuildKnowledge}
@@ -2795,6 +3136,7 @@ function App() {
         {content()}
       </main>
       <PreviewModal preview={preview} loading={previewLoading} onClose={() => setPreview(null)} />
+      <EvidenceModal data={evidenceData} loading={evidenceLoading} onClose={() => setEvidenceData(null)} onPreview={openPreview} />
       <LoginModal open={loginOpen} onClose={() => setLoginOpen(false)} onLogin={loginAdmin} />
     </div>
   );

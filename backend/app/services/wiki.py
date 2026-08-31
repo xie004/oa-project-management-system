@@ -219,19 +219,25 @@ def _load_documents_for_wiki(conn) -> list[dict[str, Any]]:
             """
             SELECT *
             FROM documents
-            WHERE status = 'indexed' OR ocr_status IN ('completed', 'partial')
+            WHERE is_current = 1
+              AND (status = 'indexed' OR ocr_status IN ('completed', 'partial'))
             ORDER BY authority_level, authority_score DESC, modified_at DESC, id DESC
             """
         ).fetchall()
     )
     docs = []
+    seen_version_groups: set[str] = set()
     for doc in rows:
+        version_group = doc.get("version_group") or f"document-{doc['id']}"
+        if version_group in seen_version_groups:
+            continue
         text = _document_text(conn, doc)
         if not text:
             continue
         doc["text"] = text
         doc["source_type"] = _source_type(doc)
         docs.append(doc)
+        seen_version_groups.add(version_group)
     return docs
 
 
@@ -279,7 +285,8 @@ def _select_page_sources(conn, docs: list[dict[str, Any]], page_key: str) -> tup
         level = int(doc.get("authority_level") or 5)
         authority_bonus = max(0, 7 - level) * 1.2 + float(doc.get("authority_score") or 45) / 100
         source_bonus = 4.0 if source_type in strategy["primary"] else 1.4
-        keyword_bonus = _keyword_score(f"{doc.get('name', '')}\n{doc.get('text', '')}", strategy["keywords"])
+        matched_text = _matched_snippet(doc, page_key)
+        keyword_bonus = _keyword_score(f"{doc.get('name', '')}\n{matched_text}", strategy["keywords"])
         if keyword_bonus <= 0 and source_type != "baseline":
             keyword_bonus = 0.2
         scored.append((source_bonus + authority_bonus + keyword_bonus, doc))

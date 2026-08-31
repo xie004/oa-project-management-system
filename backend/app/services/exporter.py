@@ -41,7 +41,7 @@ def build_weekly_summary() -> dict:
             conn.execute(
                 """
                 SELECT * FROM risks
-                WHERE status != 'closed'
+                WHERE status != 'closed' AND COALESCE(is_archived, 0) = 0
                 ORDER BY CASE level WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END, id DESC
                 LIMIT 8
                 """
@@ -51,7 +51,7 @@ def build_weekly_summary() -> dict:
             conn.execute(
                 """
                 SELECT * FROM tasks
-                WHERE status != 'completed'
+                WHERE status != 'completed' AND COALESCE(is_archived, 0) = 0
                 ORDER BY
                     CASE priority WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END,
                     COALESCE(due_date, '') ASC,

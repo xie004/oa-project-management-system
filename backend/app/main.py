@@ -44,6 +44,17 @@ from app.services.authority import (
     start_authority_analyze_job,
     update_document_authority,
 )
+from app.services.data_quality import (
+    apply_all_safe_quality_suggestions,
+    apply_quality_suggestion,
+    bootstrap_entities,
+    data_quality_status,
+    dismiss_quality_suggestion,
+    ensure_entity,
+    entity_evidence,
+    list_quality_suggestions,
+    start_data_quality_job,
+)
 from app.services.ocr import combined_ocr_text, enqueue_document_ocr, ocr_pages, ocr_status, retry_document_ocr, worker
 from app.services.scanner import (
     apply_all_suggestions,
@@ -52,6 +63,7 @@ from app.services.scanner import (
     list_documents,
     list_suggestions,
     scan_all,
+    test_structured_extraction,
     watcher,
 )
 from app.services.wiki import apply_all_wiki_suggestions, apply_wiki_suggestion, list_wiki_pages, list_wiki_suggestions, start_wiki_rebuild_job, wiki_job_status
@@ -113,10 +125,14 @@ class QuestionPayload(BaseModel):
 
 def merge_intelligent_analysis_config(payload: dict[str, Any]) -> dict[str, Any]:
     config = {**DEFAULT_INTELLIGENT_ANALYSIS, **(payload or {})}
+    policy = str(config.get("reviewPolicy") or "balanced")
+    if policy not in {"strict", "balanced", "automatic"}:
+        policy = "balanced"
+    config["reviewPolicy"] = policy
     config["enabled"] = bool(config.get("enabled"))
-    config["reviewOnly"] = bool(config.get("reviewOnly", True))
+    config["reviewOnly"] = policy == "strict"
     config["allowExternalService"] = bool(config.get("allowExternalService"))
-    config["autoApplyLowRisk"] = bool(config.get("autoApplyLowRisk", True))
+    config["autoApplyLowRisk"] = policy in {"balanced", "automatic"}
     config["rerankerEnabled"] = bool(config.get("rerankerEnabled"))
     for key in ["timeoutSeconds", "maxTextLength"]:
         try:
@@ -132,6 +148,10 @@ def merge_intelligent_analysis_config(payload: dict[str, Any]) -> dict[str, Any]
 def startup() -> None:
     init_db()
     ensure_auth_defaults()
+    try:
+        bootstrap_entities()
+    except Exception:
+        pass
     try:
         scan_all(force=False)
     except Exception:
@@ -229,6 +249,14 @@ def scan(force: bool = True) -> dict[str, Any]:
 @app.post("/api/ai/test")
 def ai_test(_: dict[str, Any] = Depends(admin_from_request)) -> dict[str, Any]:
     return test_chat_model()
+
+
+@app.post("/api/ai/extraction-test")
+def ai_extraction_test(_: dict[str, Any] = Depends(admin_from_request)) -> dict[str, Any]:
+    try:
+        return test_structured_extraction()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"结构化抽取测试失败：{exc}") from exc
 
 
 @app.get("/api/ai/models")
@@ -381,6 +409,61 @@ def qa_ask(payload: QuestionPayload) -> dict[str, Any]:
     return answer_question(question)
 
 
+@app.post("/api/data-quality/analyze")
+def api_data_quality_analyze(_: dict[str, Any] = Depends(admin_from_request)) -> dict[str, Any]:
+    return start_data_quality_job()
+
+
+@app.get("/api/data-quality/status")
+def api_data_quality_status(_: dict[str, Any] = Depends(admin_from_request)) -> dict[str, Any]:
+    return data_quality_status()
+
+
+@app.get("/api/data-quality/suggestions")
+def api_data_quality_suggestions(
+    status: str = "pending",
+    _: dict[str, Any] = Depends(admin_from_request),
+) -> list[dict[str, Any]]:
+    return list_quality_suggestions(status)
+
+
+@app.post("/api/data-quality/suggestions/apply-all-safe")
+def api_apply_all_safe_quality_suggestions(
+    _: dict[str, Any] = Depends(admin_from_request),
+) -> dict[str, Any]:
+    return apply_all_safe_quality_suggestions()
+
+
+@app.post("/api/data-quality/suggestions/{suggestion_id}/apply")
+def api_apply_quality_suggestion(
+    suggestion_id: int,
+    payload: GenericPatchPayload,
+    _: dict[str, Any] = Depends(admin_from_request),
+) -> dict[str, Any]:
+    result = apply_quality_suggestion(suggestion_id, payload.values)
+    if not result.get("ok"):
+        raise HTTPException(status_code=400, detail=result.get("message", "数据治理建议应用失败"))
+    return result
+
+
+@app.post("/api/data-quality/suggestions/{suggestion_id}/dismiss")
+def api_dismiss_quality_suggestion(
+    suggestion_id: int,
+    _: dict[str, Any] = Depends(admin_from_request),
+) -> dict[str, Any]:
+    return dismiss_quality_suggestion(suggestion_id)
+
+
+@app.get("/api/entities/{entity_type}/{record_id}/evidence")
+def api_entity_evidence(entity_type: str, record_id: int) -> dict[str, Any]:
+    if entity_type not in {"task", "risk", "milestone", "change_request", "deliverable"}:
+        raise HTTPException(status_code=400, detail="事项类型不正确。")
+    result = entity_evidence(entity_type, record_id)
+    if not result.get("entity"):
+        raise HTTPException(status_code=404, detail="未找到该事项的来源记录。")
+    return result
+
+
 def progress_from_tasks(tasks: list[dict[str, Any]]) -> int:
     if not tasks:
         return 0
@@ -391,6 +474,34 @@ def progress_from_tasks(tasks: list[dict[str, Any]]) -> int:
         else:
             total += int(task.get("progress") or 0)
     return round(total / len(tasks))
+
+
+def add_quality_flags(
+    conn: Any,
+    entity_type: str,
+    records: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    affected: dict[int, int] = {}
+    rows = conn.execute(
+        """
+        SELECT primary_record_id, related_record_ids_json
+        FROM data_quality_suggestions
+        WHERE status = 'pending' AND entity_type = ?
+          AND suggestion_kind IN ('exact_duplicate', 'near_duplicate', 'invalid_record')
+        """,
+        (entity_type,),
+    ).fetchall()
+    for row in rows:
+        ids = [int(row["primary_record_id"])] if row["primary_record_id"] else []
+        try:
+            ids.extend(int(item) for item in json.loads(row["related_record_ids_json"] or "[]"))
+        except Exception:
+            pass
+        for record_id in ids:
+            affected[record_id] = affected.get(record_id, 0) + 1
+    for record in records:
+        record["quality_issue_count"] = affected.get(int(record["id"]), 0)
+    return records
 
 
 def project_color_status(tasks: list[dict[str, Any]], risks: list[dict[str, Any]]) -> str:
@@ -413,9 +524,13 @@ def dashboard() -> dict[str, Any]:
         tasks = rows_to_dicts(
             conn.execute(
                 """
-                SELECT t.*, d.name AS document_name, d.path AS document_path
+                SELECT t.*, d.name AS document_name, d.path AS document_path,
+                    (SELECT COUNT(*) FROM project_entities pe
+                     JOIN entity_evidence ev ON ev.entity_id = pe.id
+                     WHERE pe.entity_type = 'task' AND pe.record_id = t.id) AS source_count
                 FROM tasks t
                 LEFT JOIN documents d ON d.id = t.source_document_id
+                WHERE COALESCE(t.is_archived, 0) = 0
                 ORDER BY
                     COALESCE(t.start_date, ''),
                     COALESCE(t.due_date, ''),
@@ -426,9 +541,13 @@ def dashboard() -> dict[str, Any]:
         milestones = rows_to_dicts(
             conn.execute(
                 """
-                SELECT m.*, d.name AS document_name, d.path AS document_path
+                SELECT m.*, d.name AS document_name, d.path AS document_path,
+                    (SELECT COUNT(*) FROM project_entities pe
+                     JOIN entity_evidence ev ON ev.entity_id = pe.id
+                     WHERE pe.entity_type = 'milestone' AND pe.record_id = m.id) AS source_count
                 FROM milestones m
                 LEFT JOIN documents d ON d.id = m.source_document_id
+                WHERE COALESCE(m.is_archived, 0) = 0
                 ORDER BY COALESCE(m.planned_date, ''), m.id
                 """
             ).fetchall()
@@ -436,9 +555,13 @@ def dashboard() -> dict[str, Any]:
         risks = rows_to_dicts(
             conn.execute(
                 """
-                SELECT r.*, d.name AS document_name, d.path AS document_path
+                SELECT r.*, d.name AS document_name, d.path AS document_path,
+                    (SELECT COUNT(*) FROM project_entities pe
+                     JOIN entity_evidence ev ON ev.entity_id = pe.id
+                     WHERE pe.entity_type = 'risk' AND pe.record_id = r.id) AS source_count
                 FROM risks r
                 LEFT JOIN documents d ON d.id = r.source_document_id
+                WHERE COALESCE(r.is_archived, 0) = 0
                 ORDER BY r.id DESC
                 """
             ).fetchall()
@@ -446,13 +569,21 @@ def dashboard() -> dict[str, Any]:
         changes = rows_to_dicts(
             conn.execute(
                 """
-                SELECT c.*, d.name AS document_name, d.path AS document_path
+                SELECT c.*, d.name AS document_name, d.path AS document_path,
+                    (SELECT COUNT(*) FROM project_entities pe
+                     JOIN entity_evidence ev ON ev.entity_id = pe.id
+                     WHERE pe.entity_type = 'change_request' AND pe.record_id = c.id) AS source_count
                 FROM change_requests c
                 LEFT JOIN documents d ON d.id = c.source_document_id
+                WHERE COALESCE(c.is_archived, 0) = 0
                 ORDER BY c.id DESC
                 """
             ).fetchall()
         )
+        add_quality_flags(conn, "task", tasks)
+        add_quality_flags(conn, "milestone", milestones)
+        add_quality_flags(conn, "risk", risks)
+        add_quality_flags(conn, "change_request", changes)
         docs = rows_to_dicts(
             conn.execute(
                 "SELECT * FROM documents ORDER BY modified_at DESC, id DESC LIMIT 8"
@@ -480,9 +611,11 @@ def dashboard() -> dict[str, Any]:
             "pendingSuggestions": conn.execute(
                 "SELECT COUNT(*) AS c FROM update_suggestions WHERE status = 'pending'"
             ).fetchone()["c"],
-            "deliverables": conn.execute("SELECT COUNT(*) AS c FROM deliverables").fetchone()["c"],
+            "deliverables": conn.execute(
+                "SELECT COUNT(*) AS c FROM deliverables WHERE COALESCE(is_archived, 0) = 0"
+            ).fetchone()["c"],
             "submittedDeliverables": conn.execute(
-                "SELECT COUNT(*) AS c FROM deliverables WHERE status = 'submitted'"
+                "SELECT COUNT(*) AS c FROM deliverables WHERE status = 'submitted' AND COALESCE(is_archived, 0) = 0"
             ).fetchone()["c"],
         }
         profile["overall_progress"] = progress_from_tasks(tasks)
@@ -510,12 +643,16 @@ def dashboard() -> dict[str, Any]:
 def get_tasks() -> list[dict[str, Any]]:
     conn = get_connection()
     try:
-        return rows_to_dicts(
+        records = rows_to_dicts(
             conn.execute(
                 """
-                SELECT t.*, d.name AS document_name, d.path AS document_path
+                SELECT t.*, d.name AS document_name, d.path AS document_path,
+                    (SELECT COUNT(*) FROM project_entities pe
+                     JOIN entity_evidence ev ON ev.entity_id = pe.id
+                     WHERE pe.entity_type = 'task' AND pe.record_id = t.id) AS source_count
                 FROM tasks t
                 LEFT JOIN documents d ON d.id = t.source_document_id
+                WHERE COALESCE(t.is_archived, 0) = 0
                 ORDER BY
                     COALESCE(t.start_date, ''),
                     COALESCE(t.due_date, ''),
@@ -523,6 +660,7 @@ def get_tasks() -> list[dict[str, Any]]:
                 """
             ).fetchall()
         )
+        return add_quality_flags(conn, "task", records)
     finally:
         conn.close()
 
@@ -532,7 +670,7 @@ def create_task(payload: TaskPayload) -> dict[str, Any]:
     conn = get_connection()
     try:
         now = now_iso()
-        conn.execute(
+        cursor = conn.execute(
             """
             INSERT INTO tasks(
                 title, description, owner, status, priority, color_status, start_date,
@@ -554,8 +692,10 @@ def create_task(payload: TaskPayload) -> dict[str, Any]:
                 now,
             ),
         )
+        task_id = int(cursor.lastrowid)
+        ensure_entity(conn, "task", task_id, payload.title)
         conn.commit()
-        return {"ok": True}
+        return {"ok": True, "id": task_id}
     finally:
         conn.close()
 
@@ -608,6 +748,8 @@ def update_task(task_id: int, payload: GenericPatchPayload) -> dict[str, Any]:
             f"UPDATE tasks SET {assignments}, updated_at = ? WHERE id = ?",
             [*values.values(), now_iso(), task_id],
         )
+        if "title" in values:
+            ensure_entity(conn, "task", task_id, str(values["title"]))
         conn.commit()
         return {"ok": True}
     finally:
@@ -618,16 +760,21 @@ def update_task(task_id: int, payload: GenericPatchPayload) -> dict[str, Any]:
 def get_milestones() -> list[dict[str, Any]]:
     conn = get_connection()
     try:
-        return rows_to_dicts(
+        records = rows_to_dicts(
             conn.execute(
                 """
-                SELECT m.*, d.name AS document_name, d.path AS document_path
+                SELECT m.*, d.name AS document_name, d.path AS document_path,
+                    (SELECT COUNT(*) FROM project_entities pe
+                     JOIN entity_evidence ev ON ev.entity_id = pe.id
+                     WHERE pe.entity_type = 'milestone' AND pe.record_id = m.id) AS source_count
                 FROM milestones m
                 LEFT JOIN documents d ON d.id = m.source_document_id
+                WHERE COALESCE(m.is_archived, 0) = 0
                 ORDER BY COALESCE(m.planned_date, ''), m.id
                 """
             ).fetchall()
         )
+        return add_quality_flags(conn, "milestone", records)
     finally:
         conn.close()
 
@@ -636,7 +783,7 @@ def get_milestones() -> list[dict[str, Any]]:
 def get_meetings() -> list[dict[str, Any]]:
     conn = get_connection()
     try:
-        return rows_to_dicts(
+        records = rows_to_dicts(
             conn.execute(
                 """
                 SELECT m.*, d.name AS document_name, d.path AS document_path
@@ -646,6 +793,7 @@ def get_meetings() -> list[dict[str, Any]]:
                 """
             ).fetchall()
         )
+        return records
     finally:
         conn.close()
 
@@ -654,16 +802,21 @@ def get_meetings() -> list[dict[str, Any]]:
 def get_changes() -> list[dict[str, Any]]:
     conn = get_connection()
     try:
-        return rows_to_dicts(
+        records = rows_to_dicts(
             conn.execute(
                 """
-                SELECT c.*, d.name AS document_name, d.path AS document_path
+                SELECT c.*, d.name AS document_name, d.path AS document_path,
+                    (SELECT COUNT(*) FROM project_entities pe
+                     JOIN entity_evidence ev ON ev.entity_id = pe.id
+                     WHERE pe.entity_type = 'change_request' AND pe.record_id = c.id) AS source_count
                 FROM change_requests c
                 LEFT JOIN documents d ON d.id = c.source_document_id
+                WHERE COALESCE(c.is_archived, 0) = 0
                 ORDER BY c.id DESC
                 """
             ).fetchall()
         )
+        return add_quality_flags(conn, "change_request", records)
     finally:
         conn.close()
 
@@ -672,16 +825,21 @@ def get_changes() -> list[dict[str, Any]]:
 def get_risks() -> list[dict[str, Any]]:
     conn = get_connection()
     try:
-        return rows_to_dicts(
+        records = rows_to_dicts(
             conn.execute(
                 """
-                SELECT r.*, d.name AS document_name, d.path AS document_path
+                SELECT r.*, d.name AS document_name, d.path AS document_path,
+                    (SELECT COUNT(*) FROM project_entities pe
+                     JOIN entity_evidence ev ON ev.entity_id = pe.id
+                     WHERE pe.entity_type = 'risk' AND pe.record_id = r.id) AS source_count
                 FROM risks r
                 LEFT JOIN documents d ON d.id = r.source_document_id
+                WHERE COALESCE(r.is_archived, 0) = 0
                 ORDER BY r.id DESC
                 """
             ).fetchall()
         )
+        return add_quality_flags(conn, "risk", records)
     finally:
         conn.close()
 
@@ -695,20 +853,25 @@ def get_documents() -> list[dict[str, Any]]:
 def get_deliverables() -> list[dict[str, Any]]:
     conn = get_connection()
     try:
-        return rows_to_dicts(
+        records = rows_to_dicts(
             conn.execute(
                 """
                 SELECT
                     dv.*,
                     d.name AS document_name,
                     d.path AS document_path,
-                    d.modified_at AS document_modified_at
+                    d.modified_at AS document_modified_at,
+                    (SELECT COUNT(*) FROM project_entities pe
+                     JOIN entity_evidence ev ON ev.entity_id = pe.id
+                     WHERE pe.entity_type = 'deliverable' AND pe.record_id = dv.id) AS source_count
                 FROM deliverables dv
                 LEFT JOIN documents d ON d.id = dv.document_id
+                WHERE COALESCE(dv.is_archived, 0) = 0
                 ORDER BY dv.sort_order, dv.id
                 """
             ).fetchall()
         )
+        return add_quality_flags(conn, "deliverable", records)
     finally:
         conn.close()
 
@@ -739,6 +902,8 @@ def update_deliverable(deliverable_id: int, payload: GenericPatchPayload) -> dic
             f"UPDATE deliverables SET {assignments}, updated_at = ? WHERE id = ?",
             [*values.values(), now_iso(), deliverable_id],
         )
+        if "name" in values:
+            ensure_entity(conn, "deliverable", deliverable_id, str(values["name"]))
         conn.commit()
         return {"ok": True}
     finally:

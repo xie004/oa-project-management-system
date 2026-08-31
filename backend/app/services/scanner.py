@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import sqlite3
@@ -30,6 +31,16 @@ from app.services.extractors import (
 )
 from app.services.ai import ai_config, chat_completion, index_document_knowledge
 from app.services.authority import analyze_document_authority
+from app.services.data_quality import (
+    ENTITY_TABLES,
+    attach_evidence,
+    ensure_entity,
+    find_matching_entity,
+    merge_candidate_payload,
+    normalize_title,
+    prepare_candidate,
+    suggestion_fingerprint,
+)
 from app.services.ocr import enqueue_document_ocr, should_ocr_pdf
 
 
@@ -166,28 +177,84 @@ def create_suggestion(
     description: str,
     payload: dict[str, Any],
     confidence: float = 0.72,
+    locator: str = "",
+    method: str = "rule",
+    evidence_text: str = "",
 ) -> None:
     title = compact_text(title, 140)
     description = compact_text(description, 1200)
     if not title:
         return
+    payload = {**payload, "source_document_id": document_id}
+    candidate = prepare_candidate(
+        conn,
+        document_id,
+        suggestion_type,
+        title,
+        evidence_text or description,
+        payload,
+        confidence,
+        locator=locator,
+        method=method,
+    )
+    if candidate.get("skip"):
+        return
     exists = conn.execute(
         """
-        SELECT id FROM update_suggestions
-        WHERE document_id = ? AND suggestion_type = ? AND title = ?
+        SELECT * FROM update_suggestions
+        WHERE status = 'pending' AND suggestion_type = ?
+          AND (fingerprint = ? OR normalized_title = ?)
         """,
-        (document_id, suggestion_type, title),
+        (suggestion_type, candidate.get("fingerprint"), candidate.get("normalized_title")),
     ).fetchone()
     if exists:
+        _add_suggestion_source(
+            conn,
+            int(exists["id"]),
+            document_id,
+            evidence_text or description,
+            locator,
+            payload,
+        )
+        try:
+            existing_payload = json.loads(exists["payload_json"] or "{}")
+        except Exception:
+            existing_payload = {}
+        merged_payload = merge_candidate_payload(existing_payload, payload)
+        try:
+            warnings = json.loads(exists["quality_warnings_json"] or "[]")
+        except Exception:
+            warnings = []
+        aggregate_warning = "已聚合来自多份资料的同一候选，正式字段仍需确认"
+        if aggregate_warning not in warnings:
+            warnings.append(aggregate_warning)
+        conn.execute(
+            """
+            UPDATE update_suggestions
+            SET confidence = MAX(confidence, ?), quality_score = MAX(quality_score, ?),
+                payload_json = ?, quality_warnings_json = ?
+            WHERE id = ?
+            """,
+            (
+                confidence,
+                float(candidate.get("quality_score") or confidence),
+                json.dumps(merged_payload, ensure_ascii=False),
+                json.dumps(warnings, ensure_ascii=False),
+                exists["id"],
+            ),
+        )
         return
-    payload = {**payload, "source_document_id": document_id}
-    conn.execute(
+    if candidate.get("proposed_updates"):
+        payload["proposed_updates"] = candidate["proposed_updates"]
+    cursor = conn.execute(
         """
         INSERT INTO update_suggestions(
             document_id, suggestion_type, title, description, confidence,
-            payload_json, status, created_at
+            payload_json, status, normalized_title, fingerprint, candidate_action,
+            matched_entity_type, matched_entity_id, similarity, quality_score,
+            quality_warnings_json, evidence_text, evidence_locator, created_at
         )
-        VALUES(?, ?, ?, ?, ?, ?, 'pending', ?)
+        VALUES(?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             document_id,
@@ -196,6 +263,52 @@ def create_suggestion(
             description,
             confidence,
             json.dumps(payload, ensure_ascii=False),
+            candidate.get("normalized_title") or normalize_title(title),
+            candidate.get("fingerprint") or suggestion_fingerprint(suggestion_type, title),
+            candidate.get("candidate_action") or "create",
+            candidate.get("matched_entity_type"),
+            candidate.get("matched_entity_id"),
+            float(candidate.get("similarity") or 0),
+            float(candidate.get("quality_score") or confidence),
+            json.dumps(candidate.get("warnings") or [], ensure_ascii=False),
+            evidence_text or description,
+            locator,
+            now_iso(),
+        ),
+    )
+    _add_suggestion_source(
+        conn,
+        int(cursor.lastrowid),
+        document_id,
+        evidence_text or description,
+        locator,
+        payload,
+    )
+
+
+def _add_suggestion_source(
+    conn: sqlite3.Connection,
+    suggestion_id: int,
+    document_id: int | None,
+    evidence_text: str,
+    locator: str,
+    observed: dict[str, Any],
+) -> None:
+    evidence_text = compact_text(evidence_text or "来源文件记录", 1600)
+    digest = hashlib.sha256(f"{document_id or 0}|{locator}|{evidence_text}".encode("utf-8")).hexdigest()
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO suggestion_sources(
+            suggestion_id, document_id, evidence_hash, evidence_text, locator, observed_json, created_at
+        ) VALUES(?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            suggestion_id,
+            document_id,
+            digest,
+            evidence_text,
+            locator,
+            json.dumps(observed or {}, ensure_ascii=False),
             now_iso(),
         ),
     )
@@ -250,6 +363,8 @@ def save_weekly_report(conn: sqlite3.Connection, document_id: int, text: str, fi
                 "source": "周报自动识别",
             },
             0.76,
+            locator="周报/下周工作计划",
+            evidence_text=line,
         )
 
     for line in bullet_lines(parsed["progress_text"], 10):
@@ -268,23 +383,36 @@ def save_weekly_report(conn: sqlite3.Connection, document_id: int, text: str, fi
                     "actual_date": parsed["period_end"],
                 },
                 0.7,
+                locator="周报/本周工作进展",
+                evidence_text=line,
             )
 
-    for line in bullet_lines(parsed["risk_text"], 5):
+    risk_items: list[dict[str, str]] = []
+    for line in bullet_lines(parsed["risk_text"], 8):
+        if re.match(r"^(?:策略|措施|应对|建议|处理方式)[:：]", line):
+            if risk_items:
+                risk_items[-1]["mitigation"] = re.sub(r"^[^:：]+[:：]", "", line).strip()
+            continue
+        if not any(word in line for word in ["风险", "影响", "可能", "导致", "滞后", "无法", "不足", "超期", "问题"]):
+            continue
+        risk_items.append({"title": line[:90], "description": line, "mitigation": ""})
+    for item in risk_items[:5]:
         create_suggestion(
             conn,
             document_id,
             "risk",
-            line[:90],
-            f"从周报“存在问题或风险”识别到的风险：{line}",
+            item["title"],
+            f"从周报“存在问题或风险”识别到的风险：{item['description']}",
             {
-                "title": line[:90],
-                "description": line,
+                "title": item["title"],
+                "description": item["description"],
                 "level": "medium",
                 "status": "open",
-                "mitigation": "",
+                "mitigation": item["mitigation"],
             },
             0.82,
+            locator="周报/存在问题或风险",
+            evidence_text=item["description"],
         )
 
 
@@ -322,7 +450,9 @@ def save_meeting(conn: sqlite3.Connection, document_id: int, text: str, filename
         ),
     )
 
-    for line in bullet_lines(parsed["decisions"], 8):
+    for line in bullet_lines(parsed["decisions"], 12):
+        if not any(word in line for word in ["需", "请", "负责", "完成", "提供", "确认", "组织", "推进", "跟进", "提交", "梳理", "配置", "申请", "发送", "开展", "落实", "安排"]):
+            continue
         create_suggestion(
             conn,
             document_id,
@@ -339,6 +469,8 @@ def save_meeting(conn: sqlite3.Connection, document_id: int, text: str, filename
                 "source": "会议纪要自动识别",
             },
             0.78,
+            locator="会议纪要/决议",
+            evidence_text=line,
         )
 
     text_for_changes = f"{parsed['topics']}\n{parsed['decisions']}"
@@ -358,26 +490,102 @@ def save_meeting(conn: sqlite3.Connection, document_id: int, text: str, filename
                     "status": "pending",
                 },
                 0.68,
+                locator="会议纪要/议题或决议",
+                evidence_text=line,
             )
 
 
 def save_resource_suggestions(conn: sqlite3.Connection, document_id: int, text: str, filename: str) -> None:
-    if not text.strip():
-        return
-    create_suggestion(
-        conn,
-        document_id,
-        "milestone",
-        "服务器资源需求清单已更新",
-        f"检测到资源需求类资料：{filename}。建议确认是否更新服务器资源里程碑。",
-        {
-            "title": "服务器资源需求清单已更新",
-            "description": f"来源：{filename}",
-            "status": "in_progress",
-            "color_status": "amber",
-        },
-        0.72,
+    # 资源清单本身作为资料和部署依据，不默认制造里程碑。
+    return
+
+
+AI_TYPE_ALLOWLIST = {
+    "weekly_report": {"task", "risk", "milestone"},
+    "meeting": {"task", "risk", "milestone", "change_request"},
+    "contract_tender": {"milestone", "change_request", "deliverable"},
+    "requirement_change": {"milestone", "change_request", "deliverable"},
+    "resource": {"task", "risk"},
+    "acceptance_launch": {"milestone", "risk", "deliverable"},
+    "other": {"task", "risk", "milestone", "change_request", "deliverable"},
+}
+
+
+def _parse_ai_items(raw: str) -> list[dict[str, Any]]:
+    cleaned = (raw or "").strip()
+    if not cleaned:
+        raise ValueError("模型返回为空")
+    if cleaned.startswith("```"):
+        cleaned = cleaned.strip("`").replace("json\n", "", 1).replace("JSON\n", "", 1)
+    start = cleaned.find("[")
+    end = cleaned.rfind("]")
+    if start >= 0 and end >= start:
+        cleaned = cleaned[start : end + 1]
+    items = json.loads(cleaned)
+    if not isinstance(items, list):
+        raise ValueError("模型未返回 JSON 数组")
+    return [item for item in items if isinstance(item, dict)]
+
+
+def _validate_ai_items(items: list[dict[str, Any]], allowed_types: set[str]) -> list[dict[str, Any]]:
+    required = ["type", "title", "description", "confidence", "evidence", "locator"]
+    errors: list[str] = []
+    for index, item in enumerate(items):
+        missing = [key for key in required if item.get(key) in (None, "")]
+        if missing:
+            errors.append(f"第 {index + 1} 项缺少 {', '.join(missing)}")
+        if item.get("type") not in allowed_types:
+            errors.append(f"第 {index + 1} 项 type 不在允许范围")
+        try:
+            confidence = float(item.get("confidence"))
+            if confidence < 0 or confidence > 1:
+                errors.append(f"第 {index + 1} 项 confidence 超出 0-1")
+        except (TypeError, ValueError):
+            errors.append(f"第 {index + 1} 项 confidence 不是数字")
+    if errors:
+        raise ValueError("；".join(errors[:8]))
+    return items
+
+
+def test_structured_extraction() -> dict[str, Any]:
+    config = ai_config()
+    sample = (
+        "会议决定：实施单位于2026年9月10日前完成测试环境部署，责任人为张工。\n"
+        "风险：历史数据字段映射未确认，可能影响迁移进度；应对措施为本周组织专题确认。"
     )
+    answer = chat_completion(
+        [
+            {
+                "role": "system",
+                "content": "你是结构化抽取测试器，只输出严格 JSON 数组，不使用 Markdown。",
+            },
+            {
+                "role": "user",
+                "content": (
+                    "从以下测试文本提取 task 和 risk。每项必须包含 type、title、description、"
+                    "confidence、evidence、locator；风险措施写入 mitigation。\n" + sample
+                ),
+            },
+        ],
+        config,
+        max_tokens=900,
+    )
+    items = _parse_ai_items(answer)
+    errors: list[str] = []
+    for index, item in enumerate(items):
+        missing = [key for key in ["type", "title", "description", "confidence", "evidence", "locator"] if item.get(key) in (None, "")]
+        if missing:
+            errors.append(f"第 {index + 1} 项缺少字段：{', '.join(missing)}")
+        if item.get("type") not in {"task", "risk"}:
+            errors.append(f"第 {index + 1} 项 type 不合规")
+    if not items:
+        errors.append("模型未返回任何结构化事项")
+    return {
+        "ok": not errors,
+        "items": items,
+        "errors": errors,
+        "raw": compact_text(answer, 3000),
+    }
 
 
 def save_ai_analysis_suggestions(conn: sqlite3.Connection, document_id: int, text: str, filename: str, category: str) -> None:
@@ -392,11 +600,19 @@ def save_ai_analysis_suggestions(conn: sqlite3.Connection, document_id: int, tex
         "UPDATE documents SET analysis_status = 'analyzing', analysis_error = '' WHERE id = ?",
         (document_id,),
     )
+    answer = ""
+    repaired = ""
     try:
+        allowed_types = AI_TYPE_ALLOWLIST.get(category, AI_TYPE_ALLOWLIST["other"])
         prompt = f"""
 请基于以下项目文件内容，识别可能需要更新到项目管理系统的事项。
-只返回 JSON 数组，每项包含 type、title、description、confidence。
-type 只能是 task、risk、milestone、change_request、deliverable。
+只返回 JSON 数组，每项必须包含 type、title、description、confidence、evidence、locator，
+可选包含 owner、status、progress、due_date、planned_date、actual_date、level、mitigation。
+type 只能是：{', '.join(sorted(allowed_types))}。
+title 必须是可独立管理的项目事项，禁止输出页码、页眉、表头、章节名和纯说明文字。
+风险必须说明风险事件或影响，应对策略写入 mitigation，不得单独作为风险。
+合同/招投标/需求文件只提取正式约束、交付物、验收和里程碑，不把描述性段落拆成过程任务。
+evidence 必须是文件中的简短原文依据，locator 说明章节、页码、表格或段落位置。
 文件名：{filename}
 分类：{category}
 内容：
@@ -409,47 +625,74 @@ type 只能是 task、risk、milestone、change_request、deliverable。
             ],
             config,
         )
-        cleaned = answer.strip()
-        if cleaned.startswith("```"):
-            cleaned = cleaned.strip("`")
-            cleaned = cleaned.replace("json\n", "", 1).replace("JSON\n", "", 1)
-        items = json.loads(cleaned)
-        if not isinstance(items, list):
-            raise ValueError("模型未返回 JSON 数组")
+        try:
+            items = _validate_ai_items(_parse_ai_items(answer), allowed_types)
+        except Exception as first_error:
+            repair_prompt = f"""
+下面是一次项目事项抽取的无效输出，请将它修复为严格 JSON 数组。
+不得补造原输出中不存在的事项。每项保留 type、title、description、confidence、evidence、locator。
+允许的 type：{', '.join(sorted(allowed_types))}。
+无效输出：
+{compact_text(answer, 8000) or '[空输出]'}
+"""
+            repaired = chat_completion(
+                [
+                    {"role": "system", "content": "你是 JSON 结构修复器，只输出 JSON 数组。"},
+                    {"role": "user", "content": repair_prompt},
+                ],
+                config,
+            )
+            try:
+                items = _validate_ai_items(_parse_ai_items(repaired), allowed_types)
+            except Exception as second_error:
+                raise ValueError(f"首次解析失败：{first_error}；结构修复失败：{second_error}") from second_error
         for item in items[:12]:
             suggestion_type = item.get("type")
-            if suggestion_type not in {"task", "risk", "milestone", "change_request", "deliverable"}:
+            if suggestion_type not in allowed_types:
                 continue
             title = item.get("title") or ""
             description = item.get("description") or title
+            if suggestion_type == "risk" and not any(
+                word in f"{title}{description}" for word in ["风险", "影响", "可能", "导致", "无法", "不足", "滞后", "超期", "问题"]
+            ):
+                continue
+            payload = {
+                "title": title,
+                "description": description,
+                "status": item.get("status") or ("pending" if suggestion_type == "change_request" else "not_started"),
+                "source": "大模型分析",
+            }
+            for key in ["owner", "progress", "due_date", "planned_date", "actual_date", "level", "mitigation"]:
+                if item.get(key) not in (None, ""):
+                    payload[key] = item[key]
             create_suggestion(
                 conn,
                 document_id,
                 suggestion_type,
                 title,
                 description,
-                {
-                    "title": title,
-                    "description": description,
-                    "status": "pending" if suggestion_type == "change_request" else "not_started",
-                    "source": "大模型分析",
-                },
+                payload,
                 float(item.get("confidence") or 0.7),
+                locator=str(item.get("locator") or "模型抽取"),
+                method="llm",
+                evidence_text=str(item.get("evidence") or description),
             )
         conn.execute(
-            "UPDATE documents SET analysis_status = 'analyzed', analysis_at = ?, analysis_error = '' WHERE id = ?",
-            (now_iso(), document_id),
+            "UPDATE documents SET analysis_status = 'analyzed', analysis_at = ?, analysis_error = '', analysis_raw_response = ? WHERE id = ?",
+            (now_iso(), compact_text(repaired or answer, 12000), document_id),
         )
     except Exception as exc:
         conn.execute(
-            "UPDATE documents SET analysis_status = 'failed', analysis_at = ?, analysis_error = ? WHERE id = ?",
-            (now_iso(), str(exc), document_id),
+            "UPDATE documents SET analysis_status = 'failed', analysis_at = ?, analysis_error = ?, analysis_raw_response = ? WHERE id = ?",
+            (now_iso(), str(exc), compact_text(repaired or answer, 12000), document_id),
         )
 
 
 def auto_link_deliverables(conn: sqlite3.Connection, document_id: int, filename: str) -> None:
     normalized = filename.lower()
-    rows = conn.execute("SELECT * FROM deliverables WHERE document_id IS NULL").fetchall()
+    rows = conn.execute(
+        "SELECT * FROM deliverables WHERE document_id IS NULL AND COALESCE(is_archived, 0) = 0"
+    ).fetchall()
     for row in rows:
         name = row["name"]
         keywords = [part for part in re.split(r"[/、\s（）()]+", name) if len(part) >= 2]
@@ -520,6 +763,8 @@ def index_document(path: Path, hint: str = "", force: bool = False) -> dict[str,
                                 "status": "pending",
                             },
                             0.65,
+                            locator="需求或变更资料/正文",
+                            evidence_text=line,
                         )
             save_ai_analysis_suggestions(conn, document_id, result.text, path.name, category)
         else:
@@ -573,7 +818,8 @@ def list_suggestions(status: str = "pending") -> list[dict[str, Any]]:
             params = (status,)
         rows = conn.execute(
             f"""
-            SELECT s.*, d.name AS document_name, d.path AS document_path, d.doc_category
+            SELECT s.*, d.name AS document_name, d.path AS document_path, d.doc_category,
+                   (SELECT COUNT(*) FROM suggestion_sources ss WHERE ss.suggestion_id = s.id) AS source_count
             FROM update_suggestions s
             LEFT JOIN documents d ON d.id = s.document_id
             {where}
@@ -587,6 +833,10 @@ def list_suggestions(status: str = "pending") -> list[dict[str, Any]]:
                 item["payload"] = json.loads(item.pop("payload_json"))
             except Exception:
                 item["payload"] = {}
+            try:
+                item["quality_warnings"] = json.loads(item.pop("quality_warnings_json") or "[]")
+            except Exception:
+                item["quality_warnings"] = []
         return suggestions
     finally:
         conn.close()
@@ -645,7 +895,11 @@ def _deliverable_match_score(suggestion_title: str, existing_name: str) -> float
 
 
 def _find_matching_deliverable(conn: sqlite3.Connection, title: str) -> dict[str, Any] | None:
-    rows = rows_to_dicts(conn.execute("SELECT * FROM deliverables ORDER BY sort_order, id").fetchall())
+    rows = rows_to_dicts(
+        conn.execute(
+            "SELECT * FROM deliverables WHERE COALESCE(is_archived, 0) = 0 ORDER BY sort_order, id"
+        ).fetchall()
+    )
     scored = sorted(
         ((_deliverable_match_score(title, row["name"]), row) for row in rows),
         reverse=True,
@@ -732,6 +986,102 @@ def _apply_deliverable_suggestion(
     return {"ok": True, "deliverableId": cursor.lastrowid, "action": "created"}
 
 
+def _attach_suggestion_sources(
+    conn: sqlite3.Connection,
+    suggestion: sqlite3.Row,
+    entity_id: int,
+    payload: dict[str, Any],
+) -> None:
+    sources = conn.execute(
+        "SELECT * FROM suggestion_sources WHERE suggestion_id = ? ORDER BY created_at, id",
+        (suggestion["id"],),
+    ).fetchall()
+    if not sources:
+        sources = [
+            {
+                "document_id": suggestion["document_id"],
+                "evidence_text": suggestion["evidence_text"] or suggestion["description"] or suggestion["title"],
+                "locator": suggestion["evidence_locator"] or "",
+                "observed_json": suggestion["payload_json"],
+            }
+        ]
+    for source in sources:
+        try:
+            observed = json.loads(source["observed_json"] or "{}")
+        except Exception:
+            observed = payload
+        attach_evidence(
+            conn,
+            entity_id,
+            source["document_id"],
+            source["evidence_text"] or suggestion["title"],
+            suggestion_id=int(suggestion["id"]),
+            locator=source["locator"] or "",
+            observed=observed,
+            confidence=float(suggestion["confidence"] or 0.7),
+            method="confirmed_suggestion",
+        )
+
+
+def _apply_matched_suggestion(
+    conn: sqlite3.Connection,
+    suggestion: sqlite3.Row,
+    payload: dict[str, Any],
+) -> dict[str, Any] | None:
+    suggestion_type = suggestion["suggestion_type"]
+    if suggestion_type not in ENTITY_TABLES:
+        return None
+    matched_entity_id = suggestion["matched_entity_id"]
+    candidate_action = suggestion["candidate_action"] or "create"
+    entity = None
+    similarity = float(suggestion["similarity"] or 0)
+    if matched_entity_id:
+        entity = conn.execute(
+            "SELECT * FROM project_entities WHERE id = ? AND status = 'active'",
+            (matched_entity_id,),
+        ).fetchone()
+    if not entity:
+        matched, current_similarity = find_matching_entity(conn, suggestion_type, suggestion["title"])
+        if matched and current_similarity >= 0.93:
+            entity = matched
+            similarity = current_similarity
+            candidate_action = "attach_evidence"
+    if not entity or (candidate_action == "create" and similarity < 0.93):
+        return None
+
+    config = ENTITY_TABLES[suggestion_type]
+    record = conn.execute(
+        f"SELECT * FROM {config['table']} WHERE id = ? AND COALESCE(is_archived, 0) = 0",
+        (entity["record_id"],),
+    ).fetchone()
+    if not record:
+        return None
+
+    proposed_updates = payload.get("proposed_updates") or {}
+    allowed_updates = {
+        "task": {"status", "progress", "owner", "start_date", "due_date"},
+        "risk": {"status", "level", "mitigation"},
+        "milestone": {"status", "planned_date", "actual_date"},
+        "change_request": {"status", "impact", "proposer"},
+        "deliverable": {"status", "owner", "planned_date", "submitted_date"},
+    }[suggestion_type]
+    updates = {key: value for key, value in proposed_updates.items() if key in allowed_updates}
+    if updates:
+        assignments = ", ".join(f"{key} = ?" for key in updates)
+        conn.execute(
+            f"UPDATE {config['table']} SET {assignments}, updated_at = ? WHERE id = ?",
+            [*updates.values(), now_iso(), entity["record_id"]],
+        )
+    _attach_suggestion_sources(conn, suggestion, int(entity["id"]), payload)
+    return {
+        "ok": True,
+        "action": "updated" if updates else "evidence_attached",
+        "entityId": entity["id"],
+        "recordId": entity["record_id"],
+        "updates": updates,
+    }
+
+
 def apply_suggestion(suggestion_id: int) -> dict[str, Any]:
     conn = get_connection()
     try:
@@ -746,9 +1096,17 @@ def apply_suggestion(suggestion_id: int) -> dict[str, Any]:
         payload = json.loads(suggestion["payload_json"])
         now = now_iso()
         suggestion_type = suggestion["suggestion_type"]
+        matched_result = _apply_matched_suggestion(conn, suggestion, payload)
+        if matched_result:
+            conn.execute(
+                "UPDATE update_suggestions SET status = 'applied', applied_at = ? WHERE id = ?",
+                (now, suggestion_id),
+            )
+            conn.commit()
+            return matched_result
 
         if suggestion_type == "task":
-            conn.execute(
+            cursor = conn.execute(
                 """
                 INSERT INTO tasks(
                     title, description, owner, status, priority, color_status,
@@ -773,8 +1131,9 @@ def apply_suggestion(suggestion_id: int) -> dict[str, Any]:
                     now,
                 ),
             )
+            record_id = int(cursor.lastrowid)
         elif suggestion_type == "risk":
-            conn.execute(
+            cursor = conn.execute(
                 """
                 INSERT INTO risks(
                     title, description, level, status, mitigation, source_document_id,
@@ -793,8 +1152,9 @@ def apply_suggestion(suggestion_id: int) -> dict[str, Any]:
                     now,
                 ),
             )
+            record_id = int(cursor.lastrowid)
         elif suggestion_type == "milestone":
-            conn.execute(
+            cursor = conn.execute(
                 """
                 INSERT INTO milestones(
                     title, description, planned_date, actual_date, status, color_status,
@@ -814,8 +1174,9 @@ def apply_suggestion(suggestion_id: int) -> dict[str, Any]:
                     now,
                 ),
             )
+            record_id = int(cursor.lastrowid)
         elif suggestion_type == "change_request":
-            conn.execute(
+            cursor = conn.execute(
                 """
                 INSERT INTO change_requests(
                     title, description, proposer, impact, status, source_document_id,
@@ -834,12 +1195,24 @@ def apply_suggestion(suggestion_id: int) -> dict[str, Any]:
                     now,
                 ),
             )
+            record_id = int(cursor.lastrowid)
         elif suggestion_type == "deliverable":
             deliverable_result = _apply_deliverable_suggestion(conn, suggestion, payload, now)
             if not deliverable_result.get("ok"):
                 return deliverable_result
+            record_id = int(deliverable_result["deliverableId"])
         else:
             return {"ok": False, "message": f"暂不支持应用 {suggestion_type} 类型。"}
+
+        config = ENTITY_TABLES[suggestion_type]
+        entity_id = ensure_entity(
+            conn,
+            suggestion_type,
+            record_id,
+            payload.get("title") or suggestion["title"],
+            False,
+        )
+        _attach_suggestion_sources(conn, suggestion, entity_id, payload)
 
         conn.execute(
             "UPDATE update_suggestions SET status = 'applied', applied_at = ? WHERE id = ?",
@@ -847,8 +1220,8 @@ def apply_suggestion(suggestion_id: int) -> dict[str, Any]:
         )
         conn.commit()
         if suggestion_type == "deliverable":
-            return {"ok": True, **deliverable_result}
-        return {"ok": True}
+            return {"ok": True, "entityId": entity_id, **deliverable_result}
+        return {"ok": True, "entityId": entity_id, "recordId": record_id, "action": "created"}
     except Exception as exc:
         conn.rollback()
         return {"ok": False, "message": str(exc)}

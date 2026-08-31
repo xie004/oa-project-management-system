@@ -689,12 +689,13 @@ def retrieve(query: str) -> list[dict[str, Any]]:
                 """
                 SELECT c.*, d.name AS document_name, d.path AS document_path,
                        d.doc_category, d.authority_level, d.authority_score, d.authority_scope,
-                       d.version_label, d.effective_date, d.is_current,
+                       d.version_label, d.version_group, d.effective_date, d.is_current,
                        bm25(knowledge_chunks_fts) AS rank
                 FROM knowledge_chunks_fts
                 JOIN knowledge_chunks c ON c.id = knowledge_chunks_fts.rowid
                 JOIN documents d ON d.id = c.document_id
                 WHERE knowledge_chunks_fts MATCH ?
+                  AND d.is_current = 1
                 ORDER BY rank
                 LIMIT ?
                 """,
@@ -713,10 +714,10 @@ def retrieve(query: str) -> list[dict[str, Any]]:
                     f"""
                     SELECT c.*, d.name AS document_name, d.path AS document_path,
                            d.doc_category, d.authority_level, d.authority_score, d.authority_scope,
-                           d.version_label, d.effective_date, d.is_current
+                           d.version_label, d.version_group, d.effective_date, d.is_current
                     FROM knowledge_chunks c
                     JOIN documents d ON d.id = c.document_id
-                    WHERE {where}
+                    WHERE d.is_current = 1 AND ({where})
                     ORDER BY c.updated_at DESC, c.id DESC
                     LIMIT ?
                     """,
@@ -742,11 +743,12 @@ def retrieve(query: str) -> list[dict[str, Any]]:
                 """
                 SELECT c.*, d.name AS document_name, d.path AS document_path,
                        d.doc_category, d.authority_level, d.authority_score, d.authority_scope,
-                       d.version_label, d.effective_date, d.is_current,
+                       d.version_label, d.version_group, d.effective_date, d.is_current,
                        v.vector_json
                 FROM knowledge_vectors v
                 JOIN knowledge_chunks c ON c.id = v.chunk_id
                 JOIN documents d ON d.id = c.document_id
+                WHERE d.is_current = 1
                 """
             ).fetchall()
         )
@@ -783,7 +785,21 @@ def retrieve(query: str) -> list[dict[str, Any]]:
         item["relevance_score"] = float(item.get("score") or 0)
         item["score"] = item["relevance_score"] + bonus
     ranked = sorted(hits.values(), reverse=True, key=lambda item: item["score"])
-    return [item for item in ranked if float(item.get("score") or 0) >= MIN_SOURCE_SCORE][:QA_SOURCE_LIMIT]
+    deduplicated: list[dict[str, Any]] = []
+    seen_versions: set[str] = set()
+    for item in ranked:
+        if float(item.get("score") or 0) < MIN_SOURCE_SCORE:
+            continue
+        version_key = "baseline" if item.get("source_type") == "baseline" else (
+            item.get("version_group") or f"document-{item.get('document_id')}"
+        )
+        if version_key in seen_versions:
+            continue
+        seen_versions.add(str(version_key))
+        deduplicated.append(item)
+        if len(deduplicated) >= QA_SOURCE_LIMIT:
+            break
+    return deduplicated
 
 
 def _source_payload(item: dict[str, Any], primary_level: int, conflict_note: str) -> dict[str, Any]:

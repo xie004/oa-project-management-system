@@ -120,30 +120,33 @@ def infer_document_authority(document: dict[str, Any], text: str = "") -> dict[s
     status = "pending"
     scope = AUTHORITY_SCOPE_BY_LEVEL[5]
 
-    if _contains_any(name_haystack, ["合同"]) and not _looks_like_contract_attachment(name_haystack) and not _contains_any(name_haystack, ["周报", "会议纪要"]):
-        level, score, confidence, status = 1, 98.0, 0.96, "confirmed"
-        reason = "文件名或内容明确包含合同正文特征。"
-    elif _contains_any(haystack, ["招标", "投标", "中标", "合同附件", "技术规范", "采购需求", "响应文件"]):
-        level, score, confidence, status = 2, 88.0, 0.9, "confirmed"
-        reason = "文件名或内容明确包含招投标、投标响应或合同附件特征。"
-    elif _contains_any(haystack, ["正式变更", "变更确认", "补充协议", "确认函", "签字确认", "盖章确认"]):
-        level, score, confidence, status = 3, 82.0, 0.86, "confirmed"
-        reason = "文件名或内容包含正式变更或确认文件特征。"
-    elif category == "meeting" or _contains_any(haystack, ["会议纪要", "周例会", "启动会", "会议决议", "会议记录"]):
-        level, score, confidence, status = 4, 68.0, 0.84, "confirmed"
-        reason = "文件名或分类显示为会议纪要/决议。"
-    elif category == "weekly_report" or _contains_any(haystack, ["周报", "本周工作", "下周计划", "周工作"]):
-        level, score, confidence, status = 5, 55.0, 0.86, "confirmed"
+    if category == "meeting" or _contains_any(name_haystack, ["会议纪要", "周例会", "启动会", "会议决议", "会议记录"]):
+        level, score, confidence, status = 4, 68.0, 0.94, "confirmed"
+        reason = "文件名或分类显示为会议纪要/决议；正文提及合同或招投标不会提升其权威层级。"
+    elif category == "weekly_report" or _contains_any(name_haystack, ["周报", "周工作"]):
+        level, score, confidence, status = 5, 55.0, 0.94, "confirmed"
         reason = "文件名或分类显示为项目周报/过程资料。"
+    elif category == "resource":
+        level, score, confidence, status = 5, 50.0, 0.9, "confirmed"
+        reason = "系统分类为资源需求资料，用于部署和过程决策跟踪。"
+    elif _contains_any(name_haystack, ["合同"]) and not _looks_like_contract_attachment(name_haystack):
+        level, score, confidence, status = 1, 98.0, 0.96, "confirmed"
+        reason = "文件名明确包含合同正文特征。"
+    elif _contains_any(name_haystack, ["正式变更", "变更确认", "补充协议", "确认函", "签字确认", "盖章确认"]):
+        level, score, confidence, status = 3, 82.0, 0.9, "confirmed"
+        reason = "文件名包含正式变更或确认文件特征。"
+    elif _contains_any(name_haystack, ["招标", "投标", "中标", "合同附件", "技术规范", "采购需求", "响应文件"]):
+        level, score, confidence, status = 2, 88.0, 0.9, "confirmed"
+        reason = "文件名明确包含招投标、投标响应或合同附件特征。"
+    elif category == "requirement_change" and _contains_any(haystack, ["正式变更", "变更确认", "补充协议", "确认函", "签字确认", "盖章确认"]):
+        level, score, confidence, status = 3, 82.0, 0.86, "confirmed"
+        reason = "需求/变更资料正文包含正式变更或确认特征。"
     elif category == "contract_tender":
         level, score, confidence, status = 2, 72.0, 0.68, "pending"
         reason = "系统分类为合同招投标，但无法进一步确认是否为合同正文或附件。"
     elif category == "requirement_change":
         level, score, confidence, status = 3, 62.0, 0.62, "pending"
         reason = "系统分类为需求/变更资料，需确认是否属于正式确认文件。"
-    elif category == "resource":
-        level, score, confidence, status = 5, 50.0, 0.7, "confirmed"
-        reason = "系统分类为资源需求资料，通常用于部署和过程决策跟踪。"
 
     if "作废" in haystack or "废止" in haystack or "历史版本" in haystack:
         score = min(score, 40)
