@@ -3,11 +3,11 @@ from __future__ import annotations
 import json
 import re
 import threading
-import time
+from datetime import datetime
 from typing import Any
 
 from app.database import get_connection, get_setting, now_iso, row_to_dict, rows_to_dicts
-from app.services.authority import AUTHORITY_LABELS, authority_label
+from app.services.authority import authority_label
 from app.services.ai import chat_completion
 from app.services.extractors import compact_text
 from app.services.ocr import combined_ocr_text
@@ -29,7 +29,7 @@ PAGE_SOURCE_STRATEGIES: dict[str, dict[str, Any]] = {
     "overview": {
         "primary": ["baseline", "contract_tender", "requirement_change"],
         "secondary": ["meeting", "weekly_report", "acceptance_launch", "resource"],
-        "keywords": ["项目", "概览", "合同", "采购", "需求", "建设", "范围", "目标"],
+        "keywords": ["项目", "概览", "合同", "采购", "需求", "建设", "范围", "目标", "合同金额", "合同总额", "实施周期", "验收"],
         "min_authority": 4,
         "pin_baseline": True,
     },
@@ -86,6 +86,18 @@ PAGE_SOURCE_STRATEGIES: dict[str, dict[str, Any]] = {
     },
 }
 
+PAGE_GUIDANCE = {
+    "overview": "概括项目背景、建设内容、合同边界、当前阶段和总体状态，不罗列目录或一般性条款。",
+    "goals_scope": "明确建设目标、系统范围、数据迁移、系统集成和部署边界。合同与需求优先，过程资料不得改写正式范围。",
+    "plan_milestones": "整理合同工期、计划基线、关键里程碑和当前计划偏差，区分正式约束与内部计划。",
+    "current_progress": "以最新周报和阶段汇报为主，概括已完成、进行中、下一步和进度偏差，不用旧会议覆盖最新进展。",
+    "risks_coordination": "区分风险事件、影响、应对措施和待协调事项，优先使用最新周报与明确会议结论。",
+    "meeting_decisions": "只提取已经明确形成的会议决议、责任主体、期限和待办，不把讨论过程写成正式结论。",
+    "change_requests": "区分正式变更、待确认变化和一般优化建议；没有正式文件时不得声称合同范围已变更。",
+    "deliverables_acceptance": "整理合同、需求和招投标要求的交付物、验收条件、测评要求与当前准备情况。",
+    "resources_deployment": "整理服务器、操作系统、数据库、中间件、网络、安全和高可用部署要求，并标明待确认资源。",
+}
+
 BASELINE_SOURCE = {
     "documentId": None,
     "documentName": "项目计划基线",
@@ -102,6 +114,10 @@ _wiki_job = {
     "progress": 0,
     "total": len(WIKI_PAGES),
     "created": 0,
+    "modelSucceeded": 0,
+    "fallbackCount": 0,
+    "currentPage": "",
+    "generationId": "",
     "error": "",
     "startedAt": "",
     "finishedAt": "",
@@ -168,11 +184,30 @@ def _document_text(conn, doc: dict[str, Any]) -> str:
 
 
 def _source_type(doc: dict[str, Any]) -> str:
+    name = doc.get("name") or ""
+    if any(
+        word in name.lower()
+        for word in [
+            "二维码", "激活校验码", "产品镜像", "安装包", "授权码",
+            "密码", "password", "api_key", "apikey", "license"
+        ]
+    ):
+        return "other"
+    if "请示" in name:
+        return "other"
+    if "周报" in name:
+        return "weekly_report"
+    if any(word in name for word in ["会议纪要", "会议记录", "周例会"]):
+        return "meeting"
+    if any(word in name for word in ["阶段性工作汇报", "阶段汇报", "工作汇报"]):
+        return "acceptance_launch"
+    if any(word in name for word in ["服务器资源", "资源需求", "资源清单"]):
+        return "resource"
+    if "需求" in name and not any(word in name for word in ["资源需求", "服务器资源"]):
+        return "requirement_change"
+    if any(word in name for word in ["合同", "招标", "投标"]):
+        return "contract_tender"
     category = doc.get("doc_category") or "other"
-    if category == "contract_tender":
-        name = doc.get("name") or ""
-        if "需求" in name:
-            return "requirement_change"
     return category
 
 
@@ -213,6 +248,39 @@ def _baseline_doc(conn, page_key: str) -> dict[str, Any]:
     }
 
 
+def _logical_version_key(doc: dict[str, Any]) -> str:
+    explicit = (doc.get("version_group") or "").strip()
+    if explicit:
+        return explicit
+    name = re.sub(r"\.[^.]+$", "", doc.get("name") or "").lower()
+    if doc.get("doc_category") in {"contract_tender", "requirement_change"}:
+        name = re.sub(r"初稿|拟定稿|草稿|征求意见稿|送审稿|正式稿|最终稿|修订稿", "", name)
+        name = re.sub(r"20\d{6}|20\d{2}[-_.]\d{1,2}[-_.]\d{1,2}|v\d+(?:\.\d+)*", "", name)
+    else:
+        name = re.sub(r"[（(]\d+[）)]$", "", name)
+    name = re.sub(r"[\s_\-—()（）\[\]【】]+", "", name)
+    return f"{doc.get('doc_category') or 'other'}:{name}" if name else f"document-{doc['id']}"
+
+
+def _document_preference(doc: dict[str, Any]) -> float:
+    name = doc.get("name") or ""
+    score = (7 - int(doc.get("authority_level") or 5)) * 10
+    score += float(doc.get("authority_score") or 45) / 10
+    if "合同" in name and not any(word in name for word in ["招标", "投标", "需求"]):
+        score += 12
+    if "需求" in name:
+        score += 8
+    if "中标" in name or "投标响应" in name:
+        score += 6
+    if any(word in name for word in ["正式稿", "最终稿"]):
+        score += 5
+    if any(word in name for word in ["初稿", "拟定稿", "草稿", "征求意见"]):
+        score -= 12
+    if doc.get("primary_version_id") and int(doc.get("primary_version_id")) == int(doc["id"]):
+        score += 20
+    return score
+
+
 def _load_documents_for_wiki(conn) -> list[dict[str, Any]]:
     rows = rows_to_dicts(
         conn.execute(
@@ -225,11 +293,16 @@ def _load_documents_for_wiki(conn) -> list[dict[str, Any]]:
             """
         ).fetchall()
     )
+    rows.sort(key=_document_preference, reverse=True)
     docs = []
     seen_version_groups: set[str] = set()
+    seen_content_hashes: set[str] = set()
     for doc in rows:
-        version_group = doc.get("version_group") or f"document-{doc['id']}"
+        version_group = _logical_version_key(doc)
         if version_group in seen_version_groups:
+            continue
+        content_hash = (doc.get("content_hash") or "").strip()
+        if content_hash and content_hash in seen_content_hashes:
             continue
         text = _document_text(conn, doc)
         if not text:
@@ -238,6 +311,8 @@ def _load_documents_for_wiki(conn) -> list[dict[str, Any]]:
         doc["source_type"] = _source_type(doc)
         docs.append(doc)
         seen_version_groups.add(version_group)
+        if content_hash:
+            seen_content_hashes.add(content_hash)
     return docs
 
 
@@ -260,12 +335,20 @@ def _source_payload(doc: dict[str, Any], snippet: str, primary: bool, note: str 
             "note": note,
         }
     level = int(doc.get("authority_level") or 5)
+    source_type = doc.get("source_type") or doc.get("doc_category") or "other"
+    source_labels = {
+        "weekly_report": "周报/过程资料",
+        "meeting": "会议纪要/决议",
+        "acceptance_launch": "阶段汇报/过程确认",
+        "requirement_change": "需求/正式确认文件",
+        "resource": "资源/部署资料",
+    }
     return {
         "documentId": doc.get("id"),
         "documentName": doc.get("name"),
-        "sourceType": doc.get("source_type") or doc.get("doc_category") or "other",
+        "sourceType": source_type,
         "authorityLevel": level,
-        "authorityLabel": authority_label(level),
+        "authorityLabel": source_labels.get(source_type, authority_label(level)),
         "authorityScore": float(doc.get("authority_score") or 45),
         "isPrimaryBasis": primary,
         "snippet": compact_text(snippet, 260),
@@ -273,32 +356,95 @@ def _source_payload(doc: dict[str, Any], snippet: str, primary: bool, note: str 
     }
 
 
+def _document_date_value(doc: dict[str, Any]) -> int:
+    text = f"{doc.get('name', '')} {doc.get('effective_date', '')} {doc.get('modified_at', '')}"
+    matches = re.findall(r"(20\d{2})[-_.年]?([01]\d)[-_.月]?([0-3]\d)", text)
+    if not matches:
+        return 0
+    values = []
+    for year, month, day in matches:
+        try:
+            values.append(datetime(int(year), int(month), int(day)).toordinal())
+        except ValueError:
+            continue
+    return max(values, default=0)
+
+
+def _page_name_bonus(doc: dict[str, Any], page_key: str) -> float:
+    name = doc.get("name") or ""
+    bonus = 0.0
+    if "合同" in name and page_key in {"overview", "goals_scope", "plan_milestones", "change_requests", "deliverables_acceptance"}:
+        bonus += 5.0
+    if "需求" in name and page_key in {"overview", "goals_scope", "change_requests", "deliverables_acceptance", "resources_deployment"}:
+        bonus += 5.0
+    if any(word in name for word in ["中标", "投标响应"]):
+        bonus += 2.0
+    if "周报" in name and page_key in {"current_progress", "risks_coordination"}:
+        bonus += 3.0
+    if "会议纪要" in name and page_key == "meeting_decisions":
+        bonus += 3.0
+    return bonus
+
+
 def _select_page_sources(conn, docs: list[dict[str, Any]], page_key: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str]]:
     strategy = PAGE_SOURCE_STRATEGIES.get(page_key, PAGE_SOURCE_STRATEGIES["overview"])
     baseline = _baseline_doc(conn, page_key)
     candidates = [baseline, *docs]
+    allowed = set(strategy["primary"] + strategy["secondary"])
+    eligible = [doc for doc in candidates if (doc.get("source_type") or _source_type(doc)) in allowed]
+    dated = sorted(
+        [doc for doc in eligible if _document_date_value(doc)],
+        key=_document_date_value,
+        reverse=True,
+    )
+    recency_bonus = {str(doc.get("id") or "baseline"): max(0.0, 6.0 - index * 0.7) for index, doc in enumerate(dated[:9])}
     scored: list[tuple[float, dict[str, Any]]] = []
-    for doc in candidates:
+    for doc in eligible:
         source_type = doc.get("source_type") or _source_type(doc)
-        if source_type not in set(strategy["primary"] + strategy["secondary"]):
-            continue
         level = int(doc.get("authority_level") or 5)
         authority_bonus = max(0, 7 - level) * 1.2 + float(doc.get("authority_score") or 45) / 100
-        source_bonus = 4.0 if source_type in strategy["primary"] else 1.4
+        if source_type in strategy["primary"]:
+            source_bonus = 5.2 - strategy["primary"].index(source_type) * 0.7
+        else:
+            source_bonus = 1.6 - strategy["secondary"].index(source_type) * 0.15
         matched_text = _matched_snippet(doc, page_key)
         keyword_bonus = _keyword_score(f"{doc.get('name', '')}\n{matched_text}", strategy["keywords"])
         if keyword_bonus <= 0 and source_type != "baseline":
             keyword_bonus = 0.2
-        scored.append((source_bonus + authority_bonus + keyword_bonus, doc))
+        freshness = recency_bonus.get(str(doc.get("id") or "baseline"), 0.0) if page_key in {
+            "current_progress", "risks_coordination", "meeting_decisions"
+        } else 0.0
+        draft_penalty = 7.0 if any(word in (doc.get("name") or "") for word in ["初稿", "拟定稿", "草稿", "征求意见"]) else 0.0
+        scored.append((source_bonus + authority_bonus + keyword_bonus + freshness + _page_name_bonus(doc, page_key) - draft_penalty, doc))
     ranked = [doc for _, doc in sorted(scored, reverse=True, key=lambda item: item[0])]
-    primary = [doc for doc in ranked if (doc.get("source_type") or _source_type(doc)) in strategy["primary"]][:5]
+    primary_candidates = [doc for doc in ranked if (doc.get("source_type") or _source_type(doc)) in strategy["primary"]]
+    non_draft_primary = [
+        doc for doc in primary_candidates
+        if not any(word in (doc.get("name") or "") for word in ["初稿", "拟定稿", "草稿", "征求意见"])
+    ]
+    primary = (non_draft_primary if len(non_draft_primary) >= 3 else primary_candidates)[:4]
     if strategy.get("pin_baseline") and baseline.get("text") and baseline not in primary:
-        primary = [baseline, *primary[:4]]
-    secondary = [doc for doc in ranked if doc not in primary][:4]
+        primary = [baseline, *primary[:3]]
+    primary.sort(
+        key=lambda doc: (
+            0 if int(doc.get("authority_level") or 5) <= 2 else 1,
+            0 if doc.get("source_type") == "baseline" else 1,
+            -_document_date_value(doc),
+        )
+    )
+    secondary_types = set(strategy["secondary"])
+    if page_key in {"current_progress", "risks_coordination", "meeting_decisions"}:
+        secondary_types.update(strategy["primary"])
+    secondary = [
+        doc for doc in ranked
+        if doc not in primary and (doc.get("source_type") or _source_type(doc)) in secondary_types
+    ][:2]
     warnings: list[str] = []
     high_authority = [doc for doc in primary if int(doc.get("authority_level") or 5) <= strategy.get("min_authority", 5)]
     if not high_authority:
         warnings.append("缺少高权威主依据，建议补充合同、需求、招投标或正式确认资料后再固化本页。")
+    if any(any(word in (doc.get("name") or "") for word in ["初稿", "拟定稿", "草稿"]) for doc in primary):
+        warnings.append("主依据仍包含未确认版本，建议先在数据治理中确认正式版本。")
     return primary, secondary, warnings
 
 
@@ -306,10 +452,66 @@ def _matched_snippet(doc: dict[str, Any], page_key: str) -> str:
     strategy = PAGE_SOURCE_STRATEGIES.get(page_key, PAGE_SOURCE_STRATEGIES["overview"])
     text = doc.get("text") or ""
     lines = [line.strip() for line in text.splitlines() if line.strip()]
-    matched = [line for line in lines if any(keyword in line for keyword in strategy["keywords"])]
+    scored: list[tuple[float, int, str]] = []
+    for index, line in enumerate(lines):
+        if any(
+            phrase in line
+            for phrase in [
+                "智慧经营平台", "广州交易集团", "科学城（广州）建设发展集团",
+                "本授权书声明", "经营范围：", "本合同生效日起十个工作日内"
+            ]
+        ):
+            continue
+        keyword_hits = sum(1 for keyword in strategy["keywords"] if keyword in line)
+        if not keyword_hits:
+            continue
+        score = keyword_hits * 3 + min(len(line), 240) / 120
+        if any(phrase in line for phrase in ["合同金额", "合同总额", "实施周期", "建设目标", "建设内容", "验收要求"]):
+            score += 6
+        if re.search(r"\.{5,}|…{3,}|\|\s*\d+\s*$", line):
+            score -= 5
+        if len(line) < 8:
+            score -= 2
+        scored.append((score, index, line))
+    best = sorted(scored, reverse=True)[:12]
+    matched = [compact_text(line, 420) for _, _, line in best]
     if not matched:
-        matched = lines[:10]
-    return compact_text("\n".join(matched[:12]), 1400)
+        matched = [line for line in lines[:12] if not re.search(r"\.{5,}|…{3,}", line)]
+    return compact_text("\n".join(matched), 1500)
+
+
+def _fallback_from_selected(
+    title: str,
+    page_key: str,
+    primary: list[dict[str, Any]],
+    secondary: list[dict[str, Any]],
+    warnings: list[str],
+) -> tuple[str, list[dict[str, Any]]]:
+    if not primary and not secondary:
+        return "暂无可用资料。请确认项目资料已完成正文抽取或 OCR。", []
+
+    parts = [
+        title,
+        "本页为规则降级整理结果，管理员确认后方可写入正式 Wiki。",
+    ]
+    sources: list[dict[str, Any]] = []
+    if warnings:
+        parts.append("来源治理提醒：")
+        parts.extend(f"- {warning}" for warning in warnings)
+    if primary:
+        parts.append("主依据摘要：")
+        for index, doc in enumerate(primary, start=1):
+            snippet = _matched_snippet(doc, page_key)
+            parts.append(f"{index}. {doc.get('name')}：{compact_text(snippet, 480)}")
+            sources.append({**_source_payload(doc, snippet, True), "sourceRef": f"S{index}"})
+    if secondary:
+        parts.append("补充依据摘要：")
+        for offset, doc in enumerate(secondary, start=len(primary) + 1):
+            snippet = _matched_snippet(doc, page_key)
+            parts.append(f"{offset}. {doc.get('name')}：{compact_text(snippet, 360)}")
+            sources.append({**_source_payload(doc, snippet, False), "sourceRef": f"S{offset}"})
+    parts.append("待确认事项：模型本轮未能完成归纳，请结合来源文件确认后再应用。")
+    return compact_text("\n".join(parts), 6000), sources
 
 
 def _fallback_wiki_content(title: str, docs: list[dict[str, Any]], page_key: str) -> tuple[str, list[dict[str, Any]]]:
@@ -318,107 +520,299 @@ def _fallback_wiki_content(title: str, docs: list[dict[str, Any]], page_key: str
         primary, secondary, warnings = _select_page_sources(conn, docs, page_key)
     finally:
         conn.close()
-
-    if not primary and not secondary:
-        return "暂无可用资料。请确认项目资料已完成正文抽取或 OCR。", []
-
-    parts = [
-        title,
-        "本页由系统按页面主题、资料权威层级和内容匹配度整理，管理员确认后写入正式 Wiki。",
-    ]
-    sources: list[dict[str, Any]] = []
-    if warnings:
-        parts.append("来源治理提醒：")
-        parts.extend(f"- {warning}" for warning in warnings)
-    if primary:
-        parts.append("主依据：")
-        for doc in primary:
-            snippet = _matched_snippet(doc, page_key)
-            parts.append(f"\n来源：{doc.get('name')}\n{snippet}")
-            sources.append(_source_payload(doc, snippet, True))
-    if secondary:
-        parts.append("\n补充依据：")
-        for doc in secondary:
-            snippet = _matched_snippet(doc, page_key)
-            parts.append(f"\n来源：{doc.get('name')}\n{snippet}")
-            sources.append(_source_payload(doc, snippet, False))
-    parts.append("\n待确认事项：以上内容为系统自动整理建议，正式写入前请确认来源是否充分、是否存在正式变更文件。")
-    return compact_text("\n".join(parts), 16000), sources
+    return _fallback_from_selected(title, page_key, primary, secondary, warnings)
 
 
-def _load_wiki_materials() -> tuple[list[dict[str, Any]], str, list[dict[str, Any]]]:
+def _load_wiki_materials() -> list[dict[str, Any]]:
     conn = get_connection()
     try:
         ensure_wiki_pages(conn)
         docs = _load_documents_for_wiki(conn)
-        source_text = compact_text("\n\n".join(f"文件ID {doc.get('id')}：{doc.get('name')}\n{doc.get('text')}" for doc in docs), 30000)
-        sources = [{"documentId": doc.get("id"), "documentName": doc.get("name")} for doc in docs]
-        return docs, source_text, sources
+        return docs
     finally:
         conn.close()
 
 
-def _clear_pending_wiki_suggestions() -> None:
+def _replace_pending_wiki_suggestions(items: list[dict[str, Any]]) -> None:
     conn = get_connection()
     try:
         conn.execute("DELETE FROM wiki_suggestions WHERE status = 'pending'")
+        for item in items:
+            conn.execute(
+                """
+                INSERT INTO wiki_suggestions(
+                    page_key, title, content, source_json, generation_mode,
+                    generation_error, strategy_json, generation_id, status, created_at
+                )
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+                """,
+                (
+                    item["page_key"],
+                    item["title"],
+                    item["content"],
+                    json.dumps(item["sources"][:10], ensure_ascii=False),
+                    item["generation_mode"],
+                    item.get("generation_error") or "",
+                    json.dumps(item.get("strategy") or {}, ensure_ascii=False),
+                    item.get("generation_id") or "",
+                    item["created_at"],
+                ),
+            )
         conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 
 
-def _insert_wiki_suggestion(page_key: str, title: str, content: str, sources: list[dict[str, Any]]) -> None:
+def _wiki_prompt(
+    page_key: str,
+    title: str,
+    primary: list[dict[str, Any]],
+    secondary: list[dict[str, Any]],
+    warnings: list[str],
+) -> str:
+    materials = []
+    for index, doc in enumerate([*primary, *secondary], start=1):
+        role = "主依据" if doc in primary else "补充依据"
+        materials.append(
+            f"[S{index}] {role}｜{doc.get('name')}｜{authority_label(int(doc.get('authority_level') or 5))}\n"
+            f"{_matched_snippet(doc, page_key)}"
+        )
+    return f"""
+请为“国产化OA集成项目管理系统”的 Wiki 页面“{title}”生成可审核的更新建议。
+页面要求：{PAGE_GUIDANCE.get(page_key, '')}
+
+必须遵守：
+1. 只依据下列来源，不补造事实、日期、数量、责任人或结论。
+2. 合同和正式需求优先于计划基线，计划基线优先于会议和周报；低权威资料不得覆盖高权威资料。
+   合同正文中的金额、工期、付款和验收条款优先；采购需求中的预算或最高限价不得表述为合同成交金额。
+3. 过程类页面优先使用最新周报/会议；如资料冲突，写入 conflicts 或 unknowns，不自行裁决为正式变更。
+4. 过滤目录、页眉页脚、无关资格条款和重复表述；状态类信息必须注明来源时间，避免把旧进展写成当前状态。
+5. 输出纯 JSON 对象，不要 Markdown、代码围栏、# 或 *。
+6. 对变更需求页面，会议和周报中的变化必须写成“会议提出”或“待正式确认”，不得表述为已经形成正式变更。
+
+JSON 字段：
+summary: 1至3段准确、简洁的综合说明；
+key_points: 4至10条具体事实，每条末尾可用【S1】标注依据；
+current_status: 0至6条当前状态或进展，仅适用于该页面；
+conflicts: 来源冲突数组；
+unknowns: 资料不足或待确认数组。
+
+来源治理提醒：{json.dumps(warnings, ensure_ascii=False)}
+来源材料：
+{chr(10).join(materials) or '无可用来源'}
+""".strip()
+
+
+def _string_list(value: Any, limit: int) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [compact_text(str(item), 500) for item in value if str(item).strip()][:limit]
+
+
+def _significant_numbers(text: str) -> set[str]:
+    normalized = (text or "").replace(",", "").replace("，", "")
+    values = set(re.findall(r"(?<![A-Za-z])\d{2,}(?:\.\d+)?", normalized))
+    values.update(
+        match.group(1)
+        for match in re.finditer(r"(?<![A-Za-z])(\d+(?:\.\d+)?)(?=万元|元|个月|天|日|年|套|台|个|份|%)", normalized)
+    )
+    return values
+
+
+def _validate_model_grounding(data: dict[str, Any], selected: list[dict[str, Any]], page_key: str) -> None:
+    context = "\n".join(
+        f"{doc.get('name', '')}\n{_matched_snippet(doc, page_key)}" for doc in selected
+    ).replace(",", "").replace("，", "")
+    claims = json.dumps(data, ensure_ascii=False)
+    unsupported = sorted(value for value in _significant_numbers(claims) if value not in context)
+    if unsupported:
+        raise ValueError(f"模型包含来源片段中不存在的数字：{', '.join(unsupported[:8])}")
+
+
+def _character_bigrams(text: str) -> set[str]:
+    cleaned = re.sub(r"[^\u4e00-\u9fffA-Za-z0-9]", "", text or "")
+    return {cleaned[index : index + 2] for index in range(max(0, len(cleaned) - 1))}
+
+
+def _ground_model_citations(data: dict[str, Any], selected: list[dict[str, Any]], page_key: str) -> None:
+    source_grams = [
+        _character_bigrams(f"{doc.get('name', '')}\n{_matched_snippet(doc, page_key)}") for doc in selected
+    ]
+    for field in ["key_points", "current_status", "conflicts", "unknowns"]:
+        values = data.get(field)
+        if not isinstance(values, list):
+            continue
+        grounded = []
+        for value in values:
+            text = re.sub(r"【S\d+(?:[、,，/]S?\d+)*】", "", str(value)).strip()
+            grams = _character_bigrams(text)
+            scores = [len(grams & candidate) for candidate in source_grams]
+            ranked = sorted(range(len(scores)), key=lambda index: scores[index], reverse=True)
+            refs = [index + 1 for index in ranked[: (2 if field == "conflicts" else 1)] if scores[index] >= 2]
+            grounded.append(f"{text}{''.join(f'【S{ref}】' for ref in refs)}")
+        data[field] = grounded
+
+
+def _wiki_content_from_model(page_key: str, title: str, data: dict[str, Any], warnings: list[str]) -> str:
+    summary = compact_text(str(data.get("summary") or ""), 1800)
+    key_points = _string_list(data.get("key_points"), 10)
+    current_status = _string_list(data.get("current_status"), 6)
+    conflicts = _string_list(data.get("conflicts"), 6)
+    unknowns = _string_list(data.get("unknowns"), 6)
+    if not summary or not key_points:
+        raise ValueError("模型结果缺少 summary 或 key_points")
+    parts = [title, "综合说明", summary, "关键事实"]
+    parts.extend(f"{index}. {item}" for index, item in enumerate(key_points, start=1))
+    if current_status and page_key in {
+        "plan_milestones", "current_progress", "risks_coordination", "meeting_decisions",
+        "change_requests", "deliverables_acceptance", "resources_deployment"
+    }:
+        parts.append("当前状态")
+        parts.extend(f"{index}. {item}" for index, item in enumerate(current_status, start=1))
+    if conflicts:
+        parts.append("来源冲突")
+        parts.extend(f"{index}. {item}" for index, item in enumerate(conflicts, start=1))
+    combined_unknowns = [*unknowns, *warnings]
+    if combined_unknowns:
+        parts.append("待确认事项")
+        parts.extend(f"{index}. {item}" for index, item in enumerate(combined_unknowns, start=1))
+    return compact_text("\n".join(parts), 9000)
+
+
+def _generate_one_suggestion(page_key: str, title: str, docs: list[dict[str, Any]], generation_id: str) -> dict[str, Any]:
     conn = get_connection()
     try:
-        conn.execute(
-            """
-            INSERT INTO wiki_suggestions(page_key, title, content, source_json, status, created_at)
-            VALUES(?, ?, ?, ?, 'pending', ?)
-            """,
-            (page_key, title, content, json.dumps(sources[:10], ensure_ascii=False), now_iso()),
-        )
-        conn.commit()
+        primary, secondary, warnings = _select_page_sources(conn, docs, page_key)
     finally:
         conn.close()
+    selected = [*primary, *secondary]
+    fallback_content, fallback_sources = _fallback_from_selected(title, page_key, primary, secondary, warnings)
+    strategy = {
+        "primaryCount": len(primary),
+        "secondaryCount": len(secondary),
+        "highAuthorityCount": sum(1 for doc in primary if int(doc.get("authority_level") or 5) <= 2),
+        "primarySources": [doc.get("name") for doc in primary],
+        "secondarySources": [doc.get("name") for doc in secondary],
+        "warnings": warnings,
+    }
+    item = {
+        "page_key": page_key,
+        "title": f"{title}（LLM 归纳）",
+        "content": fallback_content,
+        "sources": fallback_sources,
+        "generation_mode": "rules",
+        "generation_error": "",
+        "generation_id": generation_id,
+        "created_at": now_iso(),
+        "strategy": strategy,
+    }
+    if not selected:
+        item["generation_error"] = "没有可用来源"
+        return item
 
-
-def _generate_one_suggestion(page_key: str, title: str, docs: list[dict[str, Any]], source_text: str, sources: list[dict[str, Any]]) -> bool:
-    content, fallback_sources = _fallback_wiki_content(title, docs, page_key)
-    _insert_wiki_suggestion(page_key, f"{title}（来源治理整理）", content, fallback_sources)
-    return True
+    prompt = _wiki_prompt(page_key, title, primary, secondary, warnings)
+    raw = ""
+    try:
+        raw = chat_completion(
+            [
+                {"role": "system", "content": "你是项目 Wiki 编审助手，严格依据来源并只输出 JSON。"},
+                {"role": "user", "content": prompt},
+            ],
+            max_tokens=1200 if page_key == "overview" else 900,
+            disable_thinking=True,
+        )
+        data = _parse_json_object(raw)
+        _validate_model_grounding(data, selected, page_key)
+        _ground_model_citations(data, selected, page_key)
+        item["content"] = _wiki_content_from_model(page_key, title, data, warnings)
+        item["generation_mode"] = "llm"
+    except Exception as first_error:
+        if raw:
+            try:
+                repair_prompt = (
+                    f"前次输出校验失败：{first_error}\n请重新检查来源并修复。"
+                    if "来源片段中不存在的数字" in str(first_error)
+                    else "请按 summary、key_points、current_status、conflicts、unknowns 字段修复以下输出，只返回 JSON：\n"
+                    + compact_text(raw, 5000)
+                )
+                repaired = chat_completion(
+                    [
+                        {"role": "system", "content": "你只负责生成合法、来源可核验的 JSON，不增加新事实。"},
+                        {
+                            "role": "user",
+                            "content": f"{prompt}\n\n{repair_prompt}",
+                        },
+                    ],
+                    max_tokens=1200 if page_key == "overview" else 900,
+                    disable_thinking=True,
+                )
+                data = _parse_json_object(repaired)
+                _validate_model_grounding(data, selected, page_key)
+                _ground_model_citations(data, selected, page_key)
+                item["content"] = _wiki_content_from_model(page_key, title, data, warnings)
+                item["generation_mode"] = "llm_repaired"
+            except Exception as repair_error:
+                item["generation_error"] = f"{first_error}；结构修复失败：{repair_error}"
+        else:
+            item["generation_error"] = str(first_error)
+    mode_label = "LLM 归纳" if item["generation_mode"].startswith("llm") else "规则降级"
+    item["title"] = f"{title}（{mode_label}）"
+    return item
 
 
 def rebuild_wiki_suggestions() -> dict[str, Any]:
-    docs, source_text, sources = _load_wiki_materials()
-    _clear_pending_wiki_suggestions()
-    created = 0
-    for page_key, title in WIKI_PAGES:
-        if _generate_one_suggestion(page_key, title, docs, source_text, sources):
-            created += 1
-    return {"ok": True, "created": created}
+    docs = _load_wiki_materials()
+    generation_id = now_iso()
+    items = [_generate_one_suggestion(page_key, title, docs, generation_id) for page_key, title in WIKI_PAGES]
+    _replace_pending_wiki_suggestions(items)
+    return {
+        "ok": True,
+        "created": len(items),
+        "modelSucceeded": sum(1 for item in items if item["generation_mode"].startswith("llm")),
+        "fallbackCount": sum(1 for item in items if item["generation_mode"] == "rules"),
+    }
 
 
 def _wiki_worker() -> None:
-    _set_job(running=True, progress=0, total=len(WIKI_PAGES), created=0, error="", startedAt=now_iso(), finishedAt="")
+    generation_id = now_iso()
+    _set_job(
+        running=True, progress=0, total=len(WIKI_PAGES), created=0,
+        modelSucceeded=0, fallbackCount=0, currentPage="", generationId=generation_id,
+        error="", startedAt=now_iso(), finishedAt=""
+    )
     try:
-        docs, source_text, sources = _load_wiki_materials()
-        _clear_pending_wiki_suggestions()
-        created = 0
+        docs = _load_wiki_materials()
+        items = []
         for index, (page_key, title) in enumerate(WIKI_PAGES, start=1):
-            if _generate_one_suggestion(page_key, title, docs, source_text, sources):
-                created += 1
-            _set_job(progress=index, created=created)
-            time.sleep(0.1)
-        _set_job(running=False, finishedAt=now_iso())
+            _set_job(currentPage=title)
+            item = _generate_one_suggestion(page_key, title, docs, generation_id)
+            items.append(item)
+            model_succeeded = sum(1 for value in items if value["generation_mode"].startswith("llm"))
+            fallback_count = sum(1 for value in items if value["generation_mode"] == "rules")
+            _set_job(
+                progress=index,
+                created=len(items),
+                modelSucceeded=model_succeeded,
+                fallbackCount=fallback_count,
+            )
+        _replace_pending_wiki_suggestions(items)
+        _set_job(running=False, currentPage="", finishedAt=now_iso())
     except Exception as exc:
-        _set_job(running=False, error=str(exc), finishedAt=now_iso())
+        _set_job(running=False, currentPage="", error=str(exc), finishedAt=now_iso())
 
 
 def start_wiki_rebuild_job() -> dict[str, Any]:
     with _wiki_job_lock:
         if _wiki_job["running"]:
             return {"ok": True, "alreadyRunning": True, **dict(_wiki_job)}
-    _set_job(running=True, progress=0, total=len(WIKI_PAGES), created=0, error="", startedAt=now_iso(), finishedAt="")
+    _set_job(
+        running=True, progress=0, total=len(WIKI_PAGES), created=0,
+        modelSucceeded=0, fallbackCount=0, currentPage="", error="",
+        startedAt=now_iso(), finishedAt=""
+    )
     thread = threading.Thread(target=_wiki_worker, daemon=True)
     thread.start()
     return {"ok": True, "started": True, **wiki_job_status()}
@@ -438,6 +832,10 @@ def list_wiki_suggestions(status: str = "pending") -> list[dict[str, Any]]:
                 row["sources"] = json.loads(row.pop("source_json") or "[]")
             except Exception:
                 row["sources"] = []
+            try:
+                row["strategy"] = json.loads(row.pop("strategy_json") or "{}")
+            except Exception:
+                row["strategy"] = {}
         return rows
     finally:
         conn.close()

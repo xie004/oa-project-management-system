@@ -190,6 +190,11 @@ function formatDate(value) {
   return `${value}`.slice(0, 10);
 }
 
+function formatDateTime(value) {
+  if (!value) return "-";
+  return `${value}`.replace("T", " ").slice(0, 19);
+}
+
 function statusLabel(value) {
   return statusText[value] || value || "-";
 }
@@ -1710,11 +1715,13 @@ function WeeklyView({ weekly, onPreview }) {
 
 function WikiView({ pages, suggestions, isAdmin, onRebuild, onApply, onApplyAll, rebuildStatus, actionStates = {}, onPreview }) {
   const running = !!rebuildStatus?.running || !!actionStates["rebuild-wiki"];
+  const completed = !running && !!rebuildStatus?.finishedAt;
   const renderSources = (sources = []) => (
     <div className="wiki-source-list">
       {sources.slice(0, 5).map((source, index) => (
         <div className="wiki-source-item" key={`${source.documentId || source.documentName || "baseline"}-${index}`}>
           <div className="source-title-line">
+            {source.sourceRef && <span className="mini-badge">{source.sourceRef}</span>}
             <StatusPill value={source.authorityLabel || source.sourceType || "来源"} color={source.isPrimaryBasis ? "green" : "blue"} />
             {source.isPrimaryBasis && <span className="mini-badge">主依据</span>}
           </div>
@@ -1747,8 +1754,24 @@ function WikiView({ pages, suggestions, isAdmin, onRebuild, onApply, onApplyAll,
             <span className="qa-spinner" />
             <div>
               <strong>Wiki 更新建议正在后台生成</strong>
-              <p>进度 {rebuildStatus.progress || 0}/{rebuildStatus.total || 9}，可切换页面或关闭浏览器，不影响后台任务。</p>
+              <p>
+                进度 {rebuildStatus.progress || 0}/{rebuildStatus.total || 9}
+                {rebuildStatus.currentPage ? `，正在归纳：${rebuildStatus.currentPage}` : ""}。可切换页面或关闭浏览器，不影响后台任务。
+              </p>
             </div>
+          </div>
+        )}
+        {completed && (
+          <div className={`wiki-result-banner ${rebuildStatus.error ? "error" : "success"}`}>
+            <strong>{rebuildStatus.error ? "Wiki 建议生成未完成" : `已生成 ${rebuildStatus.created || 0} 条待确认建议`}</strong>
+            {rebuildStatus.error ? (
+              <p>{rebuildStatus.error}</p>
+            ) : (
+              <p>
+                大模型归纳 {rebuildStatus.modelSucceeded || 0} 页，规则降级 {rebuildStatus.fallbackCount || 0} 页。
+                正式 Wiki 尚未改变，请在下方审核后应用。
+              </p>
+            )}
           </div>
         )}
         <div className="wiki-grid">
@@ -1767,7 +1790,7 @@ function WikiView({ pages, suggestions, isAdmin, onRebuild, onApply, onApplyAll,
       </Section>
       {isAdmin && (
         <Section
-          title="Wiki 更新建议"
+          title={`Wiki 更新建议（${suggestions.length}）`}
           action={
             <button className="primary-button" onClick={onApplyAll} disabled={!suggestions.length || actionStates["apply-all-wiki"]}>
               {actionStates["apply-all-wiki"] ? <span className="button-spinner" /> : <Check size={16} />}
@@ -1781,8 +1804,17 @@ function WikiView({ pages, suggestions, isAdmin, onRebuild, onApply, onApplyAll,
                 <div className="suggestion-main">
                   <div className="suggestion-title">
                     <StatusPill value="pending" color="blue" />
+                    <StatusPill
+                      value={item.generation_mode?.startsWith("llm") ? "大模型归纳" : "规则降级"}
+                      color={item.generation_mode?.startsWith("llm") ? "green" : "yellow"}
+                    />
                     <strong>{item.title}</strong>
                   </div>
+                  <div className="wiki-strategy-summary">
+                    主依据 {item.strategy?.primaryCount || 0} 份，补充依据 {item.strategy?.secondaryCount || 0} 份，
+                    高权威主依据 {item.strategy?.highAuthorityCount || 0} 份 · 生成于 {formatDateTime(item.created_at)}
+                  </div>
+                  {item.generation_error && <div className="wiki-generation-warning">模型降级原因：{item.generation_error}</div>}
                   <pre className="wiki-suggestion-content">{item.content}</pre>
                   {renderSources(item.sources || [])}
                 </div>
@@ -2571,6 +2603,10 @@ function App() {
     if (auth.isAdmin) setWikiSuggestions(await api.get("/api/wiki/suggestions"));
   };
 
+  const loadWikiPages = async () => {
+    setWikiPages(await api.get("/api/wiki/pages"));
+  };
+
   const loadWikiRebuildStatus = async () => {
     if (auth.isAdmin) setWikiRebuildStatus(await api.get("/api/wiki/rebuild-status"));
   };
@@ -2911,8 +2947,8 @@ function App() {
       setError("");
       const status = await api.post("/api/wiki/rebuild-suggestions");
       setWikiRebuildStatus(status);
+      wikiWasRunningRef.current = true;
       setNotice(status.alreadyRunning ? "Wiki 更新建议已在后台生成中" : "Wiki 更新建议已开始后台生成");
-      await loadWikiSuggestions();
     } catch (err) {
       setError(err.message || "启动 Wiki 生成失败");
     } finally {
@@ -2921,11 +2957,11 @@ function App() {
   };
   const applyWikiSuggestion = async (id) => {
     const ok = await runAction(`apply-wiki-${id}`, () => api.post(`/api/wiki/suggestions/${id}/apply`), "Wiki 建议已应用");
-    if (ok) await loadWikiSuggestions();
+    if (ok) await Promise.all([loadWikiSuggestions(), loadWikiPages()]);
   };
   const applyAllWikiSuggestions = async () => {
     const ok = await runAction("apply-all-wiki", () => api.post("/api/wiki/suggestions/apply-all"), "Wiki 建议已全部应用");
-    if (ok) await loadWikiSuggestions();
+    if (ok) await Promise.all([loadWikiSuggestions(), loadWikiPages()]);
   };
   const openPreview = async (documentId) => {
     if (!documentId) return;

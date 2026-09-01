@@ -1296,6 +1296,40 @@ main {
   color: var(--muted);
 }
 
+.wiki-result-banner {
+  padding: 12px 14px;
+  border: 1px solid #b9d8c8;
+  border-radius: 8px;
+  background: #f1f8f4;
+  margin-bottom: 12px;
+}
+
+.wiki-result-banner.error {
+  border-color: #e7c3c3;
+  background: #fff5f5;
+}
+
+.wiki-result-banner p {
+  margin: 4px 0 0;
+  color: var(--muted);
+}
+
+.wiki-strategy-summary {
+  margin: 8px 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.wiki-generation-warning {
+  margin: 8px 0;
+  padding: 8px 10px;
+  border-left: 3px solid #c99422;
+  background: #fff8e8;
+  color: #76520d;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
 .wiki-card,
 .qa-answer-card {
   border: 1px solid var(--border);

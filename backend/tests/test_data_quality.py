@@ -5,6 +5,12 @@ from app.services.authority import infer_document_authority
 from app.services.data_quality import document_version_group, is_invalid_candidate, normalize_title
 from app.services.extractors import bullet_lines, compact_text
 from app.services.scanner import _parse_ai_items, _validate_ai_items, create_suggestion
+from app.services.wiki import (
+    _ground_model_citations,
+    _logical_version_key,
+    _source_type,
+    _validate_model_grounding,
+)
 
 
 class DataQualityRulesTest(unittest.TestCase):
@@ -42,6 +48,35 @@ class DataQualityRulesTest(unittest.TestCase):
         self.assertEqual(items[0]["title"], "完成联调")
         with self.assertRaises(ValueError):
             _validate_ai_items(items, {"task"})
+
+    def test_wiki_source_rules_dedupe_formats_and_keep_weekly_type(self):
+        left = _logical_version_key({"id": 1, "name": "项目启动会会议纪要.docx", "doc_category": "meeting"})
+        right = _logical_version_key({"id": 2, "name": "项目启动会会议纪要.pdf", "doc_category": "meeting"})
+        self.assertEqual(left, right)
+        self.assertEqual(
+            _source_type({"name": "项目周报（20260824-20260827）.xls", "doc_category": "meeting"}),
+            "weekly_report",
+        )
+
+    def test_wiki_model_numbers_must_exist_in_selected_sources(self):
+        selected = [{"name": "项目合同.docx", "text": "合同金额为1859880元，工期8个月。"}]
+        valid = {"summary": "合同金额为1859880元，工期8个月。", "key_points": ["金额为1859880元"]}
+        _validate_model_grounding(valid, selected, "overview")
+        with self.assertRaises(ValueError):
+            _validate_model_grounding(
+                {"summary": "合同金额为191万元。", "key_points": ["金额为191万元"]},
+                selected,
+                "overview",
+            )
+
+    def test_wiki_citations_are_reassigned_by_source_overlap(self):
+        selected = [
+            {"name": "合同.docx", "text": "项目试运行期不少于30日。"},
+            {"name": "周报.xls", "text": "档案系统数据迁移正在进行中。"},
+        ]
+        data = {"key_points": ["档案系统数据迁移正在进行中【S1】"]}
+        _ground_model_citations(data, selected, "current_progress")
+        self.assertTrue(data["key_points"][0].endswith("【S2】"))
 
 
 class CandidateAggregationTest(unittest.TestCase):

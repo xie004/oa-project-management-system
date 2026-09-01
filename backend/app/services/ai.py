@@ -224,7 +224,13 @@ def _chat_payload(model_name: str, messages: list[dict[str, str]], max_tokens: i
     return payload
 
 
-def chat_completion(messages: list[dict[str, str]], config: dict[str, Any] | None = None, max_tokens: int = 1000, retry_on_model_error: bool = True) -> str:
+def chat_completion(
+    messages: list[dict[str, str]],
+    config: dict[str, Any] | None = None,
+    max_tokens: int = 1000,
+    retry_on_model_error: bool = True,
+    disable_thinking: bool = False,
+) -> str:
     config = {**DEFAULT_INTELLIGENT_ANALYSIS, **(config or ai_config())}
     if not config.get("apiBaseUrl"):
         raise ValueError("聊天模型 API 地址未配置")
@@ -236,7 +242,7 @@ def chat_completion(messages: list[dict[str, str]], config: dict[str, Any] | Non
             _save_model_name(model_name)
     if not model_name:
         raise ValueError("聊天模型名称未配置，且未能从 /models 自动读取模型")
-    payload = _chat_payload(model_name, messages, max_tokens)
+    payload = _chat_payload(model_name, messages, max_tokens, disable_thinking=disable_thinking)
     try:
         data = _post_json(
             _url(config["apiBaseUrl"], "/chat/completions"),
@@ -252,7 +258,7 @@ def chat_completion(messages: list[dict[str, str]], config: dict[str, Any] | Non
         if not fallback_model or fallback_model == model_name:
             raise
         _save_model_name(fallback_model)
-        payload = _chat_payload(fallback_model, messages, max_tokens)
+        payload = _chat_payload(fallback_model, messages, max_tokens, disable_thinking=disable_thinking)
         data = _post_json(
             _url(config["apiBaseUrl"], "/chat/completions"),
             payload,

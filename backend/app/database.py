@@ -680,6 +680,10 @@ def init_db() -> None:
                 title TEXT NOT NULL,
                 content TEXT NOT NULL,
                 source_json TEXT NOT NULL DEFAULT '[]',
+                generation_mode TEXT NOT NULL DEFAULT 'rules',
+                generation_error TEXT,
+                strategy_json TEXT NOT NULL DEFAULT '{}',
+                generation_id TEXT,
                 status TEXT NOT NULL DEFAULT 'pending',
                 created_at TEXT NOT NULL,
                 applied_at TEXT
@@ -853,6 +857,19 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     for name, definition in suggestion_columns.items():
         if name not in current_suggestion_columns:
             conn.execute(f"ALTER TABLE update_suggestions ADD COLUMN {name} {definition}")
+
+    wiki_suggestion_columns = {
+        "generation_mode": "TEXT NOT NULL DEFAULT 'rules'",
+        "generation_error": "TEXT",
+        "strategy_json": "TEXT NOT NULL DEFAULT '{}'",
+        "generation_id": "TEXT",
+    }
+    current_wiki_suggestion_columns = {
+        row["name"] for row in conn.execute("PRAGMA table_info(wiki_suggestions)").fetchall()
+    }
+    for name, definition in wiki_suggestion_columns.items():
+        if name not in current_wiki_suggestion_columns:
+            conn.execute(f"ALTER TABLE wiki_suggestions ADD COLUMN {name} {definition}")
     fts_row = conn.execute(
         "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'knowledge_chunks_fts'"
     ).fetchone()
@@ -893,6 +910,10 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
             title TEXT NOT NULL,
             content TEXT NOT NULL,
             source_json TEXT NOT NULL DEFAULT '[]',
+            generation_mode TEXT NOT NULL DEFAULT 'rules',
+            generation_error TEXT,
+            strategy_json TEXT NOT NULL DEFAULT '{}',
+            generation_id TEXT,
             status TEXT NOT NULL DEFAULT 'pending',
             created_at TEXT NOT NULL,
             applied_at TEXT
