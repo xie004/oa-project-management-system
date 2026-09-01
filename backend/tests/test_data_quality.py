@@ -4,6 +4,7 @@ import unittest
 from app.services.authority import infer_document_authority
 from app.services.data_quality import document_version_group, is_invalid_candidate, normalize_title
 from app.services.extractors import bullet_lines, compact_text
+from app.services.progress import parse_progress_percent
 from app.services.scanner import _parse_ai_items, _validate_ai_items, create_suggestion
 from app.services.wiki import (
     _ground_model_citations,
@@ -14,6 +15,13 @@ from app.services.wiki import (
 
 
 class DataQualityRulesTest(unittest.TestCase):
+    def test_report_progress_formats_are_normalized_to_percent(self):
+        self.assertEqual(parse_progress_percent("73/73+"), 100)
+        self.assertEqual(parse_progress_percent("完成40/75"), 53)
+        self.assertEqual(parse_progress_percent("85%"), 85)
+        self.assertEqual(parse_progress_percent(120), 100)
+        self.assertEqual(parse_progress_percent("待确认"), 0)
+
     def test_page_footer_and_repeated_headers_are_removed(self):
         text = "项目周报\n第 5 页 共 5 页\n项目周报\n项目周报\n完成测试环境部署"
         cleaned = compact_text(text)

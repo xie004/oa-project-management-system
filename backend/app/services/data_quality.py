@@ -12,6 +12,7 @@ from typing import Any
 
 from app.database import get_connection, now_iso, row_to_dict, rows_to_dicts
 from app.services.extractors import compact_text
+from app.services.progress import parse_progress_percent
 
 
 ENTITY_TABLES: dict[str, dict[str, str]] = {
@@ -99,10 +100,11 @@ def merge_candidate_payload(primary: dict[str, Any], secondary: dict[str, Any]) 
             continue
         if merged.get(key) in (None, ""):
             merged[key] = value
-    try:
-        merged["progress"] = max(int(primary.get("progress") or 0), int(secondary.get("progress") or 0))
-    except (TypeError, ValueError):
-        pass
+    if primary.get("progress") not in (None, "") or secondary.get("progress") not in (None, ""):
+        merged["progress"] = max(
+            parse_progress_percent(primary.get("progress")),
+            parse_progress_percent(secondary.get("progress")),
+        )
     primary_status = str(primary.get("status") or "")
     secondary_status = str(secondary.get("status") or "")
     if STATUS_RANK.get(secondary_status, 0) > STATUS_RANK.get(primary_status, 0):
@@ -411,8 +413,8 @@ def find_matching_entity(
 def _meaningful_updates(entity_type: str, record: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
     updates: dict[str, Any] = {}
     if entity_type == "task":
-        proposed_progress = int(payload.get("progress") or 0)
-        if proposed_progress > int(record.get("progress") or 0):
+        proposed_progress = parse_progress_percent(payload.get("progress"))
+        if proposed_progress > parse_progress_percent(record.get("progress")):
             updates["progress"] = proposed_progress
         proposed_status = payload.get("status") or ""
         if STATUS_RANK.get(proposed_status, 0) > STATUS_RANK.get(record.get("status") or "", 0):

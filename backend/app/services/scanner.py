@@ -42,6 +42,7 @@ from app.services.data_quality import (
     suggestion_fingerprint,
 )
 from app.services.ocr import enqueue_document_ocr, should_ocr_pdf
+from app.services.progress import parse_progress_percent
 
 
 SUPPORTED_EXTENSIONS = {".docx", ".doc", ".xlsx", ".xls", ".pdf", ".txt", ".md", ".wpsonline"}
@@ -1066,6 +1067,8 @@ def _apply_matched_suggestion(
         "deliverable": {"status", "owner", "planned_date", "submitted_date"},
     }[suggestion_type]
     updates = {key: value for key, value in proposed_updates.items() if key in allowed_updates}
+    if suggestion_type == "task" and "progress" in updates:
+        updates["progress"] = parse_progress_percent(updates["progress"], record["progress"] or 0)
     if updates:
         assignments = ", ".join(f"{key} = ?" for key in updates)
         conn.execute(
@@ -1124,7 +1127,7 @@ def apply_suggestion(suggestion_id: int) -> dict[str, Any]:
                     payload.get("color_status", "green"),
                     payload.get("start_date", ""),
                     payload.get("due_date", ""),
-                    int(payload.get("progress", 0) or 0),
+                    parse_progress_percent(payload.get("progress")),
                     payload.get("source", "智能建议"),
                     payload.get("source_document_id"),
                     now,
