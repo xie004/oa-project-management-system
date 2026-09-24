@@ -133,7 +133,13 @@ export default function TaskBoard({ api, tasks, onCreate, onPatch, onBulkPatch, 
   }, [focusedTaskId, tasks, pageSize]);
   const bulk = async value => {
     const ids = value ? addIds : removeIds;
-    if (!ids.length || busy || batchLock.current) return;
+    if (busy || batchLock.current) return;
+    if (!ids.length) {
+      setMessage(value
+        ? "所选任务已经全部进入甘特图，没有需要重复加入的任务。任务看板会保留记录，可将甘特图筛选切换为“未进甘特图”查看待加入任务。"
+        : "所选任务均未进入甘特图，没有需要移出的任务。");
+      return;
+    }
     batchLock.current = true; setLocalBusy(true); setMessage("");
     try {
       const result = await onBulkPatch(ids, { show_in_gantt: value ? 1 : 0 });
@@ -156,12 +162,17 @@ export default function TaskBoard({ api, tasks, onCreate, onPatch, onBulkPatch, 
   const renderTask = (task, compact = false) => <TaskRow key={task.id} task={task} compact={compact} selected={selected.includes(task.id)} onSelect={() => setSelected(s => s.includes(task.id) ? s.filter(id => id !== task.id) : [...s, task.id])} onPatch={onPatch} onPreview={onPreview} onEvidence={onEvidence} busy={!!actionStates?.[`patch-task-${task.id}`]} batchBusy={busy} />;
   return <div className="view-grid task-workspace">
     <section className="section tb-toolbar"><div className="tb-toolbar-head"><h2>任务管理</h2><div className="segmented" aria-label="任务范围">{[["official", "正式任务"], ["observation", "识别事项"], ["archived", "已归档"]].map(([value, label]) => <button key={value} disabled={busy} aria-pressed={scope === value} className={scope === value ? "active" : ""} onClick={() => setScope(value)}>{label} {counts[value]}</button>)}</div>{isAdmin && <button className="ghost-button" disabled={busy || reconcileStatus?.running || actionStates?.["reconcile-tasks"]} onClick={onReconcile}>{reconcileStatus?.running || actionStates?.["reconcile-tasks"] ? <span className="button-spinner" /> : null}重算任务进度</button>}</div>
-      <p className="tb-help">正式任务参与仪表盘统计；识别事项先关联或提升。进入甘特图只是显示设置，不会删除或归档任务。</p>
+      <div className="tb-scope-explainer">
+        {scope === "official" && <><strong>正式任务</strong><span>项目计划任务、人工新增任务和管理员确认提升的任务；参与仪表盘统计，可维护进度并选择是否进入甘特图。</span></>}
+        {scope === "observation" && <><strong>识别事项</strong><span>从周报、会议纪要或模型分析得到的候选和进度证据；默认不计入正式任务，需关联、提升或归档后完成治理。</span></>}
+        {scope === "archived" && <><strong>已归档</strong><span>误识别、重复合并或已退出当前管理范围的历史记录；不参与统计和甘特图，但保留来源与审计记录。</span></>}
+      </div>
+      <p className="tb-help">进入甘特图只是显示设置，不会删除、归档任务，也不会让任务从“全部任务”列表永久消失。</p>
       {reconcileStatus?.running && <div className="task-reconcile-progress" role="status"><span className="button-spinner" />后台重算 {reconcileStatus.progress || 0}/{reconcileStatus.total || 0}</div>}
       {scope !== "observation" && <>
         <div className="tb-filters"><label>搜索<input type="search" placeholder="任务名称、责任人、来源或编号" value={query} disabled={busy} onChange={e => setQuery(e.target.value)} /></label><label>执行状态<select value={status} disabled={busy} onChange={e => setStatus(e.target.value)}><option value="all">全部状态</option>{taskStatuses.map(([s, text]) => <option value={s} key={s}>{text}</option>)}</select></label><label>甘特图<select value={gantt} disabled={busy} onChange={e => { setGantt(e.target.value); setSelected([]); }}><option value="all">全部任务</option><option value="out">未进甘特图</option><option value="in">已进甘特图</option></select></label><label>排序<select value={sort} disabled={busy} onChange={e => setSort(e.target.value)}><option value="default">项目计划顺序</option><option value="due">截止日期优先</option><option value="updated">最近更新优先</option><option value="progress">进度从高到低</option></select></label><button className="ghost-button" disabled={busy} onClick={resetFilters}>清除筛选</button></div>
         <div className="tb-viewbar"><span>筛选结果 {filtered.length} / {counts[scope]} 条</span><div className="segmented" aria-label="任务显示方式"><button className={view === "list" ? "active" : ""} aria-pressed={view === "list"} disabled={busy} onClick={() => setView("list")}>任务列表</button><button className={view === "board" ? "active" : ""} aria-pressed={view === "board"} disabled={busy} onClick={() => setView("board")}>分组看板</button></div></div>
-        {scope === "official" && <div className="tb-bulk"><label><SelectBox checked={allSelected} mixed={!allSelected && pageIds.some(id => selected.includes(id))} disabled={busy || !pageIds.length} onChange={() => setSelected(s => togglePageSelection(s, pageIds))} />全选当前页（{pageIds.length}）</label><span>已选 {selected.length} 条</span><button className="ghost-button" disabled={busy || !selected.length} onClick={() => setSelected([])}>取消选择</button><button className="primary-button" disabled={busy || !addIds.length} onClick={() => bulk(true)}>{busy && <span className="button-spinner" />}批量进入甘特图（{addIds.length}）</button><button className="ghost-button" disabled={busy || !removeIds.length} onClick={() => bulk(false)}>{busy && <span className="button-spinner" />}批量移出甘特图（{removeIds.length}）</button><label title="加入成功后自动切换到未进甘特图列表；任务不会从系统删除"><input type="checkbox" checked={hideAdded} disabled={busy} onChange={e => setHideAdded(e.target.checked)} />加入后切换到“未进甘特图”</label>{selected.length > 0 && addIds.length === 0 && removeIds.length > 0 && <small className="tb-bulk-note">所选任务已全部在甘特图中；任务看板会保留记录。</small>}</div>}
+        {scope === "official" && <div className="tb-bulk"><label><SelectBox checked={allSelected} mixed={!allSelected && pageIds.some(id => selected.includes(id))} disabled={busy || !pageIds.length} onChange={() => setSelected(s => togglePageSelection(s, pageIds))} />全选当前页（{pageIds.length}）</label><span>已选 {selected.length} 条</span><button className="ghost-button" disabled={busy || !selected.length} onClick={() => setSelected([])}>取消选择</button><button className="primary-button" disabled={busy || !selected.length} onClick={() => bulk(true)}>{busy && <span className="button-spinner" />}批量进入甘特图（{addIds.length}）</button><button className="ghost-button" disabled={busy || !selected.length} onClick={() => bulk(false)}>{busy && <span className="button-spinner" />}批量移出甘特图（{removeIds.length}）</button><label title="加入成功后自动切换到未进甘特图列表；任务不会从系统删除"><input type="checkbox" checked={hideAdded} disabled={busy} onChange={e => setHideAdded(e.target.checked)} />加入后切换到“未进甘特图”</label><small className="tb-bulk-note">括号中的数字是本次实际可处理数量；显示 0 时点击会说明原因。</small>{selected.length > 0 && addIds.length === 0 && removeIds.length > 0 && <small className="tb-bulk-note">所选任务已全部在甘特图中；任务看板会保留记录。</small>}</div>}
         {message && <div className="tb-result" role="status">{message}</div>}
       </>}
     </section>

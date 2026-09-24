@@ -109,6 +109,7 @@ export default function ObservationInbox({ api, tasks, isAdmin, onChanged, onPre
   return <section className="section observation-inbox">
     <div className="observation-toolbar"><h2>识别事项收件箱</h2><button className="ghost-button" disabled={loading} onClick={refresh}>{loading && <span className="button-spinner" />}刷新</button></div>
     <p className="muted">待处理 {data.pendingGroups || 0} 组 / {data.pendingRecords || 0} 条原始记录。优先关联已有任务；只有确认新增才增加正式任务总数。</p>
+    {!isAdmin && <div className="observation-readonly"><strong>当前为普通用户只读模式</strong><span>可查看识别内容、原始记录和来源依据。请点击左下角“管理员登录”，登录后可关联已有任务、提升为正式任务、转为风险/变更/交付物建议或忽略归档。</span></div>}
     <div className="observation-toolbar" role="group" aria-label="识别事项分类">
       {Object.entries(categories).map(([key, label]) => <button key={key} className={category === key ? "primary-button" : "ghost-button"} onClick={() => chooseCategory(key)}>{label} {key === "all" ? data.pendingGroups || 0 : data.counts[key] || 0}</button>)}
     </div>

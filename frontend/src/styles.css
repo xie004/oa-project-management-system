@@ -381,6 +381,31 @@ input[type="checkbox"] {
 .tb-bulk label, .tb-gantt label { display: inline-flex; align-items: center; gap: 8px; cursor: pointer; }
 .tb-bulk label { min-height: 32px; }
 .tb-bulk-note { color: var(--muted); line-height: 1.4; }
+
+.tb-scope-explainer,
+.observation-readonly {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-alt);
+  color: var(--muted);
+  line-height: 1.55;
+}
+
+.tb-scope-explainer strong,
+.observation-readonly strong {
+  flex: 0 0 auto;
+  color: var(--text);
+}
+
+.observation-readonly {
+  margin: 10px 0;
+  border-color: #bfdbfe;
+  background: var(--blue-soft);
+}
 .tb-result { margin-top: 12px; padding: 12px; background: #f0f7ff; border-left: 3px solid var(--blue); line-height: 1.6; }
 .tb-create summary { cursor: pointer; color: var(--blue); font-weight: 600; }
 .tb-create[open] summary { margin-bottom: 14px; }
