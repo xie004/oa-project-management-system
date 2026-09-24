@@ -7,7 +7,21 @@ from typing import Any
 
 def parse_progress_percent(value: Any, default: int = 0) -> int:
     """Convert common report progress formats to an integer percentage."""
-    fallback = max(0, min(100, int(default or 0)))
+    def normalized_fallback(raw: Any) -> int:
+        if isinstance(raw, bool) or raw is None:
+            return 0
+        if isinstance(raw, (int, float)):
+            if not math.isfinite(float(raw)):
+                return 0
+            return max(0, min(100, int(round(float(raw)))))
+        text = str(raw).strip()
+        ratio = re.search(r"(-?\d+(?:\.\d+)?)\s*/\s*(-?\d+(?:\.\d+)?)\s*\+?", text)
+        if ratio and float(ratio.group(2)) > 0:
+            return max(0, min(100, int(round(float(ratio.group(1)) / float(ratio.group(2)) * 100))))
+        number = re.search(r"-?\d+(?:\.\d+)?", text.replace(",", ""))
+        return max(0, min(100, int(round(float(number.group(0)))))) if number else 0
+
+    fallback = normalized_fallback(default)
     if value is None or isinstance(value, bool):
         return fallback
 

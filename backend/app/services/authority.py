@@ -84,9 +84,21 @@ def authority_weight(level: int | str | None) -> float:
 
 
 def question_scope(question: str) -> str:
+    text = question or ""
+    current_markers = ["最新", "当前", "目前", "现在", "本周", "上周", "截至", "进展", "完成情况"]
+    progress_markers = ["进度", "进展", "完成", "做到哪", "情况"]
+    if any(marker in text for marker in current_markers) and any(marker in text for marker in progress_markers):
+        return "progress"
+    if any(marker in text for marker in ["进展", "当前进度", "最新进度", "本周完成", "做到哪"]):
+        return "progress"
     for scope, terms in KEY_AUTHORITY_TERMS.items():
-        if any(term in question for term in terms):
+        if scope == "progress":
+            continue
+        scoped_terms = [term for term in terms if not (scope == "schedule" and term == "进度")]
+        if any(term in question for term in scoped_terms):
             return scope
+    if "进度" in text or "完成" in text:
+        return "progress"
     return "general"
 
 

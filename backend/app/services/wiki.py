@@ -7,7 +7,7 @@ from datetime import datetime
 from typing import Any
 
 from app.database import get_connection, get_setting, now_iso, row_to_dict, rows_to_dicts
-from app.services.authority import authority_label
+from app.services.authority import authority_label, question_scope
 from app.services.ai import chat_completion
 from app.services.extractors import compact_text
 from app.services.ocr import combined_ocr_text
@@ -109,6 +109,8 @@ BASELINE_SOURCE = {
 }
 
 _wiki_job_lock = threading.Lock()
+_queued_wiki_pages: set[str] = set()
+_queued_wiki_triggers: list[str] = []
 _wiki_job = {
     "running": False,
     "progress": 0,
@@ -118,10 +120,35 @@ _wiki_job = {
     "fallbackCount": 0,
     "currentPage": "",
     "generationId": "",
+    "trigger": "manual",
+    "pageKey": "",
+    "autoPublished": False,
+    "autoPublishReason": "",
+    "sourceCutoffDate": "",
+    "latestAvailableDate": "",
     "error": "",
     "startedAt": "",
     "finishedAt": "",
 }
+
+
+WIKI_CATEGORY_PAGES = {
+    "weekly_report": ["current_progress", "risks_coordination"],
+    "meeting": ["meeting_decisions", "current_progress", "risks_coordination", "change_requests"],
+    "resource": ["resources_deployment", "risks_coordination"],
+    "contract_tender": ["overview", "goals_scope", "plan_milestones", "deliverables_acceptance"],
+    "requirement_change": ["goals_scope", "change_requests", "deliverables_acceptance", "resources_deployment"],
+    "acceptance_launch": ["deliverables_acceptance", "current_progress", "plan_milestones"],
+    "other": ["overview"],
+}
+
+
+def wiki_pages_for_category(category: str, include_deliverables: bool = False) -> list[str]:
+    pages = list(WIKI_CATEGORY_PAGES.get(category, WIKI_CATEGORY_PAGES["other"]))
+    if include_deliverables and "deliverables_acceptance" not in pages:
+        pages.append("deliverables_acceptance")
+    order = {key: index for index, (key, _) in enumerate(WIKI_PAGES)}
+    return sorted(set(pages), key=lambda key: order.get(key, len(order)))
 
 
 def _set_job(**patch) -> None:
@@ -159,12 +186,21 @@ def list_wiki_pages() -> list[dict[str, Any]]:
     conn = get_connection()
     try:
         ensure_wiki_pages(conn)
+        latest_progress_date = _latest_weekly_cutoff_date(conn)
         rows = rows_to_dicts(conn.execute("SELECT * FROM wiki_pages ORDER BY id").fetchall())
         for row in rows:
             try:
                 row["sources"] = json.loads(row.pop("source_json") or "[]")
             except Exception:
                 row["sources"] = []
+            row["latestAvailableDate"] = latest_progress_date if row["page_key"] == "current_progress" else ""
+            row["sourceCutoffDate"] = row.get("source_cutoff_date") or ""
+            row["publishMode"] = row.get("publish_mode") or "manual"
+            row["isStale"] = bool(
+                row["page_key"] == "current_progress"
+                and latest_progress_date
+                and (not row["sourceCutoffDate"] or row["sourceCutoffDate"] < latest_progress_date)
+            )
         return rows
     finally:
         conn.close()
@@ -285,11 +321,12 @@ def _load_documents_for_wiki(conn) -> list[dict[str, Any]]:
     rows = rows_to_dicts(
         conn.execute(
             """
-            SELECT *
-            FROM documents
-            WHERE is_current = 1
-              AND (status = 'indexed' OR ocr_status IN ('completed', 'partial'))
-            ORDER BY authority_level, authority_score DESC, modified_at DESC, id DESC
+            SELECT d.*, COALESCE(w.period_end, d.effective_date, substr(d.modified_at, 1, 10)) AS source_cutoff_date
+            FROM documents d
+            LEFT JOIN weekly_reports w ON w.document_id = d.id
+            WHERE d.is_current = 1
+              AND (d.status = 'indexed' OR d.ocr_status IN ('completed', 'partial'))
+            ORDER BY d.authority_level, d.authority_score DESC, d.modified_at DESC, d.id DESC
             """
         ).fetchall()
     )
@@ -351,13 +388,38 @@ def _source_payload(doc: dict[str, Any], snippet: str, primary: bool, note: str 
         "authorityLabel": source_labels.get(source_type, authority_label(level)),
         "authorityScore": float(doc.get("authority_score") or 45),
         "isPrimaryBasis": primary,
+        "sourceCutoffDate": _source_cutoff_date(doc),
         "snippet": compact_text(snippet, 260),
         "note": note,
     }
 
 
+def _source_cutoff_date(doc: dict[str, Any]) -> str:
+    return str(
+        doc.get("source_cutoff_date")
+        or doc.get("period_end")
+        or doc.get("effective_date")
+        or str(doc.get("modified_at") or "")[:10]
+        or ""
+    )[:10]
+
+
+def _latest_weekly_cutoff_date(conn) -> str:
+    row = conn.execute(
+        """
+        SELECT MAX(COALESCE(w.period_end, d.effective_date, substr(d.modified_at, 1, 10))) AS cutoff_date
+        FROM documents d
+        LEFT JOIN weekly_reports w ON w.document_id = d.id
+        WHERE d.is_current = 1
+          AND d.doc_category = 'weekly_report'
+          AND d.status = 'indexed'
+        """
+    ).fetchone()
+    return str(row["cutoff_date"] or "")[:10] if row else ""
+
+
 def _document_date_value(doc: dict[str, Any]) -> int:
-    text = f"{doc.get('name', '')} {doc.get('effective_date', '')} {doc.get('modified_at', '')}"
+    text = f"{doc.get('name', '')} {_source_cutoff_date(doc)} {doc.get('modified_at', '')}"
     matches = re.findall(r"(20\d{2})[-_.年]?([01]\d)[-_.月]?([0-3]\d)", text)
     if not matches:
         return 0
@@ -392,6 +454,28 @@ def _select_page_sources(conn, docs: list[dict[str, Any]], page_key: str) -> tup
     candidates = [baseline, *docs]
     allowed = set(strategy["primary"] + strategy["secondary"])
     eligible = [doc for doc in candidates if (doc.get("source_type") or _source_type(doc)) in allowed]
+    if page_key == "current_progress":
+        weekly_docs = sorted(
+            [doc for doc in eligible if (doc.get("source_type") or _source_type(doc)) == "weekly_report"],
+            key=_document_date_value,
+            reverse=True,
+        )
+        primary = weekly_docs[:3]
+        supporting = sorted(
+            [
+                doc for doc in eligible
+                if doc not in primary and (doc.get("source_type") or _source_type(doc)) in {"meeting", "acceptance_launch"}
+            ],
+            key=_document_date_value,
+            reverse=True,
+        )
+        if len(primary) < 3:
+            primary.extend(supporting[: 3 - len(primary)])
+            supporting = [doc for doc in supporting if doc not in primary]
+        warnings = []
+        if not weekly_docs:
+            warnings.append("尚未找到可索引的项目周报，当前进度无法按周报自动发布。")
+        return primary, supporting[:2], warnings
     dated = sorted(
         [doc for doc in eligible if _document_date_value(doc)],
         key=_document_date_value,
@@ -533,18 +617,26 @@ def _load_wiki_materials() -> list[dict[str, Any]]:
         conn.close()
 
 
-def _replace_pending_wiki_suggestions(items: list[dict[str, Any]]) -> None:
+def _replace_pending_wiki_suggestions(items: list[dict[str, Any]], page_keys: list[str] | None = None) -> dict[str, int]:
     conn = get_connection()
     try:
-        conn.execute("DELETE FROM wiki_suggestions WHERE status = 'pending'")
-        for item in items:
+        target_keys = page_keys or [item["page_key"] for item in items]
+        if target_keys:
+            placeholders = ", ".join("?" for _ in target_keys)
             conn.execute(
+                f"DELETE FROM wiki_suggestions WHERE status = 'pending' AND page_key IN ({placeholders})",
+                target_keys,
+            )
+        inserted: dict[str, int] = {}
+        for item in items:
+            cursor = conn.execute(
                 """
                 INSERT INTO wiki_suggestions(
                     page_key, title, content, source_json, generation_mode,
-                    generation_error, strategy_json, generation_id, status, created_at
+                    generation_error, strategy_json, generation_id, source_cutoff_date,
+                    status, created_at
                 )
-                VALUES(?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
                 """,
                 (
                     item["page_key"],
@@ -555,10 +647,13 @@ def _replace_pending_wiki_suggestions(items: list[dict[str, Any]]) -> None:
                     item.get("generation_error") or "",
                     json.dumps(item.get("strategy") or {}, ensure_ascii=False),
                     item.get("generation_id") or "",
+                    item.get("source_cutoff_date") or "",
                     item["created_at"],
                 ),
             )
+            inserted[item["page_key"]] = int(cursor.lastrowid)
         conn.commit()
+        return inserted
     except Exception:
         conn.rollback()
         raise
@@ -689,6 +784,7 @@ def _generate_one_suggestion(page_key: str, title: str, docs: list[dict[str, Any
     finally:
         conn.close()
     selected = [*primary, *secondary]
+    source_cutoff_date = max((_source_cutoff_date(doc) for doc in selected), default="")
     fallback_content, fallback_sources = _fallback_from_selected(title, page_key, primary, secondary, warnings)
     strategy = {
         "primaryCount": len(primary),
@@ -696,6 +792,7 @@ def _generate_one_suggestion(page_key: str, title: str, docs: list[dict[str, Any
         "highAuthorityCount": sum(1 for doc in primary if int(doc.get("authority_level") or 5) <= 2),
         "primarySources": [doc.get("name") for doc in primary],
         "secondarySources": [doc.get("name") for doc in secondary],
+        "sourceCutoffDate": source_cutoff_date,
         "warnings": warnings,
     }
     item = {
@@ -706,6 +803,7 @@ def _generate_one_suggestion(page_key: str, title: str, docs: list[dict[str, Any
         "generation_mode": "rules",
         "generation_error": "",
         "generation_id": generation_id,
+        "source_cutoff_date": source_cutoff_date,
         "created_at": now_iso(),
         "strategy": strategy,
     }
@@ -763,16 +861,116 @@ def _generate_one_suggestion(page_key: str, title: str, docs: list[dict[str, Any
     return item
 
 
+def _latest_progress_source_ids(conn) -> tuple[str, set[int]]:
+    rows = conn.execute(
+        """
+        SELECT d.id, COALESCE(w.period_end, d.effective_date, substr(d.modified_at, 1, 10)) AS cutoff_date
+        FROM documents d
+        LEFT JOIN weekly_reports w ON w.document_id = d.id
+        WHERE d.is_current = 1 AND d.doc_category = 'weekly_report' AND d.status = 'indexed'
+        ORDER BY cutoff_date DESC, d.id DESC
+        LIMIT 3
+        """
+    ).fetchall()
+    return (str(rows[0]["cutoff_date"] or "")[:10] if rows else "", {int(row["id"]) for row in rows})
+
+
+def _current_progress_auto_publishable(item: dict[str, Any]) -> tuple[bool, str, str]:
+    if item.get("page_key") != "current_progress":
+        return False, "仅当前进度页面允许自动发布。", ""
+    if not str(item.get("generation_mode") or "").startswith("llm") or item.get("generation_error"):
+        return False, "当前进度未获得可校验的大模型结果，保留待确认。", ""
+    conn = get_connection()
+    try:
+        latest_date, latest_ids = _latest_progress_source_ids(conn)
+        existing = conn.execute(
+            "SELECT source_cutoff_date FROM wiki_pages WHERE page_key = 'current_progress'"
+        ).fetchone()
+    finally:
+        conn.close()
+    source_ids = {int(source["documentId"]) for source in item.get("sources", []) if source.get("documentId")}
+    cutoff = str(item.get("source_cutoff_date") or "")[:10]
+    if not latest_date or not latest_ids:
+        return False, "没有可用的已索引周报，保留待确认。", latest_date
+    if not cutoff or cutoff < latest_date or not (source_ids & latest_ids):
+        return False, "生成结果未包含最新周报，保留待确认。", latest_date
+    if existing and (existing["source_cutoff_date"] or "") > cutoff:
+        return False, "现有当前进度的资料截止日期更晚，拒绝回退。", latest_date
+    return True, "最新周报已成功索引，LLM 结果通过来源与日期校验。", latest_date
+
+
+def _apply_wiki_suggestion_record(
+    conn,
+    suggestion: dict[str, Any],
+    apply_mode: str,
+    auto_apply_reason: str = "",
+    mark_suggestion: bool = True,
+) -> None:
+    now = now_iso()
+    latest_available = _latest_weekly_cutoff_date(conn) if suggestion["page_key"] == "current_progress" else ""
+    conn.execute(
+        """
+        INSERT INTO wiki_pages(
+            page_key, title, content, source_json, status, source_cutoff_date,
+            latest_available_date, publish_mode, generation_id, published_suggestion_id, updated_at
+        )
+        VALUES(?, ?, ?, ?, 'published', ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(page_key) DO UPDATE SET
+            title = excluded.title,
+            content = excluded.content,
+            source_json = excluded.source_json,
+            status = 'published',
+            source_cutoff_date = excluded.source_cutoff_date,
+            latest_available_date = excluded.latest_available_date,
+            publish_mode = excluded.publish_mode,
+            generation_id = excluded.generation_id,
+            published_suggestion_id = excluded.published_suggestion_id,
+            updated_at = excluded.updated_at
+        """,
+        (
+            suggestion["page_key"], suggestion["title"], suggestion["content"], suggestion["source_json"],
+            suggestion.get("source_cutoff_date") or "", latest_available, apply_mode,
+            suggestion.get("generation_id") or "", suggestion["id"], now,
+        ),
+    )
+    if mark_suggestion:
+        conn.execute(
+            """
+            UPDATE wiki_suggestions
+            SET status = 'applied', applied_at = ?, apply_mode = ?, auto_apply_reason = ?
+            WHERE id = ?
+            """,
+            (now, apply_mode, auto_apply_reason, suggestion["id"]),
+        )
+
+
+def _store_items_and_auto_publish(items: list[dict[str, Any]], page_keys: list[str] | None = None) -> dict[str, Any]:
+    inserted = _replace_pending_wiki_suggestions(items, page_keys)
+    current_item = next((item for item in items if item["page_key"] == "current_progress"), None)
+    if not current_item or "current_progress" not in inserted:
+        return {"autoPublished": False, "autoPublishReason": "本轮未生成当前进度页面。", "sourceCutoffDate": ""}
+    allowed, reason, latest_date = _current_progress_auto_publishable(current_item)
+    if not allowed:
+        return {"autoPublished": False, "autoPublishReason": reason, "sourceCutoffDate": latest_date}
+    result = apply_wiki_suggestion(inserted["current_progress"], apply_mode="auto", auto_apply_reason=reason)
+    return {
+        "autoPublished": bool(result.get("ok")),
+        "autoPublishReason": reason if result.get("ok") else result.get("message", reason),
+        "sourceCutoffDate": latest_date,
+    }
+
+
 def rebuild_wiki_suggestions() -> dict[str, Any]:
     docs = _load_wiki_materials()
     generation_id = now_iso()
     items = [_generate_one_suggestion(page_key, title, docs, generation_id) for page_key, title in WIKI_PAGES]
-    _replace_pending_wiki_suggestions(items)
+    auto_result = _store_items_and_auto_publish(items)
     return {
         "ok": True,
         "created": len(items),
         "modelSucceeded": sum(1 for item in items if item["generation_mode"].startswith("llm")),
         "fallbackCount": sum(1 for item in items if item["generation_mode"] == "rules"),
+        **auto_result,
     }
 
 
@@ -781,39 +979,133 @@ def _wiki_worker() -> None:
     _set_job(
         running=True, progress=0, total=len(WIKI_PAGES), created=0,
         modelSucceeded=0, fallbackCount=0, currentPage="", generationId=generation_id,
-        error="", startedAt=now_iso(), finishedAt=""
+        trigger="manual", pageKey="", autoPublished=False, autoPublishReason="", sourceCutoffDate="",
+        latestAvailableDate="", error="", startedAt=now_iso(), finishedAt=""
     )
     try:
         docs = _load_wiki_materials()
         items = []
         for index, (page_key, title) in enumerate(WIKI_PAGES, start=1):
-            _set_job(currentPage=title)
+            _set_job(currentPage=title, pageKey=page_key)
             item = _generate_one_suggestion(page_key, title, docs, generation_id)
             items.append(item)
-            model_succeeded = sum(1 for value in items if value["generation_mode"].startswith("llm"))
-            fallback_count = sum(1 for value in items if value["generation_mode"] == "rules")
             _set_job(
                 progress=index,
                 created=len(items),
-                modelSucceeded=model_succeeded,
-                fallbackCount=fallback_count,
+                modelSucceeded=sum(1 for value in items if value["generation_mode"].startswith("llm")),
+                fallbackCount=sum(1 for value in items if value["generation_mode"] == "rules"),
             )
-        _replace_pending_wiki_suggestions(items)
-        _set_job(running=False, currentPage="", finishedAt=now_iso())
+        auto_result = _store_items_and_auto_publish(items)
+        _set_job(running=False, currentPage="", pageKey="", finishedAt=now_iso(), **auto_result)
     except Exception as exc:
-        _set_job(running=False, currentPage="", error=str(exc), finishedAt=now_iso())
+        _set_job(running=False, currentPage="", pageKey="", error=str(exc), finishedAt=now_iso())
+    _launch_queued_wiki_refresh()
+
+
+def _current_progress_worker(trigger: str) -> None:
+    generation_id = now_iso()
+    _set_job(
+        running=True, progress=0, total=1, created=0, modelSucceeded=0, fallbackCount=0,
+        currentPage="当前进度", generationId=generation_id, trigger=trigger, pageKey="current_progress",
+        autoPublished=False, autoPublishReason="", sourceCutoffDate="", latestAvailableDate="",
+        error="", startedAt=now_iso(), finishedAt="",
+    )
+    try:
+        docs = _load_wiki_materials()
+        item = _generate_one_suggestion("current_progress", "当前进度", docs, generation_id)
+        auto_result = _store_items_and_auto_publish([item], ["current_progress"])
+        _set_job(
+            running=False, progress=1, created=1,
+            modelSucceeded=int(item["generation_mode"].startswith("llm")),
+            fallbackCount=int(item["generation_mode"] == "rules"), currentPage="", pageKey="",
+            finishedAt=now_iso(), **auto_result,
+        )
+    except Exception as exc:
+        _set_job(running=False, currentPage="", pageKey="", error=str(exc), finishedAt=now_iso())
+    _launch_queued_wiki_refresh()
+
+
+def _targeted_wiki_worker(page_keys: list[str], trigger: str) -> None:
+    generation_id = now_iso()
+    page_titles = {key: title for key, title in WIKI_PAGES}
+    _set_job(
+        running=True, progress=0, total=len(page_keys), created=0, modelSucceeded=0, fallbackCount=0,
+        currentPage="", generationId=generation_id, trigger=trigger, pageKey="",
+        autoPublished=False, autoPublishReason="", sourceCutoffDate="", latestAvailableDate="",
+        error="", startedAt=now_iso(), finishedAt="",
+    )
+    try:
+        docs = _load_wiki_materials()
+        items = []
+        for index, page_key in enumerate(page_keys, start=1):
+            title = page_titles[page_key]
+            _set_job(currentPage=title, pageKey=page_key)
+            item = _generate_one_suggestion(page_key, title, docs, generation_id)
+            items.append(item)
+            _set_job(
+                progress=index,
+                created=len(items),
+                modelSucceeded=sum(1 for value in items if value["generation_mode"].startswith("llm")),
+                fallbackCount=sum(1 for value in items if value["generation_mode"] == "rules"),
+            )
+        auto_result = _store_items_and_auto_publish(items, page_keys)
+        _set_job(running=False, currentPage="", pageKey="", finishedAt=now_iso(), **auto_result)
+    except Exception as exc:
+        _set_job(running=False, currentPage="", pageKey="", error=str(exc), finishedAt=now_iso())
+    _launch_queued_wiki_refresh()
+
+
+def _launch_queued_wiki_refresh() -> None:
+    with _wiki_job_lock:
+        if _wiki_job["running"] or not _queued_wiki_pages:
+            return
+        page_keys = [key for key, _ in WIKI_PAGES if key in _queued_wiki_pages]
+        trigger = ",".join(_queued_wiki_triggers[-3:]) or "document_upload"
+        _queued_wiki_pages.clear()
+        _queued_wiki_triggers.clear()
+        _wiki_job.update(
+            running=True, progress=0, total=len(page_keys), trigger=trigger,
+            pageKey=page_keys[0] if len(page_keys) == 1 else "", error="",
+            startedAt=now_iso(), finishedAt="",
+        )
+    threading.Thread(target=_targeted_wiki_worker, args=(page_keys, trigger), daemon=True).start()
+
+
+def queue_wiki_refresh(
+    category: str,
+    trigger: str = "document_upload",
+    include_deliverables: bool = False,
+) -> dict[str, Any]:
+    page_keys = wiki_pages_for_category(category, include_deliverables)
+    with _wiki_job_lock:
+        _queued_wiki_pages.update(page_keys)
+        _queued_wiki_triggers.append(trigger)
+        already_running = bool(_wiki_job["running"])
+    _launch_queued_wiki_refresh()
+    return {
+        "ok": True,
+        "queued": True,
+        "alreadyRunning": already_running,
+        "pageKeys": page_keys,
+    }
 
 
 def start_wiki_rebuild_job() -> dict[str, Any]:
     with _wiki_job_lock:
         if _wiki_job["running"]:
             return {"ok": True, "alreadyRunning": True, **dict(_wiki_job)}
-    _set_job(
-        running=True, progress=0, total=len(WIKI_PAGES), created=0,
-        modelSucceeded=0, fallbackCount=0, currentPage="", error="",
-        startedAt=now_iso(), finishedAt=""
-    )
+    _set_job(running=True, trigger="manual", pageKey="", error="", startedAt=now_iso(), finishedAt="")
     thread = threading.Thread(target=_wiki_worker, daemon=True)
+    thread.start()
+    return {"ok": True, "started": True, **wiki_job_status()}
+
+
+def start_current_progress_refresh_job(trigger: str = "manual") -> dict[str, Any]:
+    with _wiki_job_lock:
+        if _wiki_job["running"]:
+            return {"ok": True, "alreadyRunning": True, **dict(_wiki_job)}
+    _set_job(running=True, trigger=trigger, pageKey="current_progress", error="", startedAt=now_iso(), finishedAt="")
+    thread = threading.Thread(target=_current_progress_worker, args=(trigger,), daemon=True)
     thread.start()
     return {"ok": True, "started": True, **wiki_job_status()}
 
@@ -841,7 +1133,11 @@ def list_wiki_suggestions(status: str = "pending") -> list[dict[str, Any]]:
         conn.close()
 
 
-def apply_wiki_suggestion(suggestion_id: int) -> dict[str, Any]:
+def apply_wiki_suggestion(
+    suggestion_id: int,
+    apply_mode: str = "manual",
+    auto_apply_reason: str = "",
+) -> dict[str, Any]:
     conn = get_connection()
     try:
         suggestion = row_to_dict(conn.execute("SELECT * FROM wiki_suggestions WHERE id = ?", (suggestion_id,)).fetchone())
@@ -849,23 +1145,9 @@ def apply_wiki_suggestion(suggestion_id: int) -> dict[str, Any]:
             return {"ok": False, "message": "Wiki 建议不存在"}
         if suggestion["status"] != "pending":
             return {"ok": False, "message": "该 Wiki 建议不是待确认状态"}
-        now = now_iso()
-        conn.execute(
-            """
-            INSERT INTO wiki_pages(page_key, title, content, source_json, status, updated_at)
-            VALUES(?, ?, ?, ?, 'published', ?)
-            ON CONFLICT(page_key) DO UPDATE SET
-                title = excluded.title,
-                content = excluded.content,
-                source_json = excluded.source_json,
-                status = 'published',
-                updated_at = excluded.updated_at
-            """,
-            (suggestion["page_key"], suggestion["title"], suggestion["content"], suggestion["source_json"], now),
-        )
-        conn.execute("UPDATE wiki_suggestions SET status = 'applied', applied_at = ? WHERE id = ?", (now, suggestion_id))
+        _apply_wiki_suggestion_record(conn, suggestion, apply_mode, auto_apply_reason)
         conn.commit()
-        return {"ok": True}
+        return {"ok": True, "applyMode": apply_mode, "sourceCutoffDate": suggestion.get("source_cutoff_date") or ""}
     except Exception as exc:
         conn.rollback()
         return {"ok": False, "message": str(exc)}
@@ -894,6 +1176,54 @@ def apply_all_wiki_suggestions() -> dict[str, Any]:
         else:
             failed.append({"id": suggestion_id, "message": result.get("message", "应用失败")})
     return {"ok": not failed, "applied": applied, "failed": failed, "total": len(ids)}
+
+
+def list_wiki_page_history(page_key: str) -> list[dict[str, Any]]:
+    conn = get_connection()
+    try:
+        rows = rows_to_dicts(
+            conn.execute(
+                """
+                SELECT id, page_key, title, source_json, source_cutoff_date, apply_mode,
+                       auto_apply_reason, created_at, applied_at, generation_mode
+                FROM wiki_suggestions
+                WHERE page_key = ? AND status = 'applied'
+                ORDER BY applied_at DESC, id DESC
+                """,
+                (page_key,),
+            ).fetchall()
+        )
+        for row in rows:
+            try:
+                row["sources"] = json.loads(row.pop("source_json") or "[]")
+            except Exception:
+                row["sources"] = []
+        return rows
+    finally:
+        conn.close()
+
+
+def rollback_wiki_page(page_key: str, suggestion_id: int) -> dict[str, Any]:
+    conn = get_connection()
+    try:
+        suggestion = row_to_dict(
+            conn.execute(
+                "SELECT * FROM wiki_suggestions WHERE id = ? AND page_key = ? AND status = 'applied'",
+                (suggestion_id, page_key),
+            ).fetchone()
+        )
+        if not suggestion:
+            return {"ok": False, "message": "未找到可恢复的 Wiki 历史版本。"}
+        _apply_wiki_suggestion_record(
+            conn, suggestion, "rollback", f"恢复到历史版本 #{suggestion_id}", mark_suggestion=False
+        )
+        conn.commit()
+        return {"ok": True, "sourceCutoffDate": suggestion.get("source_cutoff_date") or ""}
+    except Exception as exc:
+        conn.rollback()
+        return {"ok": False, "message": str(exc)}
+    finally:
+        conn.close()
 
 
 def _dedupe(values: list[str]) -> list[str]:
@@ -1184,7 +1514,8 @@ Wiki 资料：
                 {"role": "system", "content": "你是项目知识库问答助手，只输出 JSON。"},
                 {"role": "user", "content": prompt},
             ],
-            max_tokens=1000,
+            max_tokens=800 if question_scope(question) == "progress" else 1000,
+            disable_thinking=True,
         )
         data = _parse_json_object(answer)
     except Exception as exc:

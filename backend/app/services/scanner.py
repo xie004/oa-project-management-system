@@ -41,8 +41,15 @@ from app.services.data_quality import (
     prepare_candidate,
     suggestion_fingerprint,
 )
-from app.services.ocr import enqueue_document_ocr, should_ocr_pdf
+from app.services.ocr import enqueue_document_ocr, ocr_skip_reason, worker
 from app.services.progress import parse_progress_percent
+from app.services.task_matching import safe_match as safe_task_match
+from app.services.task_recognition import (
+    analyze_task_candidates,
+    evidence_in_source,
+    save_recognition_report,
+    semantic_batches,
+)
 
 
 SUPPORTED_EXTENSIONS = {".docx", ".doc", ".xlsx", ".xls", ".pdf", ".txt", ".md", ".wpsonline"}
@@ -347,46 +354,7 @@ def save_weekly_report(conn: sqlite3.Connection, document_id: int, text: str, fi
         ),
     )
 
-    for line in bullet_lines(parsed["next_plan_text"], 8):
-        create_suggestion(
-            conn,
-            document_id,
-            "task",
-            line,
-            f"从周报“下周工作计划”识别到的任务：{line}",
-            {
-                "title": line,
-                "description": f"来源：{filename}\n{line}",
-                "status": "not_started",
-                "priority": "medium",
-                "color_status": "green",
-                "progress": 0,
-                "source": "周报自动识别",
-            },
-            0.76,
-            locator="周报/下周工作计划",
-            evidence_text=line,
-        )
-
-    for line in bullet_lines(parsed["progress_text"], 10):
-        if any(word in line for word in ["完成", "已完成", "确认", "敲定"]):
-            create_suggestion(
-                conn,
-                document_id,
-                "milestone",
-                line,
-                f"从周报“本周工作进展”识别到的完成/阶段性成果：{line}",
-                {
-                    "title": line,
-                    "description": f"来源：{filename}\n{line}",
-                    "status": "completed",
-                    "color_status": "green",
-                    "actual_date": parsed["period_end"],
-                },
-                0.7,
-                locator="周报/本周工作进展",
-                evidence_text=line,
-            )
+    # Task plans and progress are handled by the unified accuracy-first candidate pool.
 
     risk_items: list[dict[str, str]] = []
     for line in bullet_lines(parsed["risk_text"], 8):
@@ -451,28 +419,7 @@ def save_meeting(conn: sqlite3.Connection, document_id: int, text: str, filename
         ),
     )
 
-    for line in bullet_lines(parsed["decisions"], 12):
-        if not any(word in line for word in ["需", "请", "负责", "完成", "提供", "确认", "组织", "推进", "跟进", "提交", "梳理", "配置", "申请", "发送", "开展", "落实", "安排"]):
-            continue
-        create_suggestion(
-            conn,
-            document_id,
-            "task",
-            line,
-            f"从会议决议识别到的待办或阶段事项：{line}",
-            {
-                "title": line,
-                "description": f"会议：{parsed['title']}\n{line}",
-                "status": "not_started",
-                "priority": "high" if any(word in line for word in ["尽快", "次日", "按期", "上线"]) else "medium",
-                "color_status": "amber" if any(word in line for word in ["尽快", "按期", "上线"]) else "green",
-                "progress": 0,
-                "source": "会议纪要自动识别",
-            },
-            0.78,
-            locator="会议纪要/决议",
-            evidence_text=line,
-        )
+    # Meeting tasks are handled by the unified accuracy-first candidate pool.
 
     text_for_changes = f"{parsed['topics']}\n{parsed['decisions']}"
     for line in bullet_lines(text_for_changes, 12):
@@ -589,105 +536,113 @@ def test_structured_extraction() -> dict[str, Any]:
     }
 
 
-def save_ai_analysis_suggestions(conn: sqlite3.Connection, document_id: int, text: str, filename: str, category: str) -> None:
-    config = ai_config()
-    if not config.get("enabled"):
-        conn.execute(
-            "UPDATE documents SET analysis_status = 'not_analyzed', analysis_error = '' WHERE id = ?",
-            (document_id,),
-        )
-        return
-    conn.execute(
-        "UPDATE documents SET analysis_status = 'analyzing', analysis_error = '' WHERE id = ?",
-        (document_id,),
-    )
-    answer = ""
-    repaired = ""
-    try:
-        allowed_types = AI_TYPE_ALLOWLIST.get(category, AI_TYPE_ALLOWLIST["other"])
-        prompt = f"""
-请基于以下项目文件内容，识别可能需要更新到项目管理系统的事项。
-只返回 JSON 数组，每项必须包含 type、title、description、confidence、evidence、locator，
-可选包含 owner、status、progress、due_date、planned_date、actual_date、level、mitigation。
-type 只能是：{', '.join(sorted(allowed_types))}。
-title 必须是可独立管理的项目事项，禁止输出页码、页眉、表头、章节名和纯说明文字。
-风险必须说明风险事件或影响，应对策略写入 mitigation，不得单独作为风险。
-合同/招投标/需求文件只提取正式约束、交付物、验收和里程碑，不把描述性段落拆成过程任务。
-evidence 必须是文件中的简短原文依据，locator 说明章节、页码、表格或段落位置。
-文件名：{filename}
-分类：{category}
-内容：
-{compact_text(text, int(config.get('maxTextLength') or 12000))}
-"""
-        answer = chat_completion(
-            [
-                {"role": "system", "content": "你是项目管理资料分析助手，只输出 JSON。"},
-                {"role": "user", "content": prompt},
-            ],
-            config,
-        )
-        try:
-            items = _validate_ai_items(_parse_ai_items(answer), allowed_types)
-        except Exception as first_error:
-            repair_prompt = f"""
-下面是一次项目事项抽取的无效输出，请将它修复为严格 JSON 数组。
-不得补造原输出中不存在的事项。每项保留 type、title、description、confidence、evidence、locator。
-允许的 type：{', '.join(sorted(allowed_types))}。
-无效输出：
-{compact_text(answer, 8000) or '[空输出]'}
-"""
-            repaired = chat_completion(
-                [
-                    {"role": "system", "content": "你是 JSON 结构修复器，只输出 JSON 数组。"},
-                    {"role": "user", "content": repair_prompt},
-                ],
-                config,
-            )
-            try:
-                items = _validate_ai_items(_parse_ai_items(repaired), allowed_types)
-            except Exception as second_error:
-                raise ValueError(f"首次解析失败：{first_error}；结构修复失败：{second_error}") from second_error
-        for item in items[:12]:
-            suggestion_type = item.get("type")
-            if suggestion_type not in allowed_types:
-                continue
-            title = item.get("title") or ""
-            description = item.get("description") or title
-            if suggestion_type == "risk" and not any(
-                word in f"{title}{description}" for word in ["风险", "影响", "可能", "导致", "无法", "不足", "滞后", "超期", "问题"]
-            ):
-                continue
-            payload = {
-                "title": title,
-                "description": description,
-                "status": item.get("status") or ("pending" if suggestion_type == "change_request" else "not_started"),
-                "source": "大模型分析",
-            }
-            for key in ["owner", "progress", "due_date", "planned_date", "actual_date", "level", "mitigation"]:
-                if item.get(key) not in (None, ""):
-                    payload[key] = item[key]
-            create_suggestion(
-                conn,
-                document_id,
-                suggestion_type,
-                title,
-                description,
-                payload,
-                float(item.get("confidence") or 0.7),
-                locator=str(item.get("locator") or "模型抽取"),
-                method="llm",
-                evidence_text=str(item.get("evidence") or description),
-            )
-        conn.execute(
-            "UPDATE documents SET analysis_status = 'analyzed', analysis_at = ?, analysis_error = '', analysis_raw_response = ? WHERE id = ?",
-            (now_iso(), compact_text(repaired or answer, 12000), document_id),
-        )
-    except Exception as exc:
-        conn.execute(
-            "UPDATE documents SET analysis_status = 'failed', analysis_at = ?, analysis_error = ?, analysis_raw_response = ? WHERE id = ?",
-            (now_iso(), str(exc), compact_text(repaired or answer, 12000), document_id),
-        )
+def save_ai_analysis_suggestions(document_id: int, text: str, filename: str, category: str) -> dict[str, Any]:
+    """Use one verified candidate pool for rules and model output.
 
+    Model calls happen without a write transaction. Rule candidates continue to
+    work when the model is disabled or one model batch fails.
+    """
+    config = ai_config()
+    conn = get_connection()
+    try:
+        conn.execute("UPDATE documents SET analysis_status='analyzing',analysis_error='' WHERE id=?", (document_id,))
+        conn.commit()
+    finally:
+        conn.close()
+
+    recognition = analyze_task_candidates(text, category, include_model=category in {"weekly_report", "meeting"})
+    # Progress observations are useful only when they safely identify an existing formal task.
+    conn = get_connection()
+    try:
+        officials = rows_to_dicts(conn.execute("SELECT * FROM tasks WHERE COALESCE(is_archived,0)=0 AND task_kind IN ('baseline','confirmed_addition')").fetchall())
+    finally:
+        conn.close()
+    accepted_tasks = []
+    for item in recognition["candidates"]:
+        if item.get("task_mode") == "progress" and not safe_task_match(item, officials):
+            recognition["rejected"].append({**item, "reasonCode": "unmatched_progress", "reason": "进度描述未高置信匹配正式任务，不新增为独立任务"})
+        else:
+            accepted_tasks.append(item)
+    recognition["candidates"] = accepted_tasks
+
+    non_task_failures: list[dict[str, Any]] = []
+    non_task_items: list[dict[str, Any]] = []
+    raw_responses: list[str] = list(recognition["batch"].get("raw", []))
+    allowed_types = set(AI_TYPE_ALLOWLIST.get(category, AI_TYPE_ALLOWLIST["other"])) - {"task"}
+    if config.get("enabled") and allowed_types:
+        batches = semantic_batches(text, min(8000, int(config.get("maxTextLength") or 12000)))
+        for batch_index, batch in enumerate(batches, 1):
+            answer = repaired = ""
+            try:
+                prompt = f"""基于以下项目文件批次识别非任务类项目事项。只返回严格 JSON 数组。
+每项必须包含 type、title、description、confidence、evidence、locator；type 只能是：{', '.join(sorted(allowed_types))}。
+风险必须包含风险事件或影响；措施写入 mitigation。普通完成情况不是里程碑，只有正式关键阶段节点才可为 milestone。
+evidence 必须逐字来自本批次，不得补造责任人、日期或事实。文件：{filename}；分类：{category}\n内容：\n{batch}"""
+                answer = chat_completion([{"role":"system","content":"你是准确优先的项目资料识别器，只输出 JSON。"},{"role":"user","content":prompt}], config, max_tokens=2000)
+                try:
+                    items = _validate_ai_items(_parse_ai_items(answer), allowed_types)
+                    if not items:
+                        raise ValueError("模型返回空数组")
+                except Exception as first_error:
+                    repaired = chat_completion([{"role":"system","content":"只修复为 JSON 数组，不增加事实。"},{"role":"user","content": answer or "[空输出]"}], config, max_tokens=2000)
+                    try:
+                        items = _validate_ai_items(_parse_ai_items(repaired), allowed_types)
+                        if not items:
+                            raise ValueError("结构修复后仍为空数组")
+                    except Exception as second_error:
+                        raise ValueError(f"首次解析失败：{first_error}；结构修复失败：{second_error}") from second_error
+                raw_responses.append(compact_text(repaired or answer, 4000))
+                for item in items:
+                    evidence = str(item.get("evidence") or "")
+                    if not evidence_in_source(evidence, batch):
+                        recognition["rejected"].append({"type":item.get("type","other"),"title":item.get("title", ""),"evidence":evidence,
+                            "locator":item.get("locator",f"模型批次 {batch_index}"),"method":"llm","batchIndex":batch_index,
+                            "reasonCode":"evidence_not_found","reason":"模型依据无法在原文批次中定位"})
+                        continue
+                    non_task_items.append({**item, "_batch": batch_index})
+            except Exception as exc:
+                non_task_failures.append({"batchIndex":batch_index,"error":str(exc),"textPreview":compact_text(batch,240)})
+    recognition["batch"]["failedBatches"] = [*recognition["batch"].get("failedBatches", []), *non_task_failures]
+    total_batches = int(recognition["batch"].get("totalBatches") or 0) + (len(semantic_batches(text, min(8000, int(config.get("maxTextLength") or 12000)))) if config.get("enabled") and allowed_types else 0)
+    recognition["batch"]["totalBatches"] = total_batches
+    recognition["batch"]["successfulBatches"] = max(0, total_batches - len(recognition["batch"]["failedBatches"]))
+    recognition["coverage"] = round(recognition["batch"]["successfulBatches"] / total_batches, 4) if total_batches else 1.0
+    save_recognition_report(document_id, recognition)
+
+    conn = get_connection()
+    try:
+        for item in recognition["candidates"]:
+            create_suggestion(conn, document_id, "task", item["title"], item.get("description") or item["title"], {
+                "title": item["title"], "description": item.get("description") or item["title"], "owner": item.get("owner") or "",
+                "due_date": item.get("due_date") or "", "status": item.get("status") or "not_started", "progress": item.get("progress") or 0,
+                "priority": "medium", "color_status": "green", "source": "统一任务识别", "task_mode": item.get("task_mode"),
+            }, float(item.get("confidence") or .8), locator=str(item.get("locator") or "统一识别"), method=str(item.get("method") or "rule"),
+                evidence_text=str(item.get("evidence") or item.get("description") or item["title"]))
+        for item in non_task_items:
+            suggestion_type = item["type"]
+            title = str(item.get("title") or "")
+            description = str(item.get("description") or title)
+            if suggestion_type == "risk" and not any(word in f"{title}{description}" for word in ["风险","影响","可能","导致","无法","不足","滞后","超期","问题"]):
+                continue
+            payload = {"title":title,"description":description,"status":item.get("status") or ("pending" if suggestion_type=="change_request" else "not_started"),"source":"大模型分析"}
+            for key in ["owner","progress","due_date","planned_date","actual_date","level","mitigation"]:
+                if item.get(key) not in (None, ""): payload[key]=item[key]
+            create_suggestion(conn, document_id, suggestion_type, title, description, payload, float(item.get("confidence") or .7),
+                locator=str(item.get("locator") or f"模型批次 {item['_batch']}"), method="llm", evidence_text=str(item.get("evidence") or description))
+        failed = recognition["batch"]["failedBatches"]
+        status = "partial" if failed else "analyzed"
+        error = "；".join(f"批次 {item['batchIndex']}：{item['error']}" for item in failed[:8])
+        conn.execute("UPDATE documents SET analysis_status=?,analysis_at=?,analysis_error=?,analysis_raw_response=? WHERE id=?",
+                     (status, now_iso(), error, compact_text("\n".join(raw_responses), 12000), document_id))
+        conn.commit()
+        return {"ok":not failed,"partial":bool(failed),"items":len(recognition["candidates"])+len(non_task_items),"rejected":len(recognition["rejected"]),"coverage":recognition["coverage"],"failedBatches":failed}
+    except Exception as exc:
+        conn.rollback()
+        conn.execute("UPDATE documents SET analysis_status='failed',analysis_at=?,analysis_error=?,analysis_raw_response=? WHERE id=?",
+                     (now_iso(),str(exc),compact_text("\n".join(raw_responses),12000),document_id)); conn.commit()
+        return {"ok":False,"error":str(exc)}
+    finally:
+        conn.close()
 
 def auto_link_deliverables(conn: sqlite3.Connection, document_id: int, filename: str) -> None:
     normalized = filename.lower()
@@ -705,19 +660,32 @@ def auto_link_deliverables(conn: sqlite3.Connection, document_id: int, filename:
 
 
 def index_document(path: Path, hint: str = "", force: bool = False) -> dict[str, Any]:
-    path = path.resolve()
+    """Index one file while keeping database write sections short.
+
+    File extraction, embeddings and chat-model work can take seconds.  They run
+    outside SQLite write transactions so unrelated project edits remain responsive.
+    """
+    try:
+        path = path.resolve()
+        stat = path.stat()
+    except OSError as exc:
+        return {"path": str(path), "status": "error", "error": str(exc)}
+
     conn = get_connection()
     try:
         existing = conn.execute("SELECT * FROM documents WHERE path = ?", (str(path),)).fetchone()
-        if existing and not force:
-            stat = path.stat()
-            modified = datetime.fromtimestamp(stat.st_mtime).isoformat(timespec="seconds")
-            if existing["modified_at"] == modified and existing["size_bytes"] == stat.st_size:
-                return {"path": str(path), "status": "unchanged"}
+        modified = datetime.fromtimestamp(stat.st_mtime).isoformat(timespec="seconds")
+        if existing and not force and existing["modified_at"] == modified and existing["size_bytes"] == stat.st_size:
+            return {"path": str(path), "status": "unchanged"}
+    finally:
+        conn.close()
 
-        category = classify_document(path, hint)
-        result = extract_text(path)
-        summary = compact_text(result.text, 500) if result.text else category_label(category)
+    category = classify_document(path, hint)
+    result = extract_text(path)
+    summary = compact_text(result.text, 500) if result.text else category_label(category)
+    queued_ocr = False
+    conn = get_connection()
+    try:
         document_id = upsert_document(conn, path, category, result.status, summary, result.error)
         if force:
             conn.execute(
@@ -729,70 +697,127 @@ def index_document(path: Path, hint: str = "", force: bool = False) -> dict[str,
         if category != "meeting":
             conn.execute("DELETE FROM meetings WHERE document_id = ?", (document_id,))
 
-        if should_ocr_pdf(path, result.text):
-            enqueue_document_ocr(document_id, path, conn=conn)
-        elif path.suffix.lower() == ".pdf":
-            conn.execute(
-                "UPDATE documents SET ocr_status = 'not_required', ocr_progress = 0, ocr_error = '' WHERE id = ?",
-                (document_id,),
-            )
-
-        if result.text:
-            index_document_knowledge(document_id, result.text, path.name, conn=conn)
-            analyze_document_authority(document_id, result.text, conn=conn, force=force)
-            auto_link_deliverables(conn, document_id, path.name)
-            if category == "weekly_report":
-                save_weekly_report(conn, document_id, result.text, path.name)
-            elif category == "meeting":
-                save_meeting(conn, document_id, result.text, path.name)
-            elif category == "resource":
-                save_resource_suggestions(conn, document_id, result.text, path.name)
-            elif category == "requirement_change":
-                for line in bullet_lines(result.text, 16):
-                    if any(word in line for word in ["变更", "优化", "调整", "集成", "需求"]):
-                        create_suggestion(
-                            conn,
-                            document_id,
-                            "change_request",
-                            line[:90],
-                            f"从需求/变更类资料识别到的事项：{line}",
-                            {
-                                "title": line[:90],
-                                "description": line,
-                                "proposer": "",
-                                "impact": "待确认",
-                                "status": "pending",
-                            },
-                            0.65,
-                            locator="需求或变更资料/正文",
-                            evidence_text=line,
-                        )
-            save_ai_analysis_suggestions(conn, document_id, result.text, path.name, category)
-        else:
-            analyze_document_authority(document_id, "", conn=conn, force=force)
-
+        if path.suffix.lower() == ".pdf":
+            skip_reason = ocr_skip_reason(path, result.text)
+            if skip_reason is None:
+                queued_ocr = bool(enqueue_document_ocr(document_id, path, conn=conn, start_worker=False).get("ok"))
+            else:
+                ocr_status = "not_required" if result.text else "skipped"
+                conn.execute("DELETE FROM ocr_pages WHERE document_id = ?", (document_id,))
+                conn.execute(
+                    """
+                    UPDATE documents
+                    SET ocr_status = ?, ocr_progress = 0, ocr_pages_total = 0,
+                        ocr_pages_done = 0, ocr_error = ?, ocr_at = ?
+                    WHERE id = ?
+                    """,
+                    (ocr_status, "" if ocr_status == "not_required" else skip_reason, now_iso(), document_id),
+                )
         conn.commit()
-        return {"path": str(path), "status": result.status, "category": category}
     except Exception as exc:
         conn.rollback()
         return {"path": str(path), "status": "error", "error": str(exc)}
     finally:
         conn.close()
 
+    if queued_ocr:
+        worker.start()
+
+    try:
+        if result.text:
+            # This function calculates external embeddings before opening its write
+            # transaction, then commits its own short transaction.
+            index_document_knowledge(document_id, result.text, path.name)
+
+            conn = get_connection()
+            try:
+                auto_link_deliverables(conn, document_id, path.name)
+                if category == "weekly_report":
+                    save_weekly_report(conn, document_id, result.text, path.name)
+                elif category == "meeting":
+                    save_meeting(conn, document_id, result.text, path.name)
+                elif category == "resource":
+                    save_resource_suggestions(conn, document_id, result.text, path.name)
+                elif category == "requirement_change":
+                    for line in bullet_lines(result.text, 16):
+                        if any(word in line for word in ["变更", "优化", "调整", "集成", "需求"]):
+                            create_suggestion(
+                                conn,
+                                document_id,
+                                "change_request",
+                                line[:90],
+                                f"从需求/变更类资料识别到的事项：{line}",
+                                {
+                                    "title": line[:90],
+                                    "description": line,
+                                    "proposer": "",
+                                    "impact": "待确认",
+                                    "status": "pending",
+                                },
+                                0.65,
+                                locator="需求或变更资料/正文",
+                                evidence_text=line,
+                            )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+            save_ai_analysis_suggestions(document_id, result.text, path.name, category)
+        else:
+            analyze_document_authority(document_id, "", force=force)
+    except Exception as exc:
+        return {"path": str(path), "status": "error", "error": str(exc)}
+
+    return {"path": str(path), "status": result.status, "category": category}
+
+
+_scan_lock = threading.Lock()
+
 
 def scan_all(force: bool = False) -> dict[str, Any]:
-    files = discover_files()
-    results = [index_document(path, hint, force) for path, hint in files]
-    conn = get_connection()
+    if not _scan_lock.acquire(blocking=False):
+        return {"total": 0, "counts": {}, "results": [], "skipped": True, "reason": "扫描任务正在运行"}
     try:
-        set_setting(conn, "last_scan_at", now_iso())
-        conn.commit()
+        files = discover_files()
+        results: list[dict[str, Any]] = []
+        for path, hint in files:
+            try:
+                results.append(index_document(path, hint, force))
+            except Exception as exc:
+                results.append({"path": str(path), "status": "error", "error": str(exc)})
+        conn = get_connection()
+        try:
+            set_setting(conn, "last_scan_at", now_iso())
+            conn.commit()
+        finally:
+            conn.close()
+        counts: dict[str, int] = {}
+        for item in results:
+            counts[item["status"]] = counts.get(item["status"], 0) + 1
+        changed_weekly_report = any(
+            item.get("category") == "weekly_report"
+            and item.get("status") not in {"unchanged", "error", "skipped"}
+            for item in results
+        )
+        wiki_refresh: dict[str, Any] | None = None
+        task_reconcile: dict[str, Any] | None = None
+        if changed_weekly_report:
+            from app.services.task_reconcile import start_task_progress_reconcile
+
+            task_reconcile = start_task_progress_reconcile("weekly_scan", refresh_wiki_after=True)
+            wiki_refresh = {"ok": True, "queuedAfterTaskReconcile": True}
+        return {
+            "total": len(results),
+            "counts": counts,
+            "results": results,
+            "wikiCurrentProgressRefresh": wiki_refresh,
+            "taskProgressReconcile": task_reconcile,
+            "skipped": False,
+        }
     finally:
-        conn.close()
-    counts: dict[str, int] = {}
-    for item in results:
-        counts[item["status"]] = counts.get(item["status"], 0) + 1
-    return {"total": len(results), "counts": counts, "results": results}
+        _scan_lock.release()
 
 
 def list_documents() -> list[dict[str, Any]]:
@@ -804,7 +829,26 @@ def list_documents() -> list[dict[str, Any]]:
             ORDER BY modified_at DESC, id DESC
             """
         ).fetchall()
-        return rows_to_dicts(rows)
+        documents = rows_to_dicts(rows)
+        rejection_rows = conn.execute(
+            """
+            SELECT document_id, reason_code, reason, title, evidence_text, locator
+            FROM recognition_rejections
+            ORDER BY document_id, id DESC
+            """
+        ).fetchall()
+        rejection_map: dict[int, list[dict[str, Any]]] = {}
+        for row in rejection_rows:
+            items = rejection_map.setdefault(row["document_id"], [])
+            if len(items) < 3:
+                items.append(dict(row))
+        for item in documents:
+            try:
+                item["recognition_report"] = json.loads(item.get("recognition_report_json") or "{}")
+            except (TypeError, ValueError):
+                item["recognition_report"] = {}
+            item["recognition_rejection_examples"] = rejection_map.get(item["id"], [])
+        return documents
     finally:
         conn.close()
 
@@ -1057,6 +1101,19 @@ def _apply_matched_suggestion(
     ).fetchone()
     if not record:
         return None
+
+    if suggestion_type == "task":
+        from app.services.observations import compatible_scope
+        resolution = conn.execute("SELECT * FROM observation_resolutions WHERE task_id=?",(record['id'],)).fetchone()
+        if resolution and resolution['target_id']:
+            target = conn.execute("SELECT * FROM tasks WHERE id=? AND is_archived=0",(resolution['target_id'],)).fetchone()
+            if target:
+                record = target
+                entity_id = ensure_entity(conn,'task',record['id'],record['title'])
+                entity = conn.execute('SELECT * FROM project_entities WHERE id=?',(entity_id,)).fetchone()
+        incoming = {'title':suggestion['title'],'description':suggestion['description'] or ''}
+        if not compatible_scope(incoming,dict(record)):
+            return None
 
     proposed_updates = payload.get("proposed_updates") or {}
     allowed_updates = {

@@ -6,6 +6,7 @@ import re
 import sqlite3
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 import urllib.error
 import urllib.request
@@ -37,6 +38,7 @@ QA_CONTEXT_CHARS_PER_SOURCE = 620
 RETRIEVAL_LIMIT = 12
 LIKE_CANDIDATE_LIMIT = 80
 MIN_SOURCE_SCORE = 0.3
+PROGRESS_SYNONYMS = ["周报", "本周工作进展", "本周", "进展", "完成", "进行中", "迁移", "表单"]
 
 _knowledge_job_lock = threading.Lock()
 _knowledge_job = {
@@ -369,6 +371,17 @@ def index_document_knowledge(
     conn: sqlite3.Connection | None = None,
 ) -> dict[str, Any]:
     config = {**DEFAULT_INTELLIGENT_ANALYSIS, **(config or ai_config())}
+    # Network-bound embedding work must complete before a SQLite write transaction
+    # begins.  Holding that transaction while each chunk waits for a model service
+    # blocks unrelated task edits and makes "database is locked" errors likely.
+    chunks = split_chunks(text)
+    vectors: list[list[float] | None] = []
+    for chunk in chunks:
+        try:
+            vectors.append(embedding(chunk, config))
+        except Exception:
+            vectors.append(None)
+
     owns_connection = conn is None
     conn = conn or get_connection()
     now = now_iso()
@@ -376,7 +389,6 @@ def index_document_knowledge(
         conn.execute("DELETE FROM knowledge_vectors WHERE chunk_id IN (SELECT id FROM knowledge_chunks WHERE document_id = ?)", (document_id,))
         conn.execute("DELETE FROM knowledge_chunks_fts WHERE rowid IN (SELECT id FROM knowledge_chunks WHERE document_id = ?)", (document_id,))
         conn.execute("DELETE FROM knowledge_chunks WHERE document_id = ?", (document_id,))
-        chunks = split_chunks(text)
         indexed_vectors = 0
         for index, chunk in enumerate(chunks):
             cursor = conn.execute(
@@ -388,8 +400,8 @@ def index_document_knowledge(
             )
             chunk_id = cursor.lastrowid
             conn.execute("INSERT INTO knowledge_chunks_fts(rowid, text) VALUES(?, ?)", (chunk_id, chunk))
-            try:
-                vector = embedding(chunk, config)
+            vector = vectors[index]
+            if vector is not None:
                 conn.execute(
                     """
                     INSERT INTO knowledge_vectors(chunk_id, embedding_model, vector_json, dimension, updated_at)
@@ -398,8 +410,6 @@ def index_document_knowledge(
                     (chunk_id, config.get("embeddingModelName", ""), json.dumps(vector), len(vector), now),
                 )
                 indexed_vectors += 1
-            except Exception:
-                pass
         conn.execute(
             """
             UPDATE documents
@@ -598,7 +608,8 @@ def _query_terms(query: str) -> list[str]:
         ]
         if term in query
     ]
-    return _dedupe(priority_terms + words + grams)[:18]
+    progress_terms = PROGRESS_SYNONYMS if question_scope(query) == "progress" else []
+    return _dedupe(progress_terms + priority_terms + words + grams)[:18]
 
 
 def _tokenize_query(query: str) -> str:
@@ -629,6 +640,94 @@ def _term_score(row: dict[str, Any], terms: list[str]) -> float:
             weight += 0.35
         score += min(occurrences, 4) * weight
     return score
+
+
+def _source_date(item: dict[str, Any]) -> str:
+    return str(item.get("source_date") or item.get("period_end") or item.get("effective_date") or item.get("modified_at") or "")[:10]
+
+
+def _date_value(value: str) -> int:
+    try:
+        return datetime.fromisoformat(value[:10]).toordinal()
+    except (TypeError, ValueError):
+        return 0
+
+
+def _requested_progress_cutoff(query: str, latest_date: str) -> str:
+    exact = re.search(r"截至\s*(20\d{2})[年./-]?(\d{1,2})[月./-]?(\d{1,2})", query or "")
+    if exact:
+        try:
+            return datetime(int(exact.group(1)), int(exact.group(2)), int(exact.group(3))).date().isoformat()
+        except ValueError:
+            return ""
+    month_end = re.search(r"截至\s*(\d{1,2})\s*月底", query or "")
+    if month_end and latest_date:
+        try:
+            year = int(latest_date[:4])
+            month = int(month_end.group(1))
+            next_month = datetime(year + (month == 12), 1 if month == 12 else month + 1, 1)
+            return (next_month.date().fromordinal(next_month.toordinal() - 1)).isoformat()
+        except ValueError:
+            return ""
+    return ""
+
+
+def _latest_progress_sources(conn: sqlite3.Connection, query: str) -> tuple[str, list[dict[str, Any]]]:
+    latest_row = conn.execute(
+        """
+        SELECT MAX(COALESCE(w.period_end, d.effective_date, substr(d.modified_at, 1, 10))) AS source_date
+        FROM documents d
+        LEFT JOIN weekly_reports w ON w.document_id = d.id
+        WHERE d.is_current = 1 AND d.doc_category = 'weekly_report' AND d.status = 'indexed'
+        """
+    ).fetchone()
+    latest_date = str(latest_row["source_date"] or "")[:10] if latest_row else ""
+    cutoff = _requested_progress_cutoff(query, latest_date)
+    params: list[Any] = []
+    cutoff_filter = ""
+    if cutoff:
+        cutoff_filter = "AND COALESCE(w.period_end, d.effective_date, substr(d.modified_at, 1, 10)) <= ?"
+        params.append(cutoff)
+    rows = rows_to_dicts(
+        conn.execute(
+            f"""
+            SELECT c.*, d.name AS document_name, d.path AS document_path, d.doc_category,
+                   d.authority_level, d.authority_score, d.authority_scope, d.version_label,
+                   d.version_group, d.effective_date, d.modified_at, d.is_current,
+                   COALESCE(w.period_end, d.effective_date, substr(d.modified_at, 1, 10)) AS source_date
+            FROM documents d
+            JOIN knowledge_chunks c ON c.document_id = d.id AND c.chunk_index = 0
+            LEFT JOIN weekly_reports w ON w.document_id = d.id
+            WHERE d.is_current = 1 AND d.doc_category = 'weekly_report' AND d.status = 'indexed'
+              {cutoff_filter}
+            ORDER BY source_date DESC, d.id DESC
+            LIMIT 3
+            """,
+            params,
+        ).fetchall()
+    )
+    return latest_date, rows
+
+
+def _progress_freshness() -> dict[str, str]:
+    conn = get_connection()
+    try:
+        latest_date, _ = _latest_progress_sources(conn, "")
+        page = conn.execute(
+            "SELECT source_cutoff_date FROM wiki_pages WHERE page_key = 'current_progress'"
+        ).fetchone()
+        published_cutoff = str(page["source_cutoff_date"] or "")[:10] if page else ""
+    finally:
+        conn.close()
+    if not latest_date:
+        return {"answerAsOf": "", "freshnessStatus": "no_recent_sources", "freshnessWarning": "尚未找到已索引的项目周报。"}
+    if not published_cutoff or published_cutoff < latest_date:
+        return {
+            "answerAsOf": latest_date,
+            "freshnessStatus": "stale_fallback",
+            "freshnessWarning": "正式 Wiki 尚未同步最新周报，本次回答已直接依据最新项目资料生成。",
+        }
+    return {"answerAsOf": latest_date, "freshnessStatus": "fresh", "freshnessWarning": ""}
 
 
 def _baseline_source(query: str) -> dict[str, Any] | None:
@@ -689,17 +788,22 @@ def retrieve(query: str) -> list[dict[str, Any]]:
     conn = get_connection()
     hits: dict[int, dict[str, Any]] = {}
     terms = _query_terms(query)
+    scope = question_scope(query)
+    latest_progress_date = ""
+    requested_cutoff = ""
     try:
         fts_rows = rows_to_dicts(
             conn.execute(
                 """
                 SELECT c.*, d.name AS document_name, d.path AS document_path,
                        d.doc_category, d.authority_level, d.authority_score, d.authority_scope,
-                       d.version_label, d.version_group, d.effective_date, d.is_current,
+                       d.version_label, d.version_group, d.effective_date, d.modified_at, d.is_current,
+                       COALESCE(w.period_end, d.effective_date, substr(d.modified_at, 1, 10)) AS source_date,
                        bm25(knowledge_chunks_fts) AS rank
                 FROM knowledge_chunks_fts
                 JOIN knowledge_chunks c ON c.id = knowledge_chunks_fts.rowid
                 JOIN documents d ON d.id = c.document_id
+                LEFT JOIN weekly_reports w ON w.document_id = d.id
                 WHERE knowledge_chunks_fts MATCH ?
                   AND d.is_current = 1
                 ORDER BY rank
@@ -719,10 +823,12 @@ def retrieve(query: str) -> list[dict[str, Any]]:
                 conn.execute(
                     f"""
                     SELECT c.*, d.name AS document_name, d.path AS document_path,
-                           d.doc_category, d.authority_level, d.authority_score, d.authority_scope,
-                           d.version_label, d.version_group, d.effective_date, d.is_current
+                       d.doc_category, d.authority_level, d.authority_score, d.authority_scope,
+                       d.version_label, d.version_group, d.effective_date, d.modified_at, d.is_current,
+                       COALESCE(w.period_end, d.effective_date, substr(d.modified_at, 1, 10)) AS source_date
                     FROM knowledge_chunks c
                     JOIN documents d ON d.id = c.document_id
+                    LEFT JOIN weekly_reports w ON w.document_id = d.id
                     WHERE d.is_current = 1 AND ({where})
                     ORDER BY c.updated_at DESC, c.id DESC
                     LIMIT ?
@@ -749,11 +855,13 @@ def retrieve(query: str) -> list[dict[str, Any]]:
                 """
                 SELECT c.*, d.name AS document_name, d.path AS document_path,
                        d.doc_category, d.authority_level, d.authority_score, d.authority_scope,
-                       d.version_label, d.version_group, d.effective_date, d.is_current,
+                       d.version_label, d.version_group, d.effective_date, d.modified_at, d.is_current,
+                       COALESCE(w.period_end, d.effective_date, substr(d.modified_at, 1, 10)) AS source_date,
                        v.vector_json
                 FROM knowledge_vectors v
                 JOIN knowledge_chunks c ON c.id = v.chunk_id
                 JOIN documents d ON d.id = c.document_id
+                LEFT JOIN weekly_reports w ON w.document_id = d.id
                 WHERE d.is_current = 1
                 """
             ).fetchall()
@@ -769,35 +877,72 @@ def retrieve(query: str) -> list[dict[str, Any]]:
                 hits[row["id"]] = {**row, "score": score}
     except Exception:
         pass
-    finally:
-        conn.close()
+    if scope == "progress":
+        try:
+            latest_progress_date, pinned_rows = _latest_progress_sources(conn, query)
+            requested_cutoff = _requested_progress_cutoff(query, latest_progress_date)
+            for position, row in enumerate(pinned_rows):
+                row["is_latest_progress_source"] = True
+                pinned_score = 4.0 - position * 0.1
+                if row["id"] in hits:
+                    # 固定召回的最近周报必须能进入最终来源，而不是再被关键词密度压掉。
+                    hits[row["id"]]["score"] = max(float(hits[row["id"]].get("score") or 0), pinned_score)
+                    hits[row["id"]]["is_latest_progress_source"] = True
+                    hits[row["id"]]["source_date"] = row["source_date"]
+                else:
+                    hits[row["id"]] = {**row, "score": pinned_score}
+        except Exception:
+            pass
+    conn.close()
 
     baseline = _baseline_source(query)
     if baseline:
         hits[-1] = baseline
 
-    scope = question_scope(query)
+    if scope == "progress" and requested_cutoff:
+        hits = {
+            key: item for key, item in hits.items()
+            if not _source_date(item) or _source_date(item) <= requested_cutoff
+        }
+    progress_reference_date = requested_cutoff or latest_progress_date
     for item in hits.values():
         level = int(item.get("authority_level") or 5)
         bonus = authority_weight(level)
         if item.get("source_type") == "baseline":
             bonus += 0.18
-        if scope == "progress" and level in {4, 5}:
-            bonus += 0.14
+        if scope == "progress":
+            source_type = _document_source_type(item)
+            source_date = _source_date(item)
+            if source_type == "weekly_report":
+                bonus += 0.36
+            elif source_type == "acceptance_launch":
+                bonus += 0.08
+            elif source_type == "contract_tender":
+                bonus -= 0.18
+            if progress_reference_date and source_date:
+                age_days = max(0, _date_value(progress_reference_date) - _date_value(source_date))
+                bonus += max(0.0, 0.64 - age_days / 120)
+            if item.get("is_latest_progress_source"):
+                bonus += 0.28
         elif scope in {"scope", "schedule", "deliverable", "acceptance", "cost", "resource", "change"} and level <= 3:
             bonus += 0.16
         if not int(item.get("is_current", 1)):
             bonus -= 0.18
         item["relevance_score"] = float(item.get("score") or 0)
         item["score"] = item["relevance_score"] + bonus
+        item["is_latest"] = bool(scope == "progress" and _source_date(item) and _source_date(item) == progress_reference_date)
     ranked = sorted(hits.values(), reverse=True, key=lambda item: item["score"])
     deduplicated: list[dict[str, Any]] = []
     seen_versions: set[str] = set()
     for item in ranked:
         if float(item.get("score") or 0) < MIN_SOURCE_SCORE:
             continue
+        # 周报是按期观察到的事实，不应像合同草稿一样按版本组只保留一份。
         version_key = "baseline" if item.get("source_type") == "baseline" else (
-            item.get("version_group") or f"document-{item.get('document_id')}"
+            f"weekly-{item.get('document_id')}" if scope == "progress" and (
+                item.get("is_latest_progress_source") or _document_source_type(item) == "weekly_report"
+            )
+            else item.get("version_group") or f"document-{item.get('document_id')}"
         )
         if version_key in seen_versions:
             continue
@@ -827,6 +972,8 @@ def _source_payload(item: dict[str, Any], primary_level: int, conflict_note: str
         "documentName": item["document_name"],
         "snippet": compact_text(item["text"], 260),
         "score": round(float(item.get("score") or 0), 4),
+        "effectiveDate": _source_date(item),
+        "isLatest": bool(item.get("is_latest")),
         **authority_source_payload(
             item,
             primary=int(item.get("authority_level") or 5) == primary_level,
@@ -839,6 +986,9 @@ def _source_payload(item: dict[str, Any], primary_level: int, conflict_note: str
 def answer_question(question: str) -> dict[str, Any]:
     sources = retrieve(question)
     scope = question_scope(question)
+    freshness = _progress_freshness() if scope == "progress" else {
+        "answerAsOf": "", "freshnessStatus": "not_applicable", "freshnessWarning": ""
+    }
     primary_level = min([int(item.get("authority_level") or 5) for item in sources], default=5)
     conflict_note = source_conflict_note(
         [
@@ -851,16 +1001,18 @@ def answer_question(question: str) -> dict[str, Any]:
         scope,
     )
     fallback_sources = [_source_payload(item, primary_level, conflict_note) for item in sources]
-    try:
-        from app.services.wiki import answer_from_wiki
+    if scope != "progress" or freshness["freshnessStatus"] == "fresh":
+        try:
+            from app.services.wiki import answer_from_wiki
 
-        wiki_answer = answer_from_wiki(question, fallback_sources)
-        if wiki_answer:
-            wiki_answer["authorityScope"] = scope
-            wiki_answer["conflictNote"] = wiki_answer.get("conflictNote") or conflict_note
-            return wiki_answer
-    except Exception:
-        pass
+            wiki_answer = answer_from_wiki(question, fallback_sources)
+            if wiki_answer:
+                wiki_answer["authorityScope"] = scope
+                wiki_answer["conflictNote"] = wiki_answer.get("conflictNote") or conflict_note
+                wiki_answer.update(freshness)
+                return wiki_answer
+        except Exception:
+            pass
     if not sources:
         return {
             "answer": "未在项目资料中找到依据。",
@@ -874,6 +1026,7 @@ def answer_question(question: str) -> dict[str, Any]:
             "retrievalMode": "hybrid",
             "authorityScope": scope,
             "conflictNote": "",
+            **freshness,
         }
 
     authority_instruction = (
@@ -934,6 +1087,7 @@ def answer_question(question: str) -> dict[str, Any]:
         "retrievalMode": "hybrid",
         "authorityScope": scope,
         "conflictNote": conflict_note,
+        **freshness,
     }
 
 def _parse_answer_json(raw: str) -> dict[str, Any]:

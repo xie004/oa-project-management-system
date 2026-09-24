@@ -2,6 +2,8 @@ backend/.venv/
 __pycache__/
 *.py[cod]
 backend/data/oa_project.db
+backend/data/oa_project.db-shm
+backend/data/oa_project.db-wal
 backend/data/exports/
 logs/
 rollback-backups/
