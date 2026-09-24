@@ -684,6 +684,17 @@ def init_db() -> None:
                 updated_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS deliverable_audit (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                deliverable_id INTEGER NOT NULL,
+                action TEXT NOT NULL,
+                actor TEXT NOT NULL DEFAULT '',
+                reason TEXT NOT NULL DEFAULT '',
+                before_json TEXT NOT NULL DEFAULT '{}',
+                after_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS knowledge_chunks (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
@@ -972,6 +983,18 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         for name, definition in archive_columns.items():
             if name not in table_columns:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+
+    deliverable_columns = {
+        "updated_by": "TEXT NOT NULL DEFAULT ''",
+        "update_mode": "TEXT NOT NULL DEFAULT 'manual'",
+        "update_reason": "TEXT NOT NULL DEFAULT ''",
+        "last_source_document_id": "INTEGER REFERENCES documents(id) ON DELETE SET NULL",
+        "last_source_date": "TEXT",
+    }
+    deliverable_existing = {row["name"] for row in conn.execute("PRAGMA table_info(deliverables)").fetchall()}
+    for name, definition in deliverable_columns.items():
+        if name not in deliverable_existing:
+            conn.execute(f"ALTER TABLE deliverables ADD COLUMN {name} {definition}")
 
     suggestion_columns = {
         "normalized_title": "TEXT",

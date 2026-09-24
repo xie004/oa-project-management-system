@@ -325,6 +325,14 @@ class GenericPatchPayload(BaseModel):
     values: dict[str, Any]
 
 
+class DeliverableCreatePayload(BaseModel):
+    values: dict[str, Any]
+
+
+class DeliverableArchivePayload(BaseModel):
+    reason: str = ""
+
+
 class TaskBulkPatchPayload(BaseModel):
     ids: list[int] = Field(default_factory=list)
     values: dict[str, Any]
@@ -1283,12 +1291,15 @@ def upload_document(
 
 
 @app.get("/api/deliverables")
-def get_deliverables() -> list[dict[str, Any]]:
+def get_deliverables(includeArchived: bool = False, admin: dict[str, Any] | None = Depends(current_auth)) -> list[dict[str, Any]]:
+    if includeArchived and not (admin or {}).get("isAdmin"):
+        raise HTTPException(status_code=403, detail="仅管理员可查看已归档交付物。")
     conn = get_connection()
     try:
+        archived_filter = "" if includeArchived else "WHERE COALESCE(dv.is_archived, 0) = 0"
         records = rows_to_dicts(
             conn.execute(
-                """
+                f"""
                 SELECT
                     dv.*,
                     d.name AS document_name,
@@ -1299,12 +1310,51 @@ def get_deliverables() -> list[dict[str, Any]]:
                      WHERE pe.entity_type = 'deliverable' AND pe.record_id = dv.id) AS source_count
                 FROM deliverables dv
                 LEFT JOIN documents d ON d.id = dv.document_id
-                WHERE COALESCE(dv.is_archived, 0) = 0
+                {archived_filter}
                 ORDER BY dv.sort_order, dv.id
                 """
             ).fetchall()
         )
         return add_quality_flags(conn, "deliverable", records)
+    finally:
+        conn.close()
+
+
+def _audit_deliverable(conn, deliverable_id: int, action: str, actor: str, before: dict[str, Any], after: dict[str, Any] | None = None, reason: str = "") -> None:
+    conn.execute(
+        "INSERT INTO deliverable_audit(deliverable_id,action,actor,reason,before_json,after_json,created_at) VALUES(?,?,?,?,?,?,?)",
+        (deliverable_id, action, actor, reason, json.dumps(before, ensure_ascii=False, default=str), json.dumps(after or {}, ensure_ascii=False, default=str), now_iso()),
+    )
+
+
+@app.post("/api/deliverables")
+def create_deliverable(payload: DeliverableCreatePayload, admin: dict[str, Any] = Depends(admin_from_request)) -> dict[str, Any]:
+    actor = admin if isinstance(admin, dict) else {"username": "admin"}
+    try:
+        values = _normalise_deliverable_patch_values(payload.values)
+    except ValueError as exc:
+        raise _validation_error(exc) from exc
+    if "name" not in values:
+        raise HTTPException(status_code=422, detail="交付物名称不能为空。")
+    conn = get_connection()
+    try:
+        duplicate = conn.execute("SELECT id,name FROM deliverables WHERE is_archived=0 AND lower(trim(name))=lower(trim(?))", (values["name"],)).fetchone()
+        if duplicate:
+            raise HTTPException(status_code=409, detail=f"已存在同名交付物“{duplicate['name']}”（#{duplicate['id']}）。")
+        if values.get("document_id") is not None and not conn.execute("SELECT id FROM documents WHERE id=?", (values["document_id"],)).fetchone():
+            raise HTTPException(status_code=422, detail="关联文件不存在。")
+        now = now_iso()
+        order = conn.execute("SELECT COALESCE(MAX(sort_order),0)+1 AS n FROM deliverables").fetchone()["n"]
+        keys = ["name","requirement_source","description","status","owner","planned_date","submitted_date","document_id"]
+        vals = {key: values.get(key, "" if key != "document_id" else None) for key in keys}
+        cursor = conn.execute(f"INSERT INTO deliverables({','.join(keys)},sort_order,created_at,updated_at,updated_by,update_mode,update_reason) VALUES({','.join('?' for _ in keys)},?,?,?,?,?,?)",
+            [*vals.values(),order,now,now,actor.get("username","admin"),"manual_create","管理员新增"])
+        deliverable_id = cursor.lastrowid
+        after = {**vals,"id":deliverable_id}
+        ensure_entity(conn,"deliverable",deliverable_id,vals["name"])
+        _audit_deliverable(conn,deliverable_id,"create",actor.get("username","admin"),{},after)
+        conn.commit()
+        return {"ok":True,"id":deliverable_id}
     finally:
         conn.close()
 
@@ -1337,14 +1387,15 @@ def upload_deliverable_document(
 
 
 @app.patch("/api/deliverables/{deliverable_id}")
-def update_deliverable(deliverable_id: int, payload: GenericPatchPayload) -> dict[str, Any]:
+def update_deliverable(deliverable_id: int, payload: GenericPatchPayload, admin: dict[str, Any] = Depends(admin_from_request)) -> dict[str, Any]:
+    actor = admin if isinstance(admin, dict) else {"username": "admin"}
     try:
         values = _normalise_deliverable_patch_values(payload.values)
     except ValueError as exc:
         raise _validation_error(exc) from exc
     conn = get_connection()
     try:
-        existing = conn.execute("SELECT * FROM deliverables WHERE id = ?", (deliverable_id,)).fetchone()
+        existing = conn.execute("SELECT * FROM deliverables WHERE id = ? AND COALESCE(is_archived,0)=0", (deliverable_id,)).fetchone()
         if not existing:
             raise HTTPException(status_code=404, detail="交付物不存在。")
         try:
@@ -1360,19 +1411,52 @@ def update_deliverable(deliverable_id: int, payload: GenericPatchPayload) -> dic
             document = conn.execute("SELECT id FROM documents WHERE id = ?", (values["document_id"],)).fetchone()
             if not document:
                 raise HTTPException(status_code=422, detail="关联文件不存在。")
+        if "name" in values:
+            duplicate = conn.execute("SELECT id FROM deliverables WHERE is_archived=0 AND lower(trim(name))=lower(trim(?)) AND id<>?", (values["name"],deliverable_id)).fetchone()
+            if duplicate:
+                raise HTTPException(status_code=409, detail="存在同名交付物，请先确认是否重复。")
+        before = dict(existing)
         assignments = ", ".join([f"{key} = ?" for key in values])
         cursor = conn.execute(
-            f"UPDATE deliverables SET {assignments}, updated_at = ? WHERE id = ?",
-            [*values.values(), now_iso(), deliverable_id],
+            f"UPDATE deliverables SET {assignments}, updated_at = ?, updated_by=?, update_mode='manual_edit', update_reason='管理员编辑' WHERE id = ?",
+            [*values.values(), now_iso(), actor.get("username","admin"), deliverable_id],
         )
         if cursor.rowcount != 1:
             raise HTTPException(status_code=404, detail="交付物不存在。")
         if "name" in values:
             ensure_entity(conn, "deliverable", deliverable_id, str(values["name"]))
+        _audit_deliverable(conn,deliverable_id,"update",actor.get("username","admin"),before,{**before,**values})
         conn.commit()
         return {"ok": True}
     finally:
         conn.close()
+
+
+@app.post("/api/deliverables/{deliverable_id}/archive")
+def archive_deliverable(deliverable_id: int, payload: DeliverableArchivePayload, admin: dict[str, Any] = Depends(admin_from_request)) -> dict[str, Any]:
+    conn=get_connection()
+    try:
+        row=conn.execute("SELECT * FROM deliverables WHERE id=? AND COALESCE(is_archived,0)=0",(deliverable_id,)).fetchone()
+        if not row: raise HTTPException(status_code=404,detail="有效交付物不存在。")
+        before=dict(row); reason=_clean_text(payload.reason,"归档原因",500)
+        conn.execute("UPDATE deliverables SET is_archived=1,archive_reason=?,updated_at=?,updated_by=?,update_mode='manual_archive',update_reason=? WHERE id=?",(reason,now_iso(),admin.get("username","admin"),reason,deliverable_id))
+        _audit_deliverable(conn,deliverable_id,"archive",admin.get("username","admin"),before,{},reason)
+        conn.commit(); return {"ok":True}
+    finally: conn.close()
+
+
+@app.post("/api/deliverables/{deliverable_id}/restore")
+def restore_deliverable(deliverable_id: int, admin: dict[str, Any] = Depends(admin_from_request)) -> dict[str, Any]:
+    conn=get_connection()
+    try:
+        row=conn.execute("SELECT * FROM deliverables WHERE id=? AND COALESCE(is_archived,0)=1",(deliverable_id,)).fetchone()
+        if not row: raise HTTPException(status_code=404,detail="已归档交付物不存在。")
+        before=dict(row); duplicate=conn.execute("SELECT id FROM deliverables WHERE is_archived=0 AND lower(trim(name))=lower(trim(?))",(row["name"],)).fetchone()
+        if duplicate: raise HTTPException(status_code=409,detail="有效清单已有同名交付物，无法恢复；请先处理重复项。")
+        conn.execute("UPDATE deliverables SET is_archived=0,archive_reason='',updated_at=?,updated_by=?,update_mode='manual_restore',update_reason='管理员恢复' WHERE id=?",(now_iso(),admin.get("username","admin"),deliverable_id))
+        _audit_deliverable(conn,deliverable_id,"restore",admin.get("username","admin"),before,{"is_archived":0})
+        conn.commit(); return {"ok":True}
+    finally: conn.close()
 
 
 @app.get("/api/documents/{document_id}/preview")

@@ -635,6 +635,7 @@ evidence 必须逐字来自本批次，不得补造责任人、日期或事实�
         conn.execute("UPDATE documents SET analysis_status=?,analysis_at=?,analysis_error=?,analysis_raw_response=? WHERE id=?",
                      (status, now_iso(), error, compact_text("\n".join(raw_responses), 12000), document_id))
         conn.commit()
+        _auto_update_matched_deliverables(document_id, text)
         return {"ok":not failed,"partial":bool(failed),"items":len(recognition["candidates"])+len(non_task_items),"rejected":len(recognition["rejected"]),"coverage":recognition["coverage"],"failedBatches":failed}
     except Exception as exc:
         conn.rollback()
@@ -849,6 +850,54 @@ def list_documents() -> list[dict[str, Any]]:
                 item["recognition_report"] = {}
             item["recognition_rejection_examples"] = rejection_map.get(item["id"], [])
         return documents
+    finally:
+        conn.close()
+
+
+def _auto_update_matched_deliverables(document_id: int, source_text: str) -> None:
+    """Apply only verifiable, high-confidence evidence to a unique existing deliverable.
+
+    New requirements and ambiguous matches remain pending for administrator review.
+    Existing status, owner, dates and primary file are never overwritten here.
+    """
+    conn = get_connection()
+    try:
+        suggestions = rows_to_dicts(conn.execute(
+            "SELECT * FROM update_suggestions WHERE document_id=? AND suggestion_type='deliverable' AND status='pending' AND confidence>=0.90",
+            (document_id,),
+        ).fetchall())
+        docs = row_to_dict(conn.execute("SELECT effective_date,period_end FROM documents d LEFT JOIN weekly_reports w ON w.document_id=d.id WHERE d.id=?", (document_id,)).fetchone()) or {}
+        source_date = str(docs.get("period_end") or docs.get("effective_date") or "")[:10]
+        for suggestion in suggestions:
+            evidence = str(suggestion.get("evidence_text") or "")
+            if not evidence_in_source(evidence, source_text):
+                continue
+            title = str(suggestion.get("title") or "").strip()
+            rows = rows_to_dicts(conn.execute("SELECT * FROM deliverables WHERE COALESCE(is_archived,0)=0").fetchall())
+            ranked = sorted(((_deliverable_match_score(title, row["name"]), row) for row in rows), key=lambda item:item[0], reverse=True)
+            if not ranked or ranked[0][0] < 0.90 or (len(ranked)>1 and ranked[1][0] >= 0.90):
+                continue
+            row = ranked[0][1]
+            updates = {}
+            if not row.get("document_id"):
+                updates["document_id"] = document_id
+            if not row.get("description") and suggestion.get("description"):
+                updates["description"] = suggestion["description"]
+            if not row.get("requirement_source"):
+                updates["requirement_source"] = "项目资料（AI高置信匹配）"
+            if updates:
+                assignments = ",".join(f"{key}=?" for key in updates)
+                conn.execute(f"UPDATE deliverables SET {assignments},last_source_document_id=?,last_source_date=?,updated_by='ai',update_mode='ai_evidence',update_reason='高置信原文匹配；仅补充空字段',updated_at=? WHERE id=?",
+                    [*updates.values(),document_id,source_date,now_iso(),row["id"]])
+                entity_id = ensure_entity(conn,"deliverable",int(row["id"]),row["name"])
+                attach_evidence(conn,entity_id,document_id,evidence,locator=suggestion.get("evidence_locator") or "AI交付物分析",observed={"sourceDate":source_date},confidence=float(suggestion.get("confidence") or 0),method="high_confidence_deliverable_match")
+                _audit = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='deliverable_audit'").fetchone()
+                if _audit:
+                    conn.execute("INSERT INTO deliverable_audit(deliverable_id,action,actor,reason,before_json,after_json,created_at) VALUES(?,?,?,?,?,?,?)",
+                        (row["id"],"ai_update","ai","唯一高置信匹配；未覆盖状态/责任人/日期",json.dumps(row,ensure_ascii=False,default=str),json.dumps(updates,ensure_ascii=False),now_iso()))
+        conn.commit()
+    except Exception:
+        conn.rollback()
     finally:
         conn.close()
 
