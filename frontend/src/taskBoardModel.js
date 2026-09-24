@@ -18,4 +18,10 @@ export function filterTasks(tasks, { scope = "official", query = "", status = "a
 }
 export const togglePageSelection = (selected, ids) => ids.every(id => selected.includes(id)) ? selected.filter(id => !ids.includes(id)) : [...new Set([...selected, ...ids])];
 export const pendingGanttIds = (tasks, selected, value) => tasks.filter(t => selected.includes(t.id) && isOfficial(t) && Number(t.show_in_gantt || 0) !== Number(value)).map(t => t.id);
-export const selectionAfterBatch = (selected, result) => !result ? selected : selected.filter(id => !(result.updatedIds || []).includes(id));
+export const selectionAfterBatch = (selected, result) => {
+  if (!result) return selected;
+  // A successful batch finishes the selected work queue. Keep only records
+  // explicitly reported as failed so users can correct and retry them.
+  const failed = new Set((result.skipped || []).map(item => Number(item.id)));
+  return selected.filter(id => failed.has(Number(id)));
+};

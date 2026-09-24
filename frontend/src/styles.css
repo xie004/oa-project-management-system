@@ -380,6 +380,7 @@ input[type="checkbox"] {
 .tb-bulk { padding: 12px; background: var(--blue-soft); border-radius: 8px; font-size: 13px; }
 .tb-bulk label, .tb-gantt label { display: inline-flex; align-items: center; gap: 8px; cursor: pointer; }
 .tb-bulk label { min-height: 32px; }
+.tb-bulk-note { color: var(--muted); line-height: 1.4; }
 .tb-result { margin-top: 12px; padding: 12px; background: #f0f7ff; border-left: 3px solid var(--blue); line-height: 1.6; }
 .tb-create summary { cursor: pointer; color: var(--blue); font-weight: 600; }
 .tb-create[open] summary { margin-bottom: 14px; }

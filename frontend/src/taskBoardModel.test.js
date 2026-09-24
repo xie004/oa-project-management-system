@@ -24,8 +24,9 @@ test('gantt actions skip already-added, observations and archived tasks', () => 
 });
 test('success clears only successful selection; failure retains selection', () => {
   assert.deepEqual(selectionAfterBatch([1, 2], false), [1, 2]);
-  assert.deepEqual(selectionAfterBatch([1, 2], { updatedIds: [1] }), [2]);
-  assert.deepEqual(selectionAfterBatch([1, 2], { updatedIds: [1, 2] }), []);
+  assert.deepEqual(selectionAfterBatch([1, 2], { updatedIds: [1] }), []);
+  assert.deepEqual(selectionAfterBatch([1, 2], { updatedIds: [1], skipped: [{ id: 2, reason: '失败' }] }), [2]);
+  assert.deepEqual(selectionAfterBatch([1, 2], { updatedIds: [1, 2], skipped: [] }), []);
 });
 test('gantt filter hides added tasks without deleting them', () => {
   assert.deepEqual(filterTasks(tasks, { gantt: 'out' }).map(t => t.id), [2, 5]);
