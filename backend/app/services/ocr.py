@@ -11,11 +11,15 @@ import fitz
 
 from app.database import get_connection, now_iso, row_to_dict, rows_to_dicts
 from app.services.ai import _post_json, _url, ai_config
-from app.services.extractors import compact_text
+from app.services.extractors import MAX_PDF_SIZE, compact_text
 
 
 OCR_MIN_TEXT_CHARS = 80
 OCR_RENDER_ZOOM = 1.7
+# These limits keep a single scanned PDF from monopolising the in-process worker.
+# They are processing limits, not access-control decisions.
+MAX_OCR_PDF_SIZE = MAX_PDF_SIZE
+MAX_OCR_PAGES = 50
 
 
 class OcrWorker:
@@ -51,8 +55,30 @@ class OcrWorker:
 worker = OcrWorker()
 
 
+def ocr_skip_reason(path: Path, extracted_text: str) -> str | None:
+    if path.suffix.lower() != ".pdf":
+        return "仅 PDF 文件支持 OCR"
+    if len(compact_text(extracted_text, 1000)) >= OCR_MIN_TEXT_CHARS:
+        return "已抽取到足够正文，无需 OCR"
+    try:
+        size = path.stat().st_size
+    except OSError as exc:
+        return f"无法读取 PDF 文件：{exc}"
+    if size > MAX_OCR_PDF_SIZE:
+        return f"PDF 超过 OCR 处理上限（{MAX_OCR_PDF_SIZE // 1024 // 1024} MiB）"
+    try:
+        total = pdf_page_count(path)
+    except Exception as exc:
+        return f"无法读取 PDF 页数：{exc}"
+    if total > MAX_OCR_PAGES:
+        return f"PDF 共 {total} 页，超过 OCR 处理上限（{MAX_OCR_PAGES} 页）"
+    if total <= 0:
+        return "PDF 没有可处理页面"
+    return None
+
+
 def should_ocr_pdf(path: Path, extracted_text: str) -> bool:
-    return path.suffix.lower() == ".pdf" and len(compact_text(extracted_text, 1000)) < OCR_MIN_TEXT_CHARS
+    return ocr_skip_reason(path, extracted_text) is None
 
 
 def pdf_page_count(path: Path) -> int:
@@ -60,33 +86,56 @@ def pdf_page_count(path: Path) -> int:
         return len(doc)
 
 
-def enqueue_document_ocr(document_id: int, path: Path, conn=None) -> None:
+def enqueue_document_ocr(
+    document_id: int,
+    path: Path,
+    conn=None,
+    *,
+    start_worker: bool = True,
+) -> dict[str, Any]:
     owns_connection = conn is None
     conn = conn or get_connection()
     now = now_iso()
+    result: dict[str, Any]
     try:
-        total = pdf_page_count(path)
-        conn.execute(
-            """
-            UPDATE documents
-            SET ocr_status = 'pending', ocr_progress = 0, ocr_pages_total = ?,
-                ocr_pages_done = 0, ocr_error = '', ocr_at = ?
-            WHERE id = ?
-            """,
-            (total, now, document_id),
-        )
-        for page_number in range(1, total + 1):
+        reason = ocr_skip_reason(path, "")
+        if reason:
+            status = "not_required" if reason == "已抽取到足够正文，无需 OCR" else "skipped"
+            conn.execute("DELETE FROM ocr_pages WHERE document_id = ?", (document_id,))
             conn.execute(
                 """
-                INSERT INTO ocr_pages(document_id, page_number, text, status, error, updated_at)
-                VALUES(?, ?, '', 'pending', '', ?)
-                ON CONFLICT(document_id, page_number) DO UPDATE SET
-                    status = CASE WHEN ocr_pages.status = 'completed' THEN ocr_pages.status ELSE 'pending' END,
-                    error = '',
-                    updated_at = excluded.updated_at
+                UPDATE documents
+                SET ocr_status = ?, ocr_progress = 0, ocr_pages_total = 0,
+                    ocr_pages_done = 0, ocr_error = ?, ocr_at = ?
+                WHERE id = ?
                 """,
-                (document_id, page_number, now),
+                (status, reason, now, document_id),
             )
+            result = {"ok": False, "skipped": True, "error": reason}
+        else:
+            total = pdf_page_count(path)
+            conn.execute(
+                """
+                UPDATE documents
+                SET ocr_status = 'pending', ocr_progress = 0, ocr_pages_total = ?,
+                    ocr_pages_done = 0, ocr_error = '', ocr_at = ?
+                WHERE id = ?
+                """,
+                (total, now, document_id),
+            )
+            for page_number in range(1, total + 1):
+                conn.execute(
+                    """
+                    INSERT INTO ocr_pages(document_id, page_number, text, status, error, updated_at)
+                    VALUES(?, ?, '', 'pending', '', ?)
+                    ON CONFLICT(document_id, page_number) DO UPDATE SET
+                        status = CASE WHEN ocr_pages.status = 'completed' THEN ocr_pages.status ELSE 'pending' END,
+                        error = '',
+                        updated_at = excluded.updated_at
+                    """,
+                    (document_id, page_number, now),
+                )
+            result = {"ok": True, "pages": total}
         if owns_connection:
             conn.commit()
     except Exception as exc:
@@ -96,10 +145,13 @@ def enqueue_document_ocr(document_id: int, path: Path, conn=None) -> None:
         )
         if owns_connection:
             conn.commit()
+        result = {"ok": False, "error": str(exc)}
     finally:
         if owns_connection:
             conn.close()
-    worker.start()
+    if start_worker and result.get("ok"):
+        worker.start()
+    return result
 
 
 def next_pending_document() -> dict[str, Any] | None:
@@ -292,12 +344,18 @@ def process_document_ocr(document_id: int) -> dict[str, Any]:
     try:
         status = update_document_ocr_rollup(conn, document_id)
         text = combined_ocr_text(document_id, conn)
-        if text:
-            from app.services.ai import index_document_knowledge
-            from app.services.authority import analyze_document_authority
+        conn.commit()
+    finally:
+        conn.close()
 
-            index_document_knowledge(document_id, text, document["name"], conn=conn)
-            analyze_document_authority(document_id, text, conn=conn)
+    if text:
+        from app.services.ai import index_document_knowledge
+        from app.services.authority import analyze_document_authority
+
+        index_document_knowledge(document_id, text, document["name"])
+        analyze_document_authority(document_id, text)
+        conn = get_connection()
+        try:
             conn.execute(
                 """
                 UPDATE documents
@@ -306,10 +364,16 @@ def process_document_ocr(document_id: int) -> dict[str, Any]:
                 """,
                 (compact_text(text, 500), document_id),
             )
-        conn.commit()
-        return {"ok": status in {"completed", "partial"}, "status": status, "textLength": len(text)}
-    finally:
-        conn.close()
+            conn.commit()
+        finally:
+            conn.close()
+        try:
+            from app.services.wiki import queue_wiki_refresh
+
+            queue_wiki_refresh(document.get("doc_category") or "other", trigger="ocr_completed")
+        except Exception:
+            pass
+    return {"ok": status in {"completed", "partial"}, "status": status, "textLength": len(text)}
 
 
 def retry_document_ocr(document_id: int) -> dict[str, Any]:
@@ -318,6 +382,10 @@ def retry_document_ocr(document_id: int) -> dict[str, Any]:
         document = row_to_dict(conn.execute("SELECT * FROM documents WHERE id = ?", (document_id,)).fetchone())
         if not document:
             return {"ok": False, "error": "文档不存在"}
+        path = Path(document["path"])
+        reason = ocr_skip_reason(path, "")
+        if reason:
+            return {"ok": False, "error": reason}
         conn.execute(
             """
             UPDATE ocr_pages
@@ -344,7 +412,8 @@ def ocr_status() -> dict[str, Any]:
                 SUM(CASE WHEN ocr_status = 'processing' THEN 1 ELSE 0 END) AS processing,
                 SUM(CASE WHEN ocr_status = 'completed' THEN 1 ELSE 0 END) AS completed,
                 SUM(CASE WHEN ocr_status = 'failed' THEN 1 ELSE 0 END) AS failed,
-                SUM(CASE WHEN ocr_status = 'partial' THEN 1 ELSE 0 END) AS partial
+                SUM(CASE WHEN ocr_status = 'partial' THEN 1 ELSE 0 END) AS partial,
+                SUM(CASE WHEN ocr_status = 'skipped' THEN 1 ELSE 0 END) AS skipped
             FROM documents
             """
         ).fetchone()

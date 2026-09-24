@@ -27,9 +27,11 @@
 http://本机IP:8010
 ```
 
+如 8010 端口被占用，启动脚本会改用 8012，并在窗口打印实际访问地址。
+
 ## 迁移
 
-复制整个 `oa-project-management-system` 目录到新电脑或服务器即可。迁移后进入目录重新执行：
+复制整个 `oa-project-management-system` 目录到新电脑或服务器，并同时备份/复制运行数据库。Windows 默认运行数据位于 `%USERPROFILE%\OAProjectManagementSystem\data`，也可通过 `OA_PM_DATA_DIR` 指定其他本地目录。数据库不应直接放在 WPS 同步目录内运行；首次启动会在目标本地目录不存在数据库时，从旧版 `backend/data/oa_project.db` 迁移一份（原文件保留）。迁移后进入项目目录重新执行：
 
 ```powershell
 .\start.ps1

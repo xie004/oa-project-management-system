@@ -10,13 +10,21 @@ from typing import Any, Iterable
 
 SYSTEM_ROOT = Path(__file__).resolve().parents[2]
 BACKEND_ROOT = SYSTEM_ROOT / "backend"
-DATA_DIR = BACKEND_ROOT / "data"
+LEGACY_DATA_DIR = BACKEND_ROOT / "data"
+# SQLite WAL/shm files are not reliable inside WPSDrive's on-demand cloud folder.
+# Keep runtime data on a local filesystem; OA_PM_DATA_DIR makes migration portable.
+DEFAULT_DATA_DIR = (
+    Path.home() / "OAProjectManagementSystem" / "data"
+    if os.name == "nt" else LEGACY_DATA_DIR
+)
+DATA_DIR = Path(os.environ.get("OA_PM_DATA_DIR", str(DEFAULT_DATA_DIR))).resolve()
 DB_PATH = DATA_DIR / "oa_project.db"
 DEFAULT_MONITOR_ROOT = Path(
     os.environ.get("OA_PM_MONITOR_ROOT", str(SYSTEM_ROOT.parent))
 ).resolve()
 
 PROJECT_PLAN_VERSION = "2026-06-09-refined-from-project-files"
+SQLITE_BUSY_TIMEOUT_MS = 15_000
 
 DEFAULT_INTELLIGENT_ANALYSIS = {
     "enabled": False,
@@ -149,26 +157,6 @@ PROJECT_PLAN_MILESTONES = [
     ("试运行满 30 日", "正式上线后不少于 30 日试运行，覆盖科学城总部、琶洲、顺德、东莞基地。", "2026-10-07", "", "planned", "green"),
     ("测评与验收资料齐套", "完成不低于二级等保测评、软件测评、迁移一致性校验和验收材料汇编。", "2026-10-15", "", "planned", "green"),
     ("项目整体验收完成", "组织验收小组完成整体验收，形成验收报告并进入质保期。", "2026-10-30", "", "planned", "green"),
-]
-
-PROJECT_PLAN_MILESTONE_TITLES = {item[0] for item in PROJECT_PLAN_MILESTONES}
-
-OBSOLETE_SEED_MILESTONE_TITLES = [
-    "项目启动会完成",
-    "合同与需求资料归档",
-    "项目组织与启动",
-    "需求调研与范围确认",
-    "系统集成需求清单确认",
-    "服务器资源申请与确认",
-    "测试环境与资源准备",
-    "表单迁移与前台逻辑落地",
-    "表单与数据迁移",
-    "系统集成开发与联调",
-    "业务测试与问题整改",
-    "上线准备与试运行",
-    "上线切换与试运行",
-    "项目验收",
-    "项目验收与资料归档",
 ]
 
 PROJECT_PLAN_BREAKDOWN = [
@@ -345,9 +333,17 @@ def now_iso() -> str:
 
 def get_connection() -> sqlite3.Connection:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn = sqlite3.connect(
+        DB_PATH,
+        timeout=SQLITE_BUSY_TIMEOUT_MS / 1000,
+        check_same_thread=False,
+    )
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
+    # WAL improves reader/writer concurrency. Keep FULL durability so a power
+    # interruption cannot acknowledge a project-data write that never reaches disk.
+    conn.execute("PRAGMA synchronous = FULL")
     return conn
 
 
@@ -416,13 +412,63 @@ def default_monitor_types(root: Path = DEFAULT_MONITOR_ROOT) -> dict[str, dict[s
             "patterns": ["需求", "变更", "流程", "集成"],
             "enabled": True,
         },
+        "acceptance_launch": {
+            "label": "交付物及验收",
+            "directories": [str(root / "交付物及验收")],
+            "patterns": ["交付", "验收", "报告", "手册", "上线"],
+            "enabled": True,
+        },
+        "other": {
+            "label": "其他项目资料",
+            "directories": [str(root / "项目资料")],
+            "patterns": [],
+            "enabled": True,
+        },
     }
+
+
+def _migrate_legacy_database_once() -> None:
+    """Copy an intact legacy DB off the sync drive before enabling WAL writes."""
+    legacy = LEGACY_DATA_DIR / "oa_project.db"
+    if DATA_DIR != DEFAULT_DATA_DIR.resolve() or DB_PATH.exists() or not legacy.exists():
+        return
+    wal = legacy.with_name(legacy.name + "-wal")
+    if wal.exists() and wal.stat().st_size:
+        raise RuntimeError("旧数据库仍有未合并的 WAL 数据，请先关闭旧服务并备份，不能只复制主文件。")
+    temporary = DB_PATH.with_name("oa_project.migrating.db")
+    source = destination = None
+    try:
+        # WPS on-demand sidecar placeholders can make normal SQLite open fail.
+        # A zero-sized WAL plus immutable main file gives a consistent snapshot.
+        source = sqlite3.connect(f"file:{legacy.as_posix()}?mode=ro&immutable=1", uri=True)
+        if source.execute("PRAGMA quick_check").fetchone()[0] != "ok":
+            raise RuntimeError("旧数据库完整性检查失败，未执行迁移。")
+        destination = sqlite3.connect(temporary)
+        source.backup(destination)
+        if destination.execute("PRAGMA quick_check").fetchone()[0] != "ok":
+            raise RuntimeError("新数据库完整性检查失败，未执行迁移。")
+        destination.close()
+        destination = None
+        source.close()
+        source = None
+        temporary.replace(DB_PATH)
+    finally:
+        if destination is not None:
+            destination.close()
+        if source is not None:
+            source.close()
+        if temporary.exists():
+            temporary.unlink()
 
 
 def init_db() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+    _migrate_legacy_database_once()
     conn = get_connection()
     try:
+        # WAL lets readers continue while a short write transaction is active.
+        # It is persistent for this database and only needs to be requested at startup.
+        conn.execute("PRAGMA journal_mode = WAL")
         conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS system_settings (
@@ -526,6 +572,11 @@ def init_db() -> None:
                 progress INTEGER NOT NULL DEFAULT 0,
                 source TEXT,
                 show_in_gantt INTEGER NOT NULL DEFAULT 0,
+                task_kind TEXT NOT NULL DEFAULT 'observation',
+                status_as_of TEXT,
+                status_source_document_id INTEGER REFERENCES documents(id) ON DELETE SET NULL,
+                status_confidence REAL NOT NULL DEFAULT 0,
+                status_update_mode TEXT NOT NULL DEFAULT 'manual',
                 source_document_id INTEGER REFERENCES documents(id) ON DELETE SET NULL,
                 is_archived INTEGER NOT NULL DEFAULT 0,
                 merged_into_id INTEGER,
@@ -671,6 +722,11 @@ def init_db() -> None:
                 content TEXT,
                 source_json TEXT NOT NULL DEFAULT '[]',
                 status TEXT NOT NULL DEFAULT 'draft',
+                source_cutoff_date TEXT,
+                latest_available_date TEXT,
+                publish_mode TEXT NOT NULL DEFAULT 'manual',
+                generation_id TEXT,
+                published_suggestion_id INTEGER,
                 updated_at TEXT NOT NULL
             );
 
@@ -684,6 +740,9 @@ def init_db() -> None:
                 generation_error TEXT,
                 strategy_json TEXT NOT NULL DEFAULT '{}',
                 generation_id TEXT,
+                source_cutoff_date TEXT,
+                apply_mode TEXT,
+                auto_apply_reason TEXT,
                 status TEXT NOT NULL DEFAULT 'pending',
                 created_at TEXT NOT NULL,
                 applied_at TEXT
@@ -773,6 +832,9 @@ def init_db() -> None:
             """
         )
         ensure_schema(conn)
+        from app.services.observations import ensure_observation_schema
+        ensure_observation_schema(conn)
+        ensure_performance_indexes(conn)
         seed_defaults(conn)
         ensure_project_plan(conn)
         ensure_deliverables(conn)
@@ -828,6 +890,33 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
             END
             """
         )
+    task_column_definitions = {
+        "task_kind": "TEXT NOT NULL DEFAULT 'observation'",
+        "status_as_of": "TEXT",
+        "status_source_document_id": "INTEGER REFERENCES documents(id) ON DELETE SET NULL",
+        "status_confidence": "REAL NOT NULL DEFAULT 0",
+        "status_update_mode": "TEXT NOT NULL DEFAULT 'manual'",
+    }
+    task_columns = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)").fetchall()}
+    task_kind_was_added = "task_kind" not in task_columns
+    for name, definition in task_column_definitions.items():
+        if name not in task_columns:
+            conn.execute(f"ALTER TABLE tasks ADD COLUMN {name} {definition}")
+    task_kind_filter = "" if task_kind_was_added else (
+        "WHERE task_kind IS NULL OR task_kind = '' "
+        "OR task_kind NOT IN ('baseline', 'confirmed_addition', 'observation')"
+    )
+    conn.execute(
+        f"""
+        UPDATE tasks
+        SET task_kind = CASE
+            WHEN COALESCE(source, '') IN ('项目计划分解', '初始计划') THEN 'baseline'
+            WHEN COALESCE(source, '') = '手动新增' THEN 'confirmed_addition'
+            ELSE 'observation'
+        END
+        {task_kind_filter}
+        """
+    )
     archive_columns = {
         "is_archived": "INTEGER NOT NULL DEFAULT 0",
         "merged_into_id": "INTEGER",
@@ -863,6 +952,9 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         "generation_error": "TEXT",
         "strategy_json": "TEXT NOT NULL DEFAULT '{}'",
         "generation_id": "TEXT",
+        "source_cutoff_date": "TEXT",
+        "apply_mode": "TEXT",
+        "auto_apply_reason": "TEXT",
     }
     current_wiki_suggestion_columns = {
         row["name"] for row in conn.execute("PRAGMA table_info(wiki_suggestions)").fetchall()
@@ -870,6 +962,19 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     for name, definition in wiki_suggestion_columns.items():
         if name not in current_wiki_suggestion_columns:
             conn.execute(f"ALTER TABLE wiki_suggestions ADD COLUMN {name} {definition}")
+    wiki_page_columns = {
+        "source_cutoff_date": "TEXT",
+        "latest_available_date": "TEXT",
+        "publish_mode": "TEXT NOT NULL DEFAULT 'manual'",
+        "generation_id": "TEXT",
+        "published_suggestion_id": "INTEGER",
+    }
+    current_wiki_page_columns = {
+        row["name"] for row in conn.execute("PRAGMA table_info(wiki_pages)").fetchall()
+    }
+    for name, definition in wiki_page_columns.items():
+        if name not in current_wiki_page_columns:
+            conn.execute(f"ALTER TABLE wiki_pages ADD COLUMN {name} {definition}")
     fts_row = conn.execute(
         "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'knowledge_chunks_fts'"
     ).fetchone()
@@ -902,6 +1007,11 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
             content TEXT,
             source_json TEXT NOT NULL DEFAULT '[]',
             status TEXT NOT NULL DEFAULT 'draft',
+            source_cutoff_date TEXT,
+            latest_available_date TEXT,
+            publish_mode TEXT NOT NULL DEFAULT 'manual',
+            generation_id TEXT,
+            published_suggestion_id INTEGER,
             updated_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS wiki_suggestions (
@@ -914,6 +1024,9 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
             generation_error TEXT,
             strategy_json TEXT NOT NULL DEFAULT '{}',
             generation_id TEXT,
+            source_cutoff_date TEXT,
+            apply_mode TEXT,
+            auto_apply_reason TEXT,
             status TEXT NOT NULL DEFAULT 'pending',
             created_at TEXT NOT NULL,
             applied_at TEXT
@@ -1023,6 +1136,23 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     )
 
 
+def ensure_performance_indexes(conn: sqlite3.Connection) -> None:
+    """Create indexes only after compatibility columns have been added."""
+    conn.executescript(
+        """
+        CREATE INDEX IF NOT EXISTS idx_documents_modified ON documents(modified_at DESC, id DESC);
+        CREATE INDEX IF NOT EXISTS idx_documents_ocr_status ON documents(ocr_status, ocr_at, id);
+        CREATE INDEX IF NOT EXISTS idx_tasks_active_schedule ON tasks(is_archived, start_date, due_date, id);
+        CREATE INDEX IF NOT EXISTS idx_tasks_kind_status ON tasks(is_archived, task_kind, status, id);
+        CREATE INDEX IF NOT EXISTS idx_milestones_active_schedule ON milestones(is_archived, planned_date, id);
+        CREATE INDEX IF NOT EXISTS idx_risks_active ON risks(is_archived, id DESC);
+        CREATE INDEX IF NOT EXISTS idx_changes_active ON change_requests(is_archived, id DESC);
+        CREATE INDEX IF NOT EXISTS idx_deliverables_active_status ON deliverables(is_archived, status, id);
+        CREATE INDEX IF NOT EXISTS idx_ocr_pages_pending ON ocr_pages(document_id, status, page_number);
+        """
+    )
+
+
 def seed_defaults(conn: sqlite3.Connection) -> None:
     now = now_iso()
     settings_count = conn.execute("SELECT COUNT(*) AS c FROM system_settings").fetchone()["c"]
@@ -1032,6 +1162,17 @@ def seed_defaults(conn: sqlite3.Connection) -> None:
         set_setting(conn, "monitor_types", default_monitor_types(DEFAULT_MONITOR_ROOT))
         set_setting(conn, "ignored_directories", ["oa-project-management-system", ".venv", "node_modules", "dist"])
         set_setting(conn, "last_scan_at", "")
+    else:
+        monitor_types = get_setting(conn, "monitor_types", {})
+        if isinstance(monitor_types, dict):
+            defaults = default_monitor_types(Path(get_setting(conn, "default_monitor_dir", str(DEFAULT_MONITOR_ROOT))))
+            changed = False
+            for key in ("acceptance_launch", "other"):
+                if key not in monitor_types:
+                    monitor_types[key] = defaults[key]
+                    changed = True
+            if changed:
+                set_setting(conn, "monitor_types", monitor_types)
     intelligent_analysis = get_setting(conn, "intelligent_analysis")
     if intelligent_analysis is None:
         set_setting(conn, "intelligent_analysis", DEFAULT_INTELLIGENT_ANALYSIS)
@@ -1101,9 +1242,9 @@ def seed_defaults(conn: sqlite3.Connection) -> None:
             """
             INSERT INTO tasks(
                 title, description, owner, status, priority, color_status, start_date, due_date,
-                progress, source, created_at, updated_at
+                progress, source, task_kind, created_at, updated_at
             )
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, '初始计划', ?, ?)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, '初始计划', 'baseline', ?, ?)
             """,
             [(*item, now, now) for item in tasks],
         )
@@ -1145,85 +1286,59 @@ def ensure_deliverables(conn: sqlite3.Connection) -> None:
 
 
 def ensure_project_plan(conn: sqlite3.Connection) -> None:
-    if get_setting(conn, "project_plan_version") != PROJECT_PLAN_VERSION:
-        set_setting(conn, "project_plan_version", PROJECT_PLAN_VERSION)
+    """Add missing baseline records without changing user-maintained project data.
+
+    Project plan constants are useful defaults, but they must not become a hidden
+    migration mechanism.  In particular, title-based updates/deletes cannot tell a
+    seeded record from a record that a user has subsequently edited.
+    """
+    plan_version_changed = get_setting(conn, "project_plan_version") != PROJECT_PLAN_VERSION
+    if get_setting(conn, "project_goals") is None:
         set_setting(conn, "project_goals", PROJECT_GOALS)
+    if get_setting(conn, "project_plan_breakdown") is None:
         set_setting(conn, "project_plan_breakdown", PROJECT_PLAN_BREAKDOWN)
-    elif get_setting(conn, "project_plan_breakdown") is None:
-        set_setting(conn, "project_plan_breakdown", PROJECT_PLAN_BREAKDOWN)
+    if plan_version_changed:
+        set_setting(conn, "project_plan_version", PROJECT_PLAN_VERSION)
 
     now = now_iso()
-    conn.executemany(
-        """
-        DELETE FROM milestones
-        WHERE title = ? AND source_document_id IS NULL
-        """,
-        [(title,) for title in OBSOLETE_SEED_MILESTONE_TITLES],
-    )
 
-    conn.execute(
-        """
-        UPDATE project_profile
-        SET target_date = ?,
-            description = ?,
-            updated_at = ?
-        WHERE id = 1
-        """,
-        (
-            "2026-10-30",
-            "围绕国产化 OA 集成建设，跟踪合同启动、环境部署、数据迁移、300+流程表单、财务预算报销、系统集成、UAT、上线试运行、测评验收全过程。",
-            now,
-        ),
-    )
-
-    for item in PROJECT_PLAN_MILESTONES:
-        exists = conn.execute("SELECT id FROM milestones WHERE title = ?", (item[0],)).fetchone()
-        if exists:
+    if plan_version_changed:
+        for item in PROJECT_PLAN_MILESTONES:
+            exists = conn.execute("SELECT id FROM milestones WHERE title = ?", (item[0],)).fetchone()
+            if exists:
+                continue
             conn.execute(
                 """
-                UPDATE milestones
-                SET description = ?, planned_date = ?, actual_date = ?, status = ?,
-                    color_status = ?, updated_at = ?
-                WHERE title = ?
+                INSERT INTO milestones(
+                    title, description, planned_date, actual_date, status, color_status,
+                    created_at, updated_at
+                )
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (item[1], item[2], item[3], item[4], item[5], now, item[0]),
+                (*item, now, now),
             )
-            continue
-        conn.execute(
-            """
-            INSERT INTO milestones(
-                title, description, planned_date, actual_date, status, color_status,
-                created_at, updated_at
-            )
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (*item, now, now),
-        )
 
     if get_setting(conn, "project_plan_task_version") != PROJECT_PLAN_TASK_VERSION:
-        set_setting(conn, "project_plan_task_version", PROJECT_PLAN_TASK_VERSION)
-        conn.execute(
-            """
-            DELETE FROM tasks
-            WHERE source_document_id IS NULL
-              AND COALESCE(source, '') IN ('初始计划', '项目计划分解')
-            """
-        )
-        conn.executemany(
-            """
-            INSERT INTO tasks(
-                title, description, owner, status, priority, color_status, start_date,
-                due_date, progress, source, show_in_gantt, created_at, updated_at
+        for item in PROJECT_PLAN_TASKS:
+            exists = conn.execute(
+                """
+                SELECT id FROM tasks
+                WHERE title = ?
+                  AND source_document_id IS NULL
+                  AND COALESCE(is_archived, 0) = 0
+                """,
+                (item[0],),
+            ).fetchone()
+            if exists:
+                continue
+            conn.execute(
+                """
+                INSERT INTO tasks(
+                    title, description, owner, status, priority, color_status, start_date,
+                    due_date, progress, source, show_in_gantt, task_kind, created_at, updated_at
+                )
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, '项目计划分解', 1, 'baseline', ?, ?)
+                """,
+                (*item, now, now),
             )
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, '项目计划分解', 1, ?, ?)
-            """,
-            [(*item, now, now) for item in PROJECT_PLAN_TASKS],
-        )
-    conn.execute(
-        """
-        UPDATE tasks
-        SET show_in_gantt = 1
-        WHERE COALESCE(source, '') = '项目计划分解'
-          AND COALESCE(show_in_gantt, 0) = 0
-        """
-    )
+        set_setting(conn, "project_plan_task_version", PROJECT_PLAN_TASK_VERSION)

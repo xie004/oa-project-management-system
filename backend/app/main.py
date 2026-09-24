@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import json
+import sqlite3
+from datetime import date
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
-from fastapi import Depends, FastAPI, HTTPException, Request, Response
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, Response, UploadFile, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.auth import (
     SESSION_COOKIE_NAME,
@@ -46,6 +48,7 @@ from app.services.authority import (
 )
 from app.services.data_quality import (
     apply_all_safe_quality_suggestions,
+    apply_selected_quality_suggestions,
     apply_quality_suggestion,
     bootstrap_entities,
     data_quality_status,
@@ -66,7 +69,24 @@ from app.services.scanner import (
     test_structured_extraction,
     watcher,
 )
-from app.services.wiki import apply_all_wiki_suggestions, apply_wiki_suggestion, list_wiki_pages, list_wiki_suggestions, start_wiki_rebuild_job, wiki_job_status
+from app.services import observations
+from app.services.task_reconcile import (
+    promote_task,
+    start_task_progress_reconcile,
+    task_reconcile_status,
+)
+from app.services.uploads import save_upload, upload_status, upload_targets
+from app.services.wiki import (
+    apply_all_wiki_suggestions,
+    apply_wiki_suggestion,
+    list_wiki_page_history,
+    list_wiki_pages,
+    list_wiki_suggestions,
+    rollback_wiki_page,
+    start_current_progress_refresh_job,
+    start_wiki_rebuild_job,
+    wiki_job_status,
+)
 
 
 FRONTEND_DIST = SYSTEM_ROOT / "frontend" / "dist"
@@ -79,6 +99,161 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+TASK_STATUSES = {"not_started", "in_progress", "blocked", "completed", "delayed", "planned", "pending"}
+TASK_PRIORITIES = {"low", "medium", "high"}
+COLOR_STATUSES = {"green", "amber", "red"}
+DELIVERABLE_STATUSES = {"not_started", "draft", "review", "finalized", "submitted"}
+
+
+def _clean_text(value: Any, field_name: str, limit: int, *, required: bool = False) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{field_name}必须是文本")
+    cleaned = value.strip()
+    if required and not cleaned:
+        raise ValueError(f"{field_name}不能为空")
+    if len(cleaned) > limit:
+        raise ValueError(f"{field_name}不能超过{limit}个字符")
+    return cleaned
+
+
+def _normalise_optional_date(value: Any, field_name: str) -> str:
+    if value in (None, ""):
+        return ""
+    if not isinstance(value, str):
+        raise ValueError(f"{field_name}必须是 YYYY-MM-DD 格式")
+    cleaned = value.strip()
+    if not cleaned:
+        return ""
+    try:
+        date.fromisoformat(cleaned)
+    except ValueError as exc:
+        raise ValueError(f"{field_name}必须是 YYYY-MM-DD 格式") from exc
+    return cleaned
+
+
+def _ensure_date_order(start_date: str, due_date: str, start_label: str = "开始日期", due_label: str = "截止日期") -> None:
+    if start_date and due_date and start_date > due_date:
+        raise ValueError(f"{due_label}不能早于{start_label}")
+
+
+def _normalise_boolean(value: Any, field_name: str) -> int:
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int) and value in {0, 1}:
+        return value
+    raise ValueError(f"{field_name}必须是布尔值")
+
+
+def _validation_error(exc: ValueError) -> HTTPException:
+    return HTTPException(status_code=422, detail=str(exc))
+
+
+def _normalise_task_patch_values(values: dict[str, Any]) -> dict[str, Any]:
+    allowed = {
+        "title",
+        "description",
+        "owner",
+        "status",
+        "priority",
+        "color_status",
+        "start_date",
+        "due_date",
+        "progress",
+        "show_in_gantt",
+    }
+    unknown = sorted(set(values) - allowed)
+    if unknown:
+        raise ValueError(f"不支持更新字段：{', '.join(unknown)}")
+    if not values:
+        raise ValueError("至少提供一个可更新字段")
+
+    normalized = dict(values)
+    if "title" in normalized:
+        normalized["title"] = _clean_text(normalized["title"], "任务名称", 200, required=True)
+    for key, label, limit in [("description", "任务说明", 10_000), ("owner", "负责人", 120)]:
+        if key in normalized:
+            normalized[key] = _clean_text(normalized[key], label, limit)
+    if "status" in normalized and normalized["status"] not in TASK_STATUSES:
+        raise ValueError("任务状态不正确")
+    if "priority" in normalized and normalized["priority"] not in TASK_PRIORITIES:
+        raise ValueError("任务优先级不正确")
+    if "color_status" in normalized and normalized["color_status"] not in COLOR_STATUSES:
+        raise ValueError("任务颜色状态不正确")
+    for key, label in [("start_date", "开始日期"), ("due_date", "截止日期")]:
+        if key in normalized:
+            normalized[key] = _normalise_optional_date(normalized[key], label)
+    if "progress" in normalized:
+        progress = normalized["progress"]
+        if isinstance(progress, bool) or not isinstance(progress, int) or not 0 <= progress <= 100:
+            raise ValueError("任务进度必须是 0 到 100 的整数")
+    if "show_in_gantt" in normalized:
+        normalized["show_in_gantt"] = _normalise_boolean(normalized["show_in_gantt"], "甘特图显示")
+    return normalized
+
+
+def _normalise_deliverable_patch_values(values: dict[str, Any]) -> dict[str, Any]:
+    allowed = {
+        "name",
+        "requirement_source",
+        "description",
+        "status",
+        "owner",
+        "planned_date",
+        "submitted_date",
+        "document_id",
+    }
+    unknown = sorted(set(values) - allowed)
+    if unknown:
+        raise ValueError(f"不支持更新字段：{', '.join(unknown)}")
+    if not values:
+        raise ValueError("至少提供一个可更新字段")
+
+    normalized = dict(values)
+    if "name" in normalized:
+        normalized["name"] = _clean_text(normalized["name"], "交付物名称", 200, required=True)
+    for key, label, limit in [
+        ("requirement_source", "需求来源", 500),
+        ("description", "交付物说明", 10_000),
+        ("owner", "负责人", 120),
+    ]:
+        if key in normalized:
+            normalized[key] = _clean_text(normalized[key], label, limit)
+    if "status" in normalized and normalized["status"] not in DELIVERABLE_STATUSES:
+        raise ValueError("交付物状态不正确")
+    for key, label in [("planned_date", "计划日期"), ("submitted_date", "提交日期")]:
+        if key in normalized:
+            normalized[key] = _normalise_optional_date(normalized[key], label)
+    if "document_id" in normalized:
+        document_id = normalized["document_id"]
+        if isinstance(document_id, float):
+            raise ValueError("关联文件编号不正确")
+        if document_id in (None, ""):
+            normalized["document_id"] = None
+        elif isinstance(document_id, bool):
+            raise ValueError("关联文件编号不正确")
+        else:
+            try:
+                document_id = int(document_id)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("关联文件编号不正确") from exc
+            if document_id <= 0:
+                raise ValueError("关联文件编号不正确")
+            normalized["document_id"] = document_id
+    return normalized
+
+
+@app.exception_handler(sqlite3.OperationalError)
+async def sqlite_operational_error_handler(_: Request, exc: sqlite3.OperationalError) -> JSONResponse:
+    message = str(exc).lower()
+    if "locked" in message or "busy" in message:
+        return JSONResponse(
+            status_code=503,
+            content={"detail": "数据正在更新，请稍后重试。"},
+            headers={"Retry-After": "1"},
+        )
+    return JSONResponse(status_code=500, content={"detail": "数据库操作失败。"})
 
 
 class SettingsPayload(BaseModel):
@@ -99,15 +274,50 @@ class PasswordChangePayload(BaseModel):
 
 
 class TaskPayload(BaseModel):
-    title: str
-    description: str = ""
-    owner: str = ""
-    status: str = "not_started"
-    priority: str = "medium"
-    color_status: str = "green"
+    model_config = ConfigDict(extra="forbid")
+
+    title: str = Field(max_length=200)
+    description: str = Field(default="", max_length=10_000)
+    owner: str = Field(default="", max_length=120)
+    status: Literal["not_started", "in_progress", "blocked", "completed", "delayed", "planned", "pending"] = "not_started"
+    priority: Literal["low", "medium", "high"] = "medium"
+    color_status: Literal["green", "amber", "red"] = "green"
     start_date: str = ""
     due_date: str = ""
-    progress: int = 0
+    progress: int = Field(default=0, ge=0, le=100)
+
+    @field_validator("title")
+    @classmethod
+    def validate_title(cls, value: str) -> str:
+        return _clean_text(value, "任务名称", 200, required=True)
+
+    @field_validator("description")
+    @classmethod
+    def validate_description(cls, value: str) -> str:
+        return _clean_text(value, "任务说明", 10_000)
+
+    @field_validator("owner")
+    @classmethod
+    def validate_owner(cls, value: str) -> str:
+        return _clean_text(value, "负责人", 120)
+
+    @field_validator("start_date", "due_date")
+    @classmethod
+    def validate_dates(cls, value: str, info) -> str:
+        labels = {"start_date": "开始日期", "due_date": "截止日期"}
+        return _normalise_optional_date(value, labels[info.field_name])
+
+    @field_validator("progress", mode="before")
+    @classmethod
+    def validate_progress(cls, value: Any) -> int:
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError("任务进度必须是 0 到 100 的整数")
+        return value
+
+    @model_validator(mode="after")
+    def validate_date_order(self) -> "TaskPayload":
+        _ensure_date_order(self.start_date, self.due_date)
+        return self
 
 
 class GenericPatchPayload(BaseModel):
@@ -117,6 +327,15 @@ class GenericPatchPayload(BaseModel):
 class TaskBulkPatchPayload(BaseModel):
     ids: list[int] = Field(default_factory=list)
     values: dict[str, Any]
+
+
+class QualityBatchItemPayload(BaseModel):
+    id: int = Field(gt=0)
+    values: dict[str, Any] = Field(default_factory=dict)
+
+
+class QualityBatchPayload(BaseModel):
+    items: list[QualityBatchItemPayload] = Field(min_length=1, max_length=200)
 
 
 class QuestionPayload(BaseModel):
@@ -148,6 +367,7 @@ def merge_intelligent_analysis_config(payload: dict[str, Any]) -> dict[str, Any]
 def startup() -> None:
     init_db()
     ensure_auth_defaults()
+    observations.resume_batches()
     try:
         bootstrap_entities()
     except Exception:
@@ -356,8 +576,10 @@ def api_ocr_start(document_id: int, _: dict[str, Any] = Depends(admin_from_reque
     path = Path(document["path"])
     if not path.exists():
         raise HTTPException(status_code=404, detail="本地文件不存在。")
-    enqueue_document_ocr(document_id, path)
-    return {"ok": True}
+    result = enqueue_document_ocr(document_id, path)
+    if not result.get("ok"):
+        raise HTTPException(status_code=422, detail=result.get("error", "当前文件不满足 OCR 处理条件。"))
+    return result
 
 
 @app.post("/api/ocr/documents/{document_id}/retry")
@@ -383,6 +605,11 @@ def api_wiki_rebuild_suggestions(_: dict[str, Any] = Depends(admin_from_request)
     return start_wiki_rebuild_job()
 
 
+@app.post("/api/wiki/current-progress/refresh")
+def api_wiki_current_progress_refresh(_: dict[str, Any] = Depends(admin_from_request)) -> dict[str, Any]:
+    return start_current_progress_refresh_job("manual")
+
+
 @app.get("/api/wiki/rebuild-status")
 def api_wiki_rebuild_status(_: dict[str, Any] = Depends(admin_from_request)) -> dict[str, Any]:
     return wiki_job_status()
@@ -399,6 +626,23 @@ def api_wiki_apply(suggestion_id: int, _: dict[str, Any] = Depends(admin_from_re
 @app.post("/api/wiki/suggestions/apply-all")
 def api_wiki_apply_all(_: dict[str, Any] = Depends(admin_from_request)) -> dict[str, Any]:
     return apply_all_wiki_suggestions()
+
+
+@app.get("/api/wiki/pages/{page_key}/history")
+def api_wiki_history(page_key: str, _: dict[str, Any] = Depends(admin_from_request)) -> list[dict[str, Any]]:
+    return list_wiki_page_history(page_key)
+
+
+@app.post("/api/wiki/pages/{page_key}/rollback/{suggestion_id}")
+def api_wiki_rollback(
+    page_key: str,
+    suggestion_id: int,
+    _: dict[str, Any] = Depends(admin_from_request),
+) -> dict[str, Any]:
+    result = rollback_wiki_page(page_key, suggestion_id)
+    if not result.get("ok"):
+        raise HTTPException(status_code=400, detail=result.get("message", "恢复 Wiki 版本失败"))
+    return result
 
 
 @app.post("/api/qa/ask")
@@ -432,6 +676,14 @@ def api_apply_all_safe_quality_suggestions(
     _: dict[str, Any] = Depends(admin_from_request),
 ) -> dict[str, Any]:
     return apply_all_safe_quality_suggestions()
+
+
+@app.post("/api/data-quality/suggestions/apply-selected")
+def api_apply_selected_quality_suggestions(
+    payload: QualityBatchPayload,
+    _: dict[str, Any] = Depends(admin_from_request),
+) -> dict[str, Any]:
+    return apply_selected_quality_suggestions([item.model_dump() for item in payload.items])
 
 
 @app.post("/api/data-quality/suggestions/{suggestion_id}/apply")
@@ -524,13 +776,14 @@ def dashboard() -> dict[str, Any]:
         tasks = rows_to_dicts(
             conn.execute(
                 """
-                SELECT t.*, d.name AS document_name, d.path AS document_path,
+                SELECT t.*, (SELECT state FROM observation_resolutions r WHERE r.task_id=t.id) AS observation_state, d.name AS document_name, d.path AS document_path,
                     (SELECT COUNT(*) FROM project_entities pe
                      JOIN entity_evidence ev ON ev.entity_id = pe.id
                      WHERE pe.entity_type = 'task' AND pe.record_id = t.id) AS source_count
                 FROM tasks t
                 LEFT JOIN documents d ON d.id = t.source_document_id
                 WHERE COALESCE(t.is_archived, 0) = 0
+                  AND t.task_kind IN ('baseline', 'confirmed_addition')
                 ORDER BY
                     COALESCE(t.start_date, ''),
                     COALESCE(t.due_date, ''),
@@ -601,9 +854,21 @@ def dashboard() -> dict[str, Any]:
                 """
             ).fetchall()
         )
+        latest_processed_weekly_date = get_setting(conn, "task_status_as_of", "")
         counts = {
             "tasks": len(tasks),
             "completedTasks": len([task for task in tasks if task["status"] == "completed"]),
+            "officialTasks": len(tasks),
+            "completedOfficialTasks": len([task for task in tasks if task["status"] == "completed"]),
+            "observationTasks": conn.execute(
+                "SELECT COUNT(*) AS c FROM tasks WHERE task_kind = 'observation' AND COALESCE(is_archived, 0) = 0 AND NOT EXISTS (SELECT 1 FROM observation_resolutions r WHERE r.task_id=tasks.id)"
+            ).fetchone()["c"],
+            "pendingStatusReviews": conn.execute(
+                """
+                SELECT COUNT(*) AS c FROM data_quality_suggestions
+                WHERE status = 'pending' AND suggestion_kind IN ('task_status_review', 'task_match_review')
+                """
+            ).fetchone()["c"],
             "milestones": len(milestones),
             "openRisks": len([risk for risk in risks if risk["status"] != "closed"]),
             "changes": len(changes),
@@ -634,6 +899,10 @@ def dashboard() -> dict[str, Any]:
             "projectPlanBreakdown": get_setting(conn, "project_plan_breakdown", []),
             "projectPlanVersion": get_setting(conn, "project_plan_version", ""),
             "lastScanAt": get_setting(conn, "last_scan_at", ""),
+            "taskStatusAsOf": max(
+                [latest_processed_weekly_date, *[str(task.get("status_as_of") or "")[:10] for task in tasks]],
+                default="",
+            ),
         }
     finally:
         conn.close()
@@ -646,17 +915,21 @@ def get_tasks() -> list[dict[str, Any]]:
         records = rows_to_dicts(
             conn.execute(
                 """
-                SELECT t.*, d.name AS document_name, d.path AS document_path,
+                SELECT t.*, (SELECT state FROM observation_resolutions r WHERE r.task_id=t.id) AS observation_state, d.name AS document_name, d.path AS document_path,
+                    COALESCE(w.period_end, SUBSTR(d.effective_date, 1, 10), SUBSTR(d.modified_at, 1, 10)) AS source_date,
                     (SELECT COUNT(*) FROM project_entities pe
                      JOIN entity_evidence ev ON ev.entity_id = pe.id
                      WHERE pe.entity_type = 'task' AND pe.record_id = t.id) AS source_count
                 FROM tasks t
                 LEFT JOIN documents d ON d.id = t.source_document_id
-                WHERE COALESCE(t.is_archived, 0) = 0
+                LEFT JOIN weekly_reports w ON w.document_id = d.id
                 ORDER BY
-                    COALESCE(t.start_date, ''),
-                    COALESCE(t.due_date, ''),
-                    t.id
+                    COALESCE(t.is_archived, 0),
+                    CASE t.task_kind WHEN 'baseline' THEN 1 WHEN 'confirmed_addition' THEN 2 ELSE 3 END,
+                    CASE WHEN t.task_kind IN ('baseline', 'confirmed_addition') THEN COALESCE(t.start_date, t.due_date, '') ELSE '' END,
+                    CASE WHEN t.task_kind = 'observation' THEN COALESCE(w.period_end, d.effective_date, d.modified_at, t.updated_at, '') ELSE '' END DESC,
+                    CASE WHEN t.task_kind IN ('baseline', 'confirmed_addition') THEN t.id ELSE 0 END,
+                    t.id DESC
                 """
             ).fetchall()
         )
@@ -674,9 +947,10 @@ def create_task(payload: TaskPayload) -> dict[str, Any]:
             """
             INSERT INTO tasks(
                 title, description, owner, status, priority, color_status, start_date,
-                due_date, progress, source, show_in_gantt, created_at, updated_at
+                due_date, progress, source, show_in_gantt, task_kind, status_confidence,
+                status_update_mode, created_at, updated_at
             )
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, '手动新增', 1, ?, ?)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, '手动新增', 1, 'confirmed_addition', 1, 'manual', ?, ?)
             """,
             (
                 payload.title,
@@ -702,58 +976,166 @@ def create_task(payload: TaskPayload) -> dict[str, Any]:
 
 @app.patch("/api/tasks/bulk")
 def bulk_update_tasks(payload: TaskBulkPatchPayload) -> dict[str, Any]:
-    ids = [int(item) for item in payload.ids if int(item) > 0]
-    values = {key: payload.values[key] for key in payload.values if key in {"show_in_gantt"}}
-    if "show_in_gantt" in values:
-        values["show_in_gantt"] = 1 if values["show_in_gantt"] else 0
-    if not ids or not values:
-        return {"ok": True, "updated": 0}
+    if not payload.ids or any(item <= 0 for item in payload.ids):
+        raise HTTPException(status_code=422, detail="至少提供一个有效任务编号。")
+    if set(payload.values) != {"show_in_gantt"}:
+        raise HTTPException(status_code=422, detail="批量更新仅支持甘特图显示字段。")
+    try:
+        values = {"show_in_gantt": _normalise_boolean(payload.values["show_in_gantt"], "甘特图显示")}
+    except ValueError as exc:
+        raise _validation_error(exc) from exc
+    ids = sorted(set(payload.ids))
     placeholders = ",".join(["?"] * len(ids))
     conn = get_connection()
     try:
+        records = {
+            row["id"]: row for row in conn.execute(
+                f"SELECT id, task_kind, is_archived FROM tasks WHERE id IN ({placeholders})", ids
+            ).fetchall()
+        }
+        eligible, skipped = [], []
+        for task_id in ids:
+            row = records.get(task_id)
+            reason = ("任务不存在" if row is None else "已归档任务不可修改" if row["is_archived"]
+                      else "识别事项请先关联或提升为正式任务" if row["task_kind"] not in ("baseline", "confirmed_addition") else "")
+            if reason:
+                skipped.append({"id": task_id, "reason": reason})
+            else:
+                eligible.append(task_id)
+        if not eligible:
+            return {"ok": True, "updated": 0, "updatedIds": [], "skipped": skipped}
+        placeholders = ",".join(["?"] * len(eligible))
         assignments = ", ".join([f"{key} = ?" for key in values])
         cursor = conn.execute(
             f"UPDATE tasks SET {assignments}, updated_at = ? WHERE id IN ({placeholders})",
-            [*values.values(), now_iso(), *ids],
+            [*values.values(), now_iso(), *eligible],
         )
         conn.commit()
-        return {"ok": True, "updated": cursor.rowcount}
+        return {"ok": True, "updated": cursor.rowcount, "updatedIds": eligible, "skipped": skipped}
     finally:
         conn.close()
 
 
 @app.patch("/api/tasks/{task_id}")
 def update_task(task_id: int, payload: GenericPatchPayload) -> dict[str, Any]:
-    allowed = {
-        "title",
-        "description",
-        "owner",
-        "status",
-        "priority",
-        "color_status",
-        "start_date",
-        "due_date",
-        "progress",
-        "show_in_gantt",
-    }
-    values = {key: value for key, value in payload.values.items() if key in allowed}
-    if "show_in_gantt" in values:
-        values["show_in_gantt"] = 1 if values["show_in_gantt"] else 0
-    if not values:
-        return {"ok": True}
+    try:
+        values = _normalise_task_patch_values(payload.values)
+    except ValueError as exc:
+        raise _validation_error(exc) from exc
     conn = get_connection()
     try:
+        existing = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if not existing:
+            raise HTTPException(status_code=404, detail="任务不存在。")
+        if existing["is_archived"]:
+            raise HTTPException(status_code=409, detail="已归档任务只读，不可修改")
+        if existing["task_kind"] == "observation":
+            raise HTTPException(status_code=409, detail="识别事项请通过收件箱关联或提升，不可直接修改执行状态")
+        try:
+            _ensure_date_order(
+                values.get("start_date", existing["start_date"] or ""),
+                values.get("due_date", existing["due_date"] or ""),
+            )
+        except ValueError as exc:
+            raise _validation_error(exc) from exc
         assignments = ", ".join([f"{key} = ?" for key in values])
-        conn.execute(
+        cursor = conn.execute(
             f"UPDATE tasks SET {assignments}, updated_at = ? WHERE id = ?",
             [*values.values(), now_iso(), task_id],
         )
+        if cursor.rowcount != 1:
+            raise HTTPException(status_code=404, detail="任务不存在。")
         if "title" in values:
             ensure_entity(conn, "task", task_id, str(values["title"]))
+        if "status" in values or "progress" in values:
+            conn.execute(
+                """
+                UPDATE tasks
+                SET status_confidence = 1, status_update_mode = 'manual',
+                    status_source_document_id = NULL
+                WHERE id = ?
+                """,
+                (task_id,),
+            )
         conn.commit()
         return {"ok": True}
     finally:
         conn.close()
+
+
+@app.post("/api/tasks/reconcile-progress")
+def api_task_reconcile(_: dict[str, Any] = Depends(admin_from_request)) -> dict[str, Any]:
+    return start_task_progress_reconcile("manual")
+
+
+@app.get("/api/tasks/reconcile-status")
+def api_task_reconcile_status(_: dict[str, Any] = Depends(admin_from_request)) -> dict[str, Any]:
+    return task_reconcile_status()
+
+
+class ObservationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    id: int = 0
+    action: Literal["link", "promote", "ignore", "transfer"]
+    fingerprint: str = Field(min_length=1, max_length=100)
+    title: str | None = Field(default=None, max_length=300)
+    owner: str | None = Field(default=None, max_length=200)
+    due_date: str | None = Field(default=None, max_length=10)
+    targetId: int | None = None
+    keepIndependent: bool = False
+    reason: str = Field(default="", max_length=2000)
+    suggestionType: Literal["risk", "change_request", "deliverable"] | None = None
+
+
+class ObservationPreview(BaseModel):
+    ids: list[int] = Field(min_length=1, max_length=100)
+
+
+class ObservationBatch(BaseModel):
+    items: list[ObservationRequest] = Field(min_length=1, max_length=100)
+    requestKey: str = Field(min_length=1, max_length=100)
+
+
+@app.get("/api/task-observations")
+def api_observations(category: Literal["all", "link", "new", "conflict", "processed"] = "all",
+                     page: int = Query(default=1, ge=1), page_size: int = Query(default=15, ge=1, le=100)):
+    return observations.list_observations(category, page, page_size)
+
+
+@app.post("/api/task-observations/preview")
+def api_observation_preview(payload: ObservationPreview, admin: dict = Depends(admin_from_request)):
+    try:
+        return observations.preview(payload.ids)
+    except ValueError as exc:
+        raise _validation_error(exc) from exc
+
+
+@app.post("/api/task-observations/resolve-batch")
+def api_observation_batch(payload: ObservationBatch, admin: dict = Depends(admin_from_request)):
+    try:
+        return observations.start_batch([item.model_dump(exclude_none=True) for item in payload.items], payload.requestKey, admin["username"])
+    except ValueError as exc:
+        raise _validation_error(exc) from exc
+
+
+@app.get("/api/task-observations/batch-status")
+def api_observation_batch_status(batch_id: str | None = None, admin: dict = Depends(admin_from_request)):
+    return observations.batch_status(batch_id)
+
+
+@app.post("/api/task-observations/{task_id}/resolve")
+def api_observation_resolve(task_id: int, payload: ObservationRequest, admin: dict = Depends(admin_from_request)):
+    try:
+        return observations.resolve({**payload.model_dump(exclude_none=True), "id": task_id}, admin["username"])
+    except ValueError as exc:
+        raise _validation_error(exc) from exc
+
+
+@app.post("/api/tasks/{task_id}/promote")
+def api_promote_task(task_id: int, payload: ObservationRequest, admin: dict = Depends(admin_from_request)):
+    if payload.action != "promote":
+        raise HTTPException(status_code=422, detail="提升接口仅支持 promote")
+    return api_observation_resolve(task_id, payload, admin)
 
 
 @app.get("/api/milestones")
@@ -849,6 +1231,32 @@ def get_documents() -> list[dict[str, Any]]:
     return list_documents()
 
 
+@app.get("/api/uploads/targets")
+def get_upload_targets() -> list[dict[str, Any]]:
+    return upload_targets()
+
+
+@app.get("/api/uploads/status")
+def get_upload_status() -> dict[str, Any]:
+    return upload_status()
+
+
+@app.post("/api/documents/upload")
+def upload_document(
+    file: UploadFile = File(...),
+    monitor_type: str = Form("other"),
+    directory_index: int = Form(0),
+) -> dict[str, Any]:
+    try:
+        result = save_upload(file.file, file.filename or "", monitor_type, directory_index)
+        watcher.start()
+        return result
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    finally:
+        file.file.close()
+
+
 @app.get("/api/deliverables")
 def get_deliverables() -> list[dict[str, Any]]:
     conn = get_connection()
@@ -876,32 +1284,64 @@ def get_deliverables() -> list[dict[str, Any]]:
         conn.close()
 
 
-@app.patch("/api/deliverables/{deliverable_id}")
-def update_deliverable(deliverable_id: int, payload: GenericPatchPayload) -> dict[str, Any]:
-    allowed = {
-        "name",
-        "requirement_source",
-        "description",
-        "status",
-        "owner",
-        "planned_date",
-        "submitted_date",
-        "document_id",
-    }
-    values = {key: value for key, value in payload.values.items() if key in allowed}
-    if "status" in values and values["status"] not in {"not_started", "draft", "review", "finalized", "submitted"}:
-        raise HTTPException(status_code=400, detail="交付物状态不正确。")
-    if "document_id" in values and values["document_id"] in ("", None):
-        values["document_id"] = None
-    if not values:
-        return {"ok": True}
+@app.post("/api/deliverables/{deliverable_id}/upload")
+def upload_deliverable_document(
+    deliverable_id: int,
+    file: UploadFile = File(...),
+    monitor_type: str = Form("acceptance_launch"),
+    directory_index: int = Form(0),
+) -> dict[str, Any]:
     conn = get_connection()
     try:
+        exists = conn.execute(
+            "SELECT id FROM deliverables WHERE id = ? AND COALESCE(is_archived, 0) = 0",
+            (deliverable_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    if not exists:
+        raise HTTPException(status_code=404, detail="交付物不存在或已归档。")
+    try:
+        result = save_upload(file.file, file.filename or "", monitor_type, directory_index, deliverable_id)
+        watcher.start()
+        return result
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    finally:
+        file.file.close()
+
+
+@app.patch("/api/deliverables/{deliverable_id}")
+def update_deliverable(deliverable_id: int, payload: GenericPatchPayload) -> dict[str, Any]:
+    try:
+        values = _normalise_deliverable_patch_values(payload.values)
+    except ValueError as exc:
+        raise _validation_error(exc) from exc
+    conn = get_connection()
+    try:
+        existing = conn.execute("SELECT * FROM deliverables WHERE id = ?", (deliverable_id,)).fetchone()
+        if not existing:
+            raise HTTPException(status_code=404, detail="交付物不存在。")
+        try:
+            _ensure_date_order(
+                values.get("planned_date", existing["planned_date"] or ""),
+                values.get("submitted_date", existing["submitted_date"] or ""),
+                "计划日期",
+                "提交日期",
+            )
+        except ValueError as exc:
+            raise _validation_error(exc) from exc
+        if values.get("document_id") is not None:
+            document = conn.execute("SELECT id FROM documents WHERE id = ?", (values["document_id"],)).fetchone()
+            if not document:
+                raise HTTPException(status_code=422, detail="关联文件不存在。")
         assignments = ", ".join([f"{key} = ?" for key in values])
-        conn.execute(
+        cursor = conn.execute(
             f"UPDATE deliverables SET {assignments}, updated_at = ? WHERE id = ?",
             [*values.values(), now_iso(), deliverable_id],
         )
+        if cursor.rowcount != 1:
+            raise HTTPException(status_code=404, detail="交付物不存在。")
         if "name" in values:
             ensure_entity(conn, "deliverable", deliverable_id, str(values["name"]))
         conn.commit()

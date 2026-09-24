@@ -29,9 +29,11 @@ import {
   Settings,
   ShieldCheck,
   Sparkles,
+  Upload,
   X
 } from "lucide-react";
 import "./styles.css";
+import TaskBoard from "./TaskBoard.jsx";
 
 const api = {
   async error(response) {
@@ -53,6 +55,14 @@ const api = {
       method: "POST",
       headers: body ? { "Content-Type": "application/json" } : undefined,
       body: body ? JSON.stringify(body) : undefined
+    });
+    if (!response.ok) throw new Error(await this.error(response));
+    return response.json();
+  },
+  async upload(path, formData) {
+    const response = await fetch(path, {
+      method: "POST",
+      body: formData
     });
     if (!response.ok) throw new Error(await this.error(response));
     return response.json();
@@ -119,7 +129,8 @@ const ocrStatusText = {
   processing: "OCR中",
   completed: "已OCR",
   failed: "OCR失败",
-  partial: "部分完成"
+  partial: "部分完成",
+  skipped: "已跳过"
 };
 
 const authorityLabels = {
@@ -245,16 +256,20 @@ function todayLineStyle(range) {
   return { left: `${left}%` };
 }
 
-function Stat({ label, value, icon: Icon, tone = "neutral" }) {
-  return (
-    <div className={`stat stat-${tone}`}>
+function Stat({ label, value, icon: Icon, tone = "neutral", onClick }) {
+  const content = (
+    <>
       <Icon size={20} />
       <div>
         <div className="stat-value">{value}</div>
         <div className="stat-label">{label}</div>
       </div>
-    </div>
+    </>
   );
+  if (onClick) {
+    return <button type="button" className={`stat stat-${tone} stat-action`} onClick={onClick}>{content}</button>;
+  }
+  return <div className={`stat stat-${tone}`}>{content}</div>;
 }
 
 function StatusPill({ value, color }) {
@@ -718,7 +733,7 @@ function DashboardWorkspace({ widgets, renderWidget, resetSignal }) {
   );
 }
 
-function Dashboard({ data, onScan, onPreview, onEvidence, resetLayoutSignal, scanLoading }) {
+function Dashboard({ data, onScan, onPreview, onEvidence, onOpenTaskGovernance, resetLayoutSignal, scanLoading }) {
   const [taskStatusView, setTaskStatusView] = useState(loadTaskStatusView);
 
   useEffect(() => {
@@ -859,13 +874,19 @@ function Dashboard({ data, onScan, onPreview, onEvidence, resetLayoutSignal, sca
       </div>
 
       <div className="stats-grid">
-        <Stat label="任务总数" value={data.counts?.tasks || 0} icon={ListChecks} tone="blue" />
-        <Stat label="已完成任务" value={data.counts?.completedTasks || 0} icon={Check} tone="green" />
+        <Stat label="任务总数" value={data.counts?.officialTasks ?? data.counts?.tasks ?? 0} icon={ListChecks} tone="blue" />
+        <Stat label="已完成任务" value={data.counts?.completedOfficialTasks ?? data.counts?.completedTasks ?? 0} icon={Check} tone="green" />
+        <Stat label="待治理识别事项" value={data.counts?.observationTasks || 0} icon={Database} tone="amber" onClick={onOpenTaskGovernance} />
         <Stat label="开放风险" value={data.counts?.openRisks || 0} icon={AlertTriangle} tone="amber" />
         <Stat label="待确认建议" value={data.counts?.pendingSuggestions || 0} icon={Sparkles} tone="red" />
         <Stat label="里程碑" value={data.counts?.milestones || 0} icon={Flag} tone="neutral" />
         <Stat label="交付物" value={`${data.counts?.submittedDeliverables || 0}/${data.counts?.deliverables || 0}`} icon={ClipboardCheck} tone="green" />
         <Stat label="资料文件" value={data.counts?.documents || 0} icon={FolderCog} tone="neutral" />
+      </div>
+      <div className="metric-scope-note">
+        任务指标仅统计项目计划及已确认新增任务，不含自动识别事项。
+        {data.taskStatusAsOf && <span>状态证据处理截至 {formatDate(data.taskStatusAsOf)}</span>}
+        {!!data.counts?.pendingStatusReviews && <span>{data.counts.pendingStatusReviews} 条状态变化待确认</span>}
       </div>
 
       <DashboardWorkspace widgets={dashboardWidgets} renderWidget={renderDashboardWidget} resetSignal={resetLayoutSignal} />
@@ -878,9 +899,10 @@ function Gantt({ tasks, milestones = [], onTaskFocus }) {
   const [scale, setScale] = useState("week");
   const [showAllDated, setShowAllDated] = useState(false);
   const [collapsed, setCollapsed] = useState({});
-  const ganttTasks = tasks.filter((task) => Number(task.show_in_gantt || 0) === 1);
-  const datedHidden = tasks.filter((task) => Number(task.show_in_gantt || 0) !== 1 && (safeDate(task.start_date) || safeDate(task.due_date)));
-  const visibleTasks = showAllDated ? tasks.filter((task) => safeDate(task.start_date) || safeDate(task.due_date)) : ganttTasks;
+  const officialTasks = tasks.filter((task) => !Number(task.is_archived || 0) && ["baseline", "confirmed_addition"].includes(task.task_kind));
+  const ganttTasks = officialTasks.filter((task) => Number(task.show_in_gantt || 0) === 1);
+  const datedHidden = officialTasks.filter((task) => Number(task.show_in_gantt || 0) !== 1 && (safeDate(task.start_date) || safeDate(task.due_date)));
+  const visibleTasks = showAllDated ? officialTasks.filter((task) => safeDate(task.start_date) || safeDate(task.due_date)) : ganttTasks;
   const grouped = ganttPhases.map((phase) => {
     const phaseTasks = visibleTasks.filter((task) => phaseForTask(task).key === phase.key);
     return { ...phase, tasks: phaseTasks };
@@ -1053,140 +1075,6 @@ function EvidenceModal({ data, loading, onClose, onPreview }) {
   );
 }
 
-function TaskBoard({ tasks, onCreate, onPatch, onBulkPatch, onPreview, onEvidence, focusedTaskId, onFocusedTaskHandled }) {
-  const [draft, setDraft] = useState({ title: "", owner: "", due_date: "", priority: "medium" });
-  const [selected, setSelected] = useState([]);
-  const selectedSet = new Set(selected);
-  const columns = [
-    ["not_started", "待开始"],
-    ["in_progress", "进行中"],
-    ["blocked", "待协调"],
-    ["completed", "已完成"],
-    ["delayed", "已延期"]
-  ];
-  const submit = async (event) => {
-    event.preventDefault();
-    if (!draft.title.trim()) return;
-    await onCreate({
-      ...draft,
-      status: "not_started",
-      color_status: draft.priority === "high" ? "amber" : "green",
-      show_in_gantt: 1,
-      progress: 0
-    });
-    setDraft({ title: "", owner: "", due_date: "", priority: "medium" });
-  };
-  const toggleSelected = (id) => {
-    setSelected((current) => current.includes(id) ? current.filter((item) => item !== id) : [...current, id]);
-  };
-  const bulkSetGantt = async (value) => {
-    if (!selected.length) return;
-    await onBulkPatch(selected, { show_in_gantt: value ? 1 : 0 });
-    setSelected([]);
-  };
-  useEffect(() => {
-    if (!focusedTaskId) return;
-    const selector = `[data-task-id="${focusedTaskId}"]`;
-    const timer = window.setTimeout(() => {
-      const node = document.querySelector(selector);
-      if (node) {
-        node.scrollIntoView({ behavior: "smooth", block: "center" });
-        node.classList.add("focused");
-        window.setTimeout(() => node.classList.remove("focused"), 2400);
-      }
-      onFocusedTaskHandled?.();
-    }, 120);
-    return () => window.clearTimeout(timer);
-  }, [focusedTaskId, onFocusedTaskHandled]);
-
-  return (
-    <div className="view-grid">
-      <Section title="新增任务">
-        <form className="task-form" onSubmit={submit}>
-          <input value={draft.title} onChange={(e) => setDraft({ ...draft, title: e.target.value })} placeholder="任务名称" />
-          <input value={draft.owner} onChange={(e) => setDraft({ ...draft, owner: e.target.value })} placeholder="责任人" />
-          <input type="date" value={draft.due_date} onChange={(e) => setDraft({ ...draft, due_date: e.target.value })} />
-          <select value={draft.priority} onChange={(e) => setDraft({ ...draft, priority: e.target.value })}>
-            <option value="high">高</option>
-            <option value="medium">中</option>
-            <option value="low">低</option>
-          </select>
-          <button className="primary-button" type="submit">
-            <Plus size={16} />
-            新增
-          </button>
-        </form>
-      </Section>
-      <Section
-        title="甘特图任务治理"
-        action={
-          <div className="board-bulk-actions">
-            <span>已选 {selected.length} 条</span>
-            <button className="ghost-button" disabled={!selected.length} onClick={() => bulkSetGantt(true)}>批量进入甘特图</button>
-            <button className="ghost-button" disabled={!selected.length} onClick={() => bulkSetGantt(false)}>批量移出甘特图</button>
-          </div>
-        }
-      >
-        <div className="gantt-hint">
-          项目计划分解和手动新增任务默认进入甘特图；周报、会议纪要、大模型分析等过程任务默认留在看板。
-        </div>
-      </Section>
-      <div className="board">
-        {columns.map(([status, label]) => (
-          <div className="board-column" key={status}>
-            <div className="board-head">{label}</div>
-            {tasks.filter((task) => task.status === status).map((task) => (
-              <div className="task-card" key={task.id} data-task-id={task.id}>
-                <div className="task-card-top">
-                  <label className="task-select">
-                    <input type="checkbox" checked={selectedSet.has(task.id)} onChange={() => toggleSelected(task.id)} />
-                    <strong>{task.title}</strong>
-                  </label>
-                  <StatusPill color={task.color_status} value={task.color_status} />
-                </div>
-                <p>{task.description || task.source || ""}</p>
-                <div className="task-meta">
-                  <span>{task.owner || "-"}</span>
-                  <span>{formatDate(task.due_date)}</span>
-                </div>
-                <div className="task-meta">
-                  <span>{task.source || "任务"}</span>
-                  <label className="inline-toggle">
-                    <input
-                      type="checkbox"
-                      checked={Number(task.show_in_gantt || 0) === 1}
-                      onChange={(event) => onPatch(task.id, { show_in_gantt: event.target.checked ? 1 : 0 })}
-                    />
-                    进入甘特图
-                  </label>
-                </div>
-                {task.document_name && (
-                  <div className="source-line">
-                    <FileButton documentId={task.source_document_id} name={task.document_name} onPreview={onPreview} />
-                  </div>
-                )}
-                <EvidenceButton entityType="task" record={task} onEvidence={onEvidence} />
-                <div className="task-actions">
-                  <select value={task.status} onChange={(e) => onPatch(task.id, { status: e.target.value })}>
-                    {columns.map(([value, text]) => <option value={value} key={value}>{text}</option>)}
-                  </select>
-                  <input
-                    type="number"
-                    min="0"
-                    max="100"
-                    value={task.progress}
-                    onChange={(e) => onPatch(task.id, { progress: Number(e.target.value) })}
-                  />
-                </div>
-              </div>
-            ))}
-          </div>
-        ))}
-      </div>
-    </div>
-  );
-}
-
 function MilestoneView({ milestones, profile, goals, breakdown, onPreview, onEvidence }) {
   const plannedMilestones = milestones.filter((item) => refinedMilestoneTitles.has(item.title));
   return (
@@ -1343,11 +1231,108 @@ function SuggestionsView({ suggestions, onApply, onApplyAll, onDismiss, onPrevie
   );
 }
 
-function DocumentsView({ documents, onPreview, isAdmin, onStartOcr, onRetryOcr, actionStates = {} }) {
+const uploadAccept = ".doc,.docx,.xls,.xlsx,.pdf,.txt,.md,.wpsonline";
+
+function uploadTargetValue(target) {
+  return target ? `${target.monitorType}:${target.directoryIndex}` : "";
+}
+
+function parseUploadTarget(value, targets) {
+  return targets.find((target) => uploadTargetValue(target) === value) || targets[0] || null;
+}
+
+function preferredUploadTarget(targets, preferred) {
+  return targets.find((target) => target.monitorType === preferred) || targets[0] || null;
+}
+
+function uploadTargetLabel(target) {
+  const directoryName = (target.directory || "").split(/[\\/]/).filter(Boolean).pop();
+  return directoryName && directoryName !== target.label ? `${target.label} · ${directoryName}` : target.label;
+}
+
+function UploadPickerButton({ onSelect, loading, label = "上传文件", title = "选择并上传文件" }) {
+  const inputRef = useRef(null);
   return (
-    <Section title="资料台账">
+    <>
+      <input
+        ref={inputRef}
+        className="hidden-file-input"
+        type="file"
+        accept={uploadAccept}
+        onChange={async (event) => {
+          const file = event.target.files?.[0];
+          if (file) await onSelect(file);
+          event.target.value = "";
+        }}
+      />
+      <button className="primary-button" type="button" onClick={() => inputRef.current?.click()} disabled={loading} title={title}>
+        {loading ? <span className="button-spinner" /> : <Upload size={16} />}
+        {loading ? "上传中" : label}
+      </button>
+    </>
+  );
+}
+
+function UploadJobBanner({ uploadStatus, deliverableOnly = false }) {
+  const jobs = (uploadStatus?.jobs || []).filter((job) => deliverableOnly ? !!job.deliverableId : true);
+  const job = jobs.find((item) => ["queued", "processing"].includes(item.status)) || jobs[0];
+  if (!job) return null;
+  const running = ["queued", "processing"].includes(job.status);
+  return (
+    <div className={`upload-job-banner ${job.status || "queued"}`}>
+      <div className="upload-job-main">
+        {running ? <span className="button-spinner" /> : job.status === "failed" ? <AlertTriangle size={16} /> : <Check size={16} />}
+        <div>
+          <strong>{job.fileName}</strong>
+          <p>{job.error || job.stage}</p>
+        </div>
+        <span>{job.progress || 0}%</span>
+      </div>
+      <div className="upload-progress"><span style={{ width: `${Math.max(0, Math.min(100, job.progress || 0))}%` }} /></div>
+    </div>
+  );
+}
+
+function DocumentsView({
+  documents,
+  onPreview,
+  isAdmin,
+  onStartOcr,
+  onRetryOcr,
+  onUpload,
+  uploadTargets = [],
+  uploadStatus = {},
+  actionStates = {}
+}) {
+  const preferred = preferredUploadTarget(uploadTargets, "other");
+  const [targetValue, setTargetValue] = useState(uploadTargetValue(preferred));
+  useEffect(() => {
+    if (!uploadTargets.some((target) => uploadTargetValue(target) === targetValue)) {
+      setTargetValue(uploadTargetValue(preferredUploadTarget(uploadTargets, "other")));
+    }
+  }, [uploadTargets, targetValue]);
+  const selectedTarget = parseUploadTarget(targetValue, uploadTargets);
+  return (
+    <Section
+      title="资料台账"
+      action={(
+        <div className="upload-actions">
+          <select value={targetValue} onChange={(event) => setTargetValue(event.target.value)} aria-label="上传监控目录">
+            {uploadTargets.map((target) => (
+              <option key={uploadTargetValue(target)} value={uploadTargetValue(target)}>{uploadTargetLabel(target)}</option>
+            ))}
+          </select>
+          <UploadPickerButton
+            onSelect={(file) => onUpload(file, selectedTarget)}
+            loading={actionStates["upload-document"]}
+            label="上传资料"
+          />
+        </div>
+      )}
+    >
+      <UploadJobBanner uploadStatus={uploadStatus} />
       <div className="table-wrap">
-        <table>
+        <table className="documents-table">
           <thead>
             <tr>
               <th>文件名</th>
@@ -1407,11 +1392,29 @@ const deliverableStatuses = [
   ["submitted", "已提交", "green"]
 ];
 
-function DeliverablesView({ deliverables, documents, onPatch, onPreview, onEvidence }) {
+function DeliverablesView({
+  deliverables,
+  documents,
+  onPatch,
+  onPreview,
+  onEvidence,
+  onUpload,
+  uploadTargets = [],
+  uploadStatus = {},
+  actionStates = {}
+}) {
   const total = deliverables.length;
   const submitted = deliverables.filter((item) => item.status === "submitted").length;
   const ready = deliverables.filter((item) => ["finalized", "submitted"].includes(item.status)).length;
   const linked = deliverables.filter((item) => item.document_id).length;
+  const preferred = preferredUploadTarget(uploadTargets, "acceptance_launch");
+  const [targetValue, setTargetValue] = useState(uploadTargetValue(preferred));
+  useEffect(() => {
+    if (!uploadTargets.some((target) => uploadTargetValue(target) === targetValue)) {
+      setTargetValue(uploadTargetValue(preferredUploadTarget(uploadTargets, "acceptance_launch")));
+    }
+  }, [uploadTargets, targetValue]);
+  const selectedTarget = parseUploadTarget(targetValue, uploadTargets);
 
   return (
     <div className="view-grid">
@@ -1421,9 +1424,22 @@ function DeliverablesView({ deliverables, documents, onPatch, onPreview, onEvide
         <Stat label="已定稿/已提交" value={ready} icon={Flag} tone="amber" />
         <Stat label="已关联文件" value={linked} icon={FolderCog} tone="neutral" />
       </div>
-      <Section title="交付物台账">
+      <Section
+        title="交付物台账"
+        action={(
+          <div className="upload-actions">
+            <span className="upload-directory-label">上传目录</span>
+            <select value={targetValue} onChange={(event) => setTargetValue(event.target.value)} aria-label="交付物上传监控目录">
+              {uploadTargets.map((target) => (
+                <option key={uploadTargetValue(target)} value={uploadTargetValue(target)}>{uploadTargetLabel(target)}</option>
+              ))}
+            </select>
+          </div>
+        )}
+      >
+        <UploadJobBanner uploadStatus={uploadStatus} deliverableOnly />
         <div className="table-wrap">
-          <table>
+          <table className="deliverable-table">
             <thead>
               <tr>
                 <th>交付物</th>
@@ -1438,26 +1454,32 @@ function DeliverablesView({ deliverables, documents, onPatch, onPreview, onEvide
             <tbody>
               {deliverables.map((item) => (
                 <tr key={item.id}>
-                  <td className="wide-cell">
+                  <td className="wide-cell" data-label="交付物">
                     <strong>{item.name}</strong>
                     <p>{item.description}</p>
+                    <UploadPickerButton
+                      onSelect={(file) => onUpload(item.id, file, selectedTarget)}
+                      loading={actionStates[`upload-deliverable-${item.id}`]}
+                      label={item.document_id ? "替换文件" : "上传文件"}
+                      title={item.document_id ? "上传新文件并更新关联" : "上传并关联交付物"}
+                    />
                   </td>
-                  <td>{item.requirement_source || "-"}</td>
-                  <td>
+                  <td data-label="依据">{item.requirement_source || "-"}</td>
+                  <td data-label="状态">
                     <select value={item.status} onChange={(e) => onPatch(item.id, { status: e.target.value })}>
                       {deliverableStatuses.map(([value, label]) => <option value={value} key={value}>{label}</option>)}
                     </select>
                   </td>
-                  <td>
+                  <td data-label="责任人">
                     <input value={item.owner || ""} onChange={(e) => onPatch(item.id, { owner: e.target.value })} />
                   </td>
-                  <td>
+                  <td data-label="计划日期">
                     <input type="date" value={item.planned_date || ""} onChange={(e) => onPatch(item.id, { planned_date: e.target.value })} />
                   </td>
-                  <td>
+                  <td data-label="提交日期">
                     <input type="date" value={item.submitted_date || ""} onChange={(e) => onPatch(item.id, { submitted_date: e.target.value })} />
                   </td>
-                  <td className="deliverable-file-cell">
+                  <td className="deliverable-file-cell" data-label="关联文件">
                     <select
                       value={item.document_id || ""}
                       onChange={(e) => onPatch(item.id, { document_id: e.target.value ? Number(e.target.value) : null })}
@@ -1713,7 +1735,7 @@ function WeeklyView({ weekly, onPreview }) {
   );
 }
 
-function WikiView({ pages, suggestions, isAdmin, onRebuild, onApply, onApplyAll, rebuildStatus, actionStates = {}, onPreview }) {
+function WikiView({ pages, suggestions, isAdmin, onRebuild, onRefreshCurrent, onApply, onApplyAll, rebuildStatus, actionStates = {}, onPreview }) {
   const running = !!rebuildStatus?.running || !!actionStates["rebuild-wiki"];
   const completed = !running && !!rebuildStatus?.finishedAt;
   const renderSources = (sources = []) => (
@@ -1742,10 +1764,16 @@ function WikiView({ pages, suggestions, isAdmin, onRebuild, onApply, onApplyAll,
         title="项目 Wiki"
         action={
           isAdmin && (
-            <button className="ghost-button" onClick={onRebuild} disabled={running}>
-              {running ? <span className="button-spinner" /> : <RefreshCw size={16} />}
-              {running ? "生成中" : "生成更新建议"}
-            </button>
+            <div className="wiki-actions">
+              <button className="ghost-button" onClick={onRefreshCurrent} disabled={running || actionStates["refresh-current-progress"]}>
+                {running || actionStates["refresh-current-progress"] ? <span className="button-spinner" /> : <RefreshCw size={16} />}
+                {running ? "更新中" : "更新当前进度"}
+              </button>
+              <button className="ghost-button" onClick={onRebuild} disabled={running}>
+                {running ? <span className="button-spinner" /> : <RefreshCw size={16} />}
+                {running ? "生成中" : "生成更新建议"}
+              </button>
+            </div>
           )
         }
       >
@@ -1769,7 +1797,9 @@ function WikiView({ pages, suggestions, isAdmin, onRebuild, onApply, onApplyAll,
             ) : (
               <p>
                 大模型归纳 {rebuildStatus.modelSucceeded || 0} 页，规则降级 {rebuildStatus.fallbackCount || 0} 页。
-                正式 Wiki 尚未改变，请在下方审核后应用。
+                {rebuildStatus.autoPublished
+                  ? ` 当前进度已按周报自动发布，资料截止 ${rebuildStatus.sourceCutoffDate || "最新资料"}。`
+                  : " 正式 Wiki 尚未改变，请在下方审核后应用。"}
               </p>
             )}
           </div>
@@ -1781,6 +1811,13 @@ function WikiView({ pages, suggestions, isAdmin, onRebuild, onApply, onApplyAll,
                 <strong>{page.title}</strong>
                 <span>{formatDate(page.updated_at)}</span>
               </div>
+              {page.page_key === "current_progress" && (
+                <div className={`wiki-freshness ${page.isStale ? "stale" : ""}`}>
+                  <span>资料截止 {page.sourceCutoffDate || "未记录"}</span>
+                  <span>{page.publishMode === "auto" ? "周报自动发布" : "人工发布"}</span>
+                  {page.isStale && <span>正式 Wiki 落后最新资料 {page.latestAvailableDate}</span>}
+                </div>
+              )}
               {renderSources(page.sources || [])}
               <pre className="wiki-content">{page.content || "暂无内容，生成并确认 Wiki 更新建议后显示。"}</pre>
             </article>
@@ -1839,6 +1876,12 @@ function StructuredAnswer({ answer, onPreview }) {
   return (
     <Section title="回答">
       <div className="qa-answer-card">
+        {(answer.answerAsOf || answer.freshnessWarning) && (
+          <div className={`qa-freshness ${answer.freshnessStatus === "stale_fallback" ? "stale" : ""}`}>
+            {answer.answerAsOf && <span>回答依据截至 {answer.answerAsOf}</span>}
+            {answer.freshnessWarning && <span>{answer.freshnessWarning}</span>}
+          </div>
+        )}
         <h3>结论</h3>
         <p>{structured.answer_summary || answer.answer}</p>
         {!!(structured.key_points || []).length && (
@@ -1868,6 +1911,8 @@ function StructuredAnswer({ answer, onPreview }) {
                 <strong>来源 {index + 1}</strong>
                 {source.authorityLabel && <StatusPill value={source.authorityLabel} color={source.isPrimaryBasis ? "green" : "blue"} />}
                 {source.isPrimaryBasis && <span className="mini-badge">主依据</span>}
+                {source.isLatest && <span className="mini-badge">最新依据</span>}
+                {source.effectiveDate && <span className="source-date">{source.effectiveDate}</span>}
               </div>
               {source.documentId ? (
                 <FileButton documentId={source.documentId} name={source.documentName} onPreview={onPreview} />
@@ -1942,7 +1987,9 @@ const qualityKindLabels = {
   invalid_record: "疑似误识别",
   document_version: "版本冲突",
   authority_anomaly: "权威异常",
-  analysis_failure: "模型分析失败"
+  analysis_failure: "模型分析失败",
+  task_match_review: "任务匹配确认",
+  task_status_review: "状态变更确认"
 };
 
 const entityTypeLabels = {
@@ -1958,25 +2005,77 @@ function qualityRecordTitle(record = {}) {
   return record.entity_title || record.title || record.name || `记录 #${record.id}`;
 }
 
-function QualitySuggestionCard({ item, onApply, onDismiss, actionStates }) {
+function qualityCandidates(item) {
+  if (!item) return [];
   const records = item.details?.records || [];
   const documents = item.details?.documents || [];
-  const candidates = records.length ? records : documents;
-  const [primaryRecordId, setPrimaryRecordId] = useState(item.primary_record_id || candidates[0]?.id || 0);
-  const [fieldChoices, setFieldChoices] = useState({});
+  if (records.length) return records;
+  if (documents.length) return documents;
+  return item.details?.document ? [item.details.document] : [];
+}
+
+function qualityResolution(item, current = {}) {
+  if (!item) return { primaryRecordId: 0, relatedRecordIds: [], fieldChoices: {} };
+  const candidates = qualityCandidates(item);
+  const candidateIds = candidates.map((candidate) => Number(candidate.id)).filter(Boolean);
+  const fallbackPrimary = Number(item.primary_record_id || candidateIds[0] || 0);
+  const requestedPrimary = Number(current.primaryRecordId || fallbackPrimary);
+  const primaryRecordId = candidateIds.includes(requestedPrimary) ? requestedPrimary : fallbackPrimary;
+  return {
+    primaryRecordId,
+    relatedRecordIds: candidateIds.filter((id) => id !== primaryRecordId),
+    fieldChoices: current.fieldChoices || {}
+  };
+}
+
+function qualityRecordFacts(record = {}) {
+  return [
+    ["状态", record.status ? statusLabel(record.status) : ""],
+    ["进度", record.progress !== undefined && record.progress !== null ? `${record.progress}%` : ""],
+    ["责任人", record.owner || record.proposer],
+    ["开始日期", record.start_date || record.planned_date],
+    ["截止/提交", record.due_date || record.submitted_date || record.actual_date],
+    ["记录来源", record.source || record.requirement_source || record.doc_category],
+    ["资料日期", record.source_document_date || record.effective_date || record.modified_at]
+  ].filter(([, value]) => value !== undefined && value !== null && value !== "");
+}
+
+function QualitySuggestionCard({
+  item,
+  selected,
+  resolution,
+  onToggleSelect,
+  onResolutionChange,
+  onApply,
+  onDismiss,
+  onPreview,
+  actionStates
+}) {
+  const candidates = qualityCandidates(item);
+  const currentResolution = qualityResolution(item, resolution);
+  const primaryRecordId = currentResolution.primaryRecordId;
+  const fieldChoices = currentResolution.fieldChoices;
   const conflicts = item.details?.fieldConflicts || {};
   const applyKey = `apply-quality-${item.id}`;
   const dismissKey = `dismiss-quality-${item.id}`;
-  const apply = () => onApply(item.id, {
-    primaryRecordId: Number(primaryRecordId || item.primary_record_id || 0),
-    relatedRecordIds: candidates.map((candidate) => Number(candidate.id)).filter((id) => id !== Number(primaryRecordId)),
-    fieldChoices
+  const apply = () => onApply(item.id, currentResolution);
+  const updatePrimary = (value) => onResolutionChange(item.id, qualityResolution(item, {
+    ...currentResolution,
+    primaryRecordId: Number(value)
+  }));
+  const updateFieldChoice = (field, value) => onResolutionChange(item.id, {
+    ...currentResolution,
+    fieldChoices: { ...fieldChoices, [field]: value }
   });
 
   return (
-    <article className="quality-card">
+    <article className={`quality-card ${selected ? "selected" : ""}`}>
       <div className="quality-card-head">
         <div>
+          <label className="quality-select">
+            <input type="checkbox" checked={selected} onChange={() => onToggleSelect(item.id)} />
+            纳入批量确认
+          </label>
           <div className="suggestion-title">
             <StatusPill value={qualityKindLabels[item.suggestion_kind]} color={item.safe_auto ? "green" : "amber"} />
             <span className="quality-entity-label">{entityTypeLabels[item.entity_type] || item.entity_type}</span>
@@ -1991,7 +2090,7 @@ function QualitySuggestionCard({ item, onApply, onDismiss, actionStates }) {
         <div className="quality-resolution">
           <label>
             主记录/当前版本
-            <select value={primaryRecordId} onChange={(event) => setPrimaryRecordId(Number(event.target.value))}>
+            <select value={primaryRecordId} onChange={(event) => updatePrimary(event.target.value)}>
               {candidates.map((candidate) => <option value={candidate.id} key={candidate.id}>{qualityRecordTitle(candidate)}</option>)}
             </select>
           </label>
@@ -2011,13 +2110,46 @@ function QualitySuggestionCard({ item, onApply, onDismiss, actionStates }) {
           {Object.entries(conflicts).map(([field, values]) => (
             <label key={field}>
               {field}
-              <select value={fieldChoices[field] ?? ""} onChange={(event) => setFieldChoices({ ...fieldChoices, [field]: event.target.value })}>
+              <select value={fieldChoices[field] ?? ""} onChange={(event) => updateFieldChoice(field, event.target.value)}>
                 <option value="">保留主记录值</option>
                 {values.map((value) => <option value={value} key={String(value)}>{String(value)}</option>)}
               </select>
             </label>
           ))}
         </div>
+      )}
+
+      {!!candidates.length && (
+        <details className="quality-record-details">
+          <summary><FileText size={15} />记录详情 <span>{candidates.length} 条</span></summary>
+          <div className="quality-record-list">
+            {candidates.map((candidate) => {
+              const documentId = candidate.source_document_id || (item.entity_type === "document" ? candidate.id : null);
+              const documentName = candidate.source_document_name || (item.entity_type === "document" ? candidate.name : "");
+              const description = candidate.description || candidate.summary || candidate.authority_reason || "";
+              return (
+                <div className={`quality-record-row ${Number(candidate.id) === Number(primaryRecordId) ? "primary" : ""}`} key={candidate.id}>
+                  <div className="quality-record-head">
+                    <strong>#{candidate.id} {qualityRecordTitle(candidate)}</strong>
+                    {Number(candidate.id) === Number(primaryRecordId) && <span>主记录</span>}
+                  </div>
+                  {description && <p className="quality-record-description">{description}</p>}
+                  <dl className="quality-record-facts">
+                    {qualityRecordFacts(candidate).map(([label, value]) => (
+                      <div key={label}><dt>{label}</dt><dd>{String(value)}</dd></div>
+                    ))}
+                  </dl>
+                  {documentId && documentName && (
+                    <div className="quality-record-source">
+                      <span>关联资料</span>
+                      <FileButton documentId={documentId} name={documentName} onPreview={onPreview} />
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </details>
       )}
 
       {item.details?.warnings?.length > 0 && <p className="quality-warning">{item.details.warnings.join("；")}</p>}
@@ -2037,9 +2169,47 @@ function QualitySuggestionCard({ item, onApply, onDismiss, actionStates }) {
   );
 }
 
-function DataQualityView({ status, suggestions, onAnalyze, onApply, onDismiss, onApplyAllSafe, actionStates = {} }) {
+function DataQualityView({
+  status,
+  suggestions,
+  onAnalyze,
+  onApply,
+  onApplySelected,
+  onDismiss,
+  onApplyAllSafe,
+  onPreview,
+  actionStates = {}
+}) {
   const running = !!status?.running || !!actionStates["analyze-quality"];
   const counts = status?.pendingCounts || {};
+  const [selectedIds, setSelectedIds] = useState([]);
+  const [resolutions, setResolutions] = useState({});
+  const availableIds = suggestions.map((item) => Number(item.id));
+  const allSelected = !!availableIds.length && selectedIds.length === availableIds.length;
+
+  useEffect(() => {
+    const availableSet = new Set(availableIds);
+    setSelectedIds((current) => current.filter((id) => availableSet.has(id)));
+    setResolutions((current) => {
+      const next = {};
+      for (const item of suggestions) next[item.id] = qualityResolution(item, current[item.id]);
+      return next;
+    });
+  }, [suggestions]);
+
+  const toggleSelected = (id) => setSelectedIds((current) => (
+    current.includes(id) ? current.filter((value) => value !== id) : [...current, id]
+  ));
+  const toggleAll = () => setSelectedIds(allSelected ? [] : availableIds);
+  const updateResolution = (id, values) => setResolutions((current) => ({ ...current, [id]: values }));
+  const applySelected = async () => {
+    const items = selectedIds.map((id) => {
+      const item = suggestions.find((candidate) => Number(candidate.id) === Number(id));
+      return item ? { id, values: qualityResolution(item, resolutions[id]) } : null;
+    }).filter(Boolean);
+    const result = await onApplySelected(items);
+    setSelectedIds((result?.failed || []).map((item) => Number(item.id)));
+  };
   return (
     <div className="view-grid">
       <div className="stats-grid deliverable-stats">
@@ -2076,10 +2246,40 @@ function DataQualityView({ status, suggestions, onAnalyze, onApply, onDismiss, o
         )}
         {status?.error && <div className="error">质量分析失败：{status.error}</div>}
       </Section>
-      <Section title="待确认治理建议">
+      <Section
+        title="待确认治理建议"
+        action={
+          <div className="quality-batch-toolbar">
+            <label>
+              <input type="checkbox" checked={allSelected} onChange={toggleAll} disabled={!suggestions.length} />
+              全选当前
+            </label>
+            <span>已选 {selectedIds.length} 条</span>
+            <button
+              className="primary-button"
+              onClick={applySelected}
+              disabled={!selectedIds.length || running || actionStates["apply-selected-quality"]}
+            >
+              {actionStates["apply-selected-quality"] ? <span className="button-spinner" /> : <Check size={16} />}
+              {actionStates["apply-selected-quality"] ? "批量处理中" : "批量确认并应用"}
+            </button>
+          </div>
+        }
+      >
         <div className="quality-list">
           {suggestions.map((item) => (
-            <QualitySuggestionCard key={item.id} item={item} onApply={onApply} onDismiss={onDismiss} actionStates={actionStates} />
+            <QualitySuggestionCard
+              key={item.id}
+              item={item}
+              selected={selectedIds.includes(Number(item.id))}
+              resolution={resolutions[item.id]}
+              onToggleSelect={toggleSelected}
+              onResolutionChange={updateResolution}
+              onApply={onApply}
+              onDismiss={onDismiss}
+              onPreview={onPreview}
+              actionStates={actionStates}
+            />
           ))}
           {!suggestions.length && <Empty text="当前没有待确认的数据治理建议" />}
         </div>
@@ -2514,6 +2714,9 @@ function App() {
   const [changes, setChanges] = useState([]);
   const [documents, setDocuments] = useState([]);
   const [deliverables, setDeliverables] = useState([]);
+  const [uploadTargets, setUploadTargets] = useState([]);
+  const [uploadStatus, setUploadStatus] = useState({ jobs: [] });
+  const uploadWasRunningRef = useRef(false);
   const [suggestions, setSuggestions] = useState([]);
   const [wikiPages, setWikiPages] = useState([]);
   const [wikiSuggestions, setWikiSuggestions] = useState([]);
@@ -2526,6 +2729,8 @@ function App() {
   const [qualitySuggestions, setQualitySuggestions] = useState([]);
   const [qualityStatus, setQualityStatus] = useState({});
   const qualityWasRunningRef = useRef(false);
+  const [taskReconcileStatus, setTaskReconcileStatus] = useState({});
+  const taskReconcileWasRunningRef = useRef(false);
   const [weekly, setWeekly] = useState({});
   const [settings, setSettings] = useState({ monitorTypes: {} });
   const [modelTest, setModelTest] = useState(null);
@@ -2554,7 +2759,7 @@ function App() {
 
   const refresh = async () => {
     setError("");
-    const [dashboard, taskList, milestoneList, meetingList, changeList, documentList, deliverableList, suggestionList, wikiPageList, weeklyData] =
+    const [dashboard, taskList, milestoneList, meetingList, changeList, documentList, deliverableList, suggestionList, wikiPageList, weeklyData, targetList, currentUploadStatus] =
       await Promise.all([
         api.get("/api/dashboard"),
         api.get("/api/tasks"),
@@ -2565,7 +2770,9 @@ function App() {
         api.get("/api/deliverables"),
         api.get("/api/suggestions"),
         api.get("/api/wiki/pages"),
-        api.get("/api/weekly-summary")
+        api.get("/api/weekly-summary"),
+        api.get("/api/uploads/targets"),
+        api.get("/api/uploads/status")
       ]);
     setDashboardData(dashboard);
     setTasks(taskList);
@@ -2577,6 +2784,8 @@ function App() {
     setSuggestions(suggestionList);
     setWikiPages(wikiPageList);
     setWeekly(weeklyData);
+    setUploadTargets(targetList);
+    setUploadStatus(currentUploadStatus);
   };
 
   const refreshAuth = async () => {
@@ -2633,6 +2842,10 @@ function App() {
     setQualitySuggestions(items);
   };
 
+  const loadTaskReconcileStatus = async () => {
+    if (auth.isAdmin) setTaskReconcileStatus(await api.get("/api/tasks/reconcile-status"));
+  };
+
   useEffect(() => {
     Promise.all([refresh(), refreshAuth()])
       .catch((err) => setError(err.message || "加载失败"))
@@ -2650,7 +2863,7 @@ function App() {
       if (active === "quality") setActive("dashboard");
       return;
     }
-    Promise.all([loadSettings(), loadKnowledgeStatus(), loadKnowledgeRebuildStatus(), loadWikiSuggestions(), loadWikiRebuildStatus(), loadAuthority(), loadDataQuality()]).catch((err) => setError(err.message || "系统设置加载失败"));
+    Promise.all([loadSettings(), loadKnowledgeStatus(), loadKnowledgeRebuildStatus(), loadWikiSuggestions(), loadWikiRebuildStatus(), loadAuthority(), loadDataQuality(), loadTaskReconcileStatus()]).catch((err) => setError(err.message || "系统设置加载失败"));
   }, [auth.isAdmin]);
 
   useEffect(() => {
@@ -2704,6 +2917,38 @@ function App() {
         knowledgeWasRunningRef.current = !!status.running;
       } catch {
         // keep polling quiet on transient admin/session/network issues
+      }
+    }, 2500);
+    return () => window.clearInterval(timer);
+  }, [auth.isAdmin]);
+
+  useEffect(() => {
+    const timer = window.setInterval(async () => {
+      try {
+        const status = await api.get("/api/uploads/status");
+        setUploadStatus(status);
+        if (!status.running && uploadWasRunningRef.current) {
+          await refresh();
+          if (auth.isAdmin) await loadWikiSuggestions();
+        }
+        uploadWasRunningRef.current = !!status.running;
+      } catch {
+        // Upload errors are shown by the initiating action; transient polling errors stay quiet.
+      }
+    }, 2500);
+    return () => window.clearInterval(timer);
+  }, [auth.isAdmin]);
+
+  useEffect(() => {
+    if (!auth.isAdmin) return undefined;
+    const timer = window.setInterval(async () => {
+      try {
+        const status = await api.get("/api/tasks/reconcile-status");
+        setTaskReconcileStatus(status);
+        if (status.running || taskReconcileWasRunningRef.current) await refresh();
+        taskReconcileWasRunningRef.current = !!status.running;
+      } catch {
+        // Explicit actions surface errors; polling remains quiet on transient failures.
       }
     }, 2500);
     return () => window.clearInterval(timer);
@@ -2870,9 +3115,90 @@ function App() {
   };
   const dismissSuggestion = (id) => runAction(`dismiss-suggestion-${id}`, () => api.post(`/api/suggestions/${id}/dismiss`), "建议已忽略");
   const createTask = (payload) => runAction("create-task", () => api.post("/api/tasks", payload), "任务已新增");
-  const patchTask = (id, values) => runAction(`patch-task-${id}`, () => api.patch(`/api/tasks/${id}`, { values }), "任务已更新");
-  const bulkPatchTasks = (ids, values) => runAction("bulk-patch-tasks", () => api.patch("/api/tasks/bulk", { ids, values }), "任务已批量更新");
+  const patchTask = async (id, values) => {
+    const key = `patch-task-${id}`;
+    setActionLoading(key, true); setError(""); setNotice("");
+    try {
+      await api.patch(`/api/tasks/${id}`, { values });
+      setTasks(current => current.map(t => t.id === id ? { ...t, ...values } : t));
+      try { await refreshTaskData(); }
+      catch { setError("任务已保存，但列表刷新失败，请稍后刷新。"); }
+      setNotice("任务已更新"); return true;
+    } catch (err) { setError(err.message || "任务更新失败"); return false; }
+    finally { setActionLoading(key, false); }
+  };
+  const refreshTaskData = async () => {
+    // Task edits must not fail merely because an unrelated Wiki or upload endpoint is down.
+    const taskList = await api.get("/api/tasks");
+    setTasks(taskList);
+    try { setDashboardData(await api.get("/api/dashboard")); }
+    catch { setError("任务已保存，但仪表盘暂未刷新，请稍后刷新。"); }
+  };
+  const bulkPatchTasks = async (ids, values) => {
+    setActionLoading("bulk-patch-tasks", true); setNotice(""); setError("");
+    try {
+      const result = await api.patch("/api/tasks/bulk", { ids, values });
+      const updatedIds = result.updatedIds || [];
+      setTasks(current => current.map(t => updatedIds.includes(t.id) ? { ...t, ...values } : t));
+      try { await refreshTaskData(); }
+      catch { setError("批量设置已保存，但列表刷新失败，请稍后刷新；无需重复提交。"); }
+      return result;
+    } catch (err) { setError(err.message || "批量更新失败"); return false; }
+    finally { setActionLoading("bulk-patch-tasks", false); }
+  };
+  const promoteTask = (id) => runAction(`promote-task-${id}`, () => api.post(`/api/tasks/${id}/promote`), "已提升为正式任务");
+  const reconcileTasks = async () => {
+    try {
+      setActionLoading("reconcile-tasks", true);
+      setNotice("");
+      setError("");
+      const status = await api.post("/api/tasks/reconcile-progress");
+      setTaskReconcileStatus(status);
+      taskReconcileWasRunningRef.current = true;
+      setNotice(status.alreadyRunning ? "任务进度已在后台重算" : "任务进度已开始后台重算");
+    } catch (err) {
+      setError(err.message || "启动任务进度重算失败");
+    } finally {
+      setActionLoading("reconcile-tasks", false);
+    }
+  };
   const patchDeliverable = (id, values) => runAction(`patch-deliverable-${id}`, () => api.patch(`/api/deliverables/${id}`, { values }), "交付物已更新");
+  const uploadFile = async (path, file, target, actionKey) => {
+    if (!target) {
+      setError("没有可用的监控目录，请先在系统设置中配置。 ");
+      return false;
+    }
+    const formData = new FormData();
+    formData.append("file", file);
+    formData.append("monitor_type", target.monitorType);
+    formData.append("directory_index", String(target.directoryIndex));
+    try {
+      setActionLoading(actionKey, true);
+      setNotice("");
+      setError("");
+      const result = await api.upload(path, formData);
+      uploadWasRunningRef.current = true;
+      setUploadStatus((current) => ({
+        ...current,
+        running: true,
+        jobs: [result.job, ...(current.jobs || []).filter((job) => job.id !== result.job.id)]
+      }));
+      setNotice(`“${result.job.fileName}”已保存，正在后台抽取、索引并更新 Wiki`);
+      return true;
+    } catch (err) {
+      setError(err.message || "文件上传失败");
+      return false;
+    } finally {
+      setActionLoading(actionKey, false);
+    }
+  };
+  const uploadDocument = (file, target) => uploadFile("/api/documents/upload", file, target, "upload-document");
+  const uploadDeliverable = (id, file, target) => uploadFile(
+    `/api/deliverables/${id}/upload`,
+    file,
+    target,
+    `upload-deliverable-${id}`
+  );
   const analyzeAuthority = async () => {
     try {
       setActionLoading("analyze-authority", true);
@@ -2938,6 +3264,27 @@ function App() {
       setActionLoading("apply-all-safe-quality", false);
     }
   };
+  const applySelectedQuality = async (items) => {
+    try {
+      setActionLoading("apply-selected-quality", true);
+      setNotice("");
+      setError("");
+      const result = await api.post("/api/data-quality/suggestions/apply-selected", { items });
+      await Promise.all([refresh(), loadDataQuality()]);
+      if (result.failed?.length) {
+        setNotice(`已确认并应用 ${result.applied || 0}/${result.total || 0} 条，失败项仍保留`);
+        setError(result.failed.map((item) => `#${item.id}：${item.message}`).join("；"));
+      } else {
+        setNotice(`已批量确认并应用 ${result.applied || 0} 条治理建议`);
+      }
+      return result;
+    } catch (err) {
+      setError(err.message || "批量确认治理建议失败");
+      return { ok: false, applied: 0, total: items.length, failed: items.map((item) => ({ id: item.id, message: err.message || "请求失败" })) };
+    } finally {
+      setActionLoading("apply-selected-quality", false);
+    }
+  };
   const startOcr = (id) => runAction(`ocr-start-${id}`, () => api.post(`/api/ocr/documents/${id}/start`), "OCR 已启动");
   const retryOcr = (id) => runAction(`ocr-retry-${id}`, () => api.post(`/api/ocr/documents/${id}/retry`), "OCR 已重新入队");
   const rebuildWikiSuggestions = async () => {
@@ -2953,6 +3300,21 @@ function App() {
       setError(err.message || "启动 Wiki 生成失败");
     } finally {
       setActionLoading("rebuild-wiki", false);
+    }
+  };
+  const refreshCurrentProgress = async () => {
+    try {
+      setActionLoading("refresh-current-progress", true);
+      setNotice("");
+      setError("");
+      const status = await api.post("/api/wiki/current-progress/refresh");
+      setWikiRebuildStatus(status);
+      wikiWasRunningRef.current = true;
+      setNotice(status.alreadyRunning ? "当前进度正在后台更新" : "已开始根据最新周报更新当前进度");
+    } catch (err) {
+      setError(err.message || "启动当前进度更新失败");
+    } finally {
+      setActionLoading("refresh-current-progress", false);
     }
   };
   const applyWikiSuggestion = async (id) => {
@@ -2993,7 +3355,7 @@ function App() {
   const content = () => {
     if (loading) return <div className="loading">加载中</div>;
     if (active === "dashboard") {
-      return <Dashboard data={dashboardData} onScan={scanNow} onPreview={openPreview} onEvidence={openEvidence} resetLayoutSignal={dashboardResetSignal} scanLoading={isActionLoading("scan")} />;
+      return <Dashboard data={dashboardData} onScan={scanNow} onPreview={openPreview} onEvidence={openEvidence} onOpenTaskGovernance={() => setActive("board")} resetLayoutSignal={dashboardResetSignal} scanLoading={isActionLoading("scan")} />;
     }
     if (active === "gantt") {
       return (
@@ -3010,10 +3372,17 @@ function App() {
     if (active === "board") {
       return (
         <TaskBoard
+          api={api}
           tasks={tasks}
           onCreate={createTask}
           onPatch={patchTask}
           onBulkPatch={bulkPatchTasks}
+          onPromote={promoteTask}
+          onChanged={async () => { await refresh(); if (auth.isAdmin) await loadDataQuality(); }}
+          onReconcile={reconcileTasks}
+          reconcileStatus={taskReconcileStatus}
+          isAdmin={auth.isAdmin}
+          actionStates={actionStates}
           onPreview={openPreview}
           onEvidence={openEvidence}
           focusedTaskId={focusedTaskId}
@@ -3039,10 +3408,34 @@ function App() {
       return <SuggestionsView suggestions={suggestions} onApply={applySuggestion} onApplyAll={applyAllSuggestions} onDismiss={dismissSuggestion} onPreview={openPreview} actionStates={actionStates} />;
     }
     if (active === "documents") {
-      return <DocumentsView documents={documents} onPreview={openPreview} isAdmin={auth.isAdmin} onStartOcr={startOcr} onRetryOcr={retryOcr} actionStates={actionStates} />;
+      return (
+        <DocumentsView
+          documents={documents}
+          onPreview={openPreview}
+          isAdmin={auth.isAdmin}
+          onStartOcr={startOcr}
+          onRetryOcr={retryOcr}
+          onUpload={uploadDocument}
+          uploadTargets={uploadTargets}
+          uploadStatus={uploadStatus}
+          actionStates={actionStates}
+        />
+      );
     }
     if (active === "deliverables") {
-      return <DeliverablesView deliverables={deliverables} documents={documents} onPatch={patchDeliverable} onPreview={openPreview} onEvidence={openEvidence} />;
+      return (
+        <DeliverablesView
+          deliverables={deliverables}
+          documents={documents}
+          onPatch={patchDeliverable}
+          onPreview={openPreview}
+          onEvidence={openEvidence}
+          onUpload={uploadDeliverable}
+          uploadTargets={uploadTargets}
+          uploadStatus={uploadStatus}
+          actionStates={actionStates}
+        />
+      );
     }
     if (active === "authority" && auth.isAdmin) {
       return (
@@ -3066,8 +3459,10 @@ function App() {
           suggestions={qualitySuggestions}
           onAnalyze={analyzeDataQuality}
           onApply={applyQualitySuggestion}
+          onApplySelected={applySelectedQuality}
           onDismiss={dismissQualitySuggestion}
           onApplyAllSafe={applyAllSafeQuality}
+          onPreview={openPreview}
           actionStates={actionStates}
         />
       );
@@ -3080,6 +3475,7 @@ function App() {
           suggestions={wikiSuggestions}
           isAdmin={auth.isAdmin}
           onRebuild={rebuildWikiSuggestions}
+          onRefreshCurrent={refreshCurrentProgress}
           onApply={applyWikiSuggestion}
           onApplyAll={applyAllWikiSuggestions}
           rebuildStatus={wikiRebuildStatus}

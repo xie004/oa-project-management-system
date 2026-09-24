@@ -246,6 +246,8 @@ def document_version_group(name: str) -> str:
 def _record_rows(conn: sqlite3.Connection, entity_type: str, include_archived: bool = True) -> list[dict[str, Any]]:
     config = ENTITY_TABLES[entity_type]
     where = "" if include_archived else "WHERE COALESCE(is_archived, 0) = 0"
+    if not include_archived and entity_type == "task":
+        where += " AND NOT (task_kind='observation' AND EXISTS (SELECT 1 FROM observation_resolutions r WHERE r.task_id=tasks.id))"
     return rows_to_dicts(
         conn.execute(
             f"SELECT *, {config['title']} AS entity_title FROM {config['table']} {where} ORDER BY id"
@@ -647,7 +649,7 @@ def analyze_data_quality() -> dict[str, Any]:
     try:
         bootstrap_entities(conn)
         consolidate_pending_candidates(conn)
-        conn.execute("DELETE FROM data_quality_suggestions WHERE status = 'pending'")
+        conn.execute("DELETE FROM data_quality_suggestions WHERE status = 'pending' AND suggestion_kind NOT IN ('task_match_review','task_status_review')")
         document_categories = {
             int(row["id"]): row["doc_category"] or ""
             for row in conn.execute("SELECT id, doc_category FROM documents").fetchall()
@@ -886,6 +888,12 @@ def start_data_quality_job() -> dict[str, Any]:
 def list_quality_suggestions(status: str = "pending") -> list[dict[str, Any]]:
     conn = get_connection()
     try:
+        document_map = {
+            int(row["id"]): row_to_dict(row) or {}
+            for row in conn.execute(
+                "SELECT id, name, path, doc_category, modified_at, effective_date, status FROM documents"
+            ).fetchall()
+        }
         where = "WHERE status = ?" if status else ""
         params: tuple[Any, ...] = (status,) if status else ()
         rows = rows_to_dicts(
@@ -903,6 +911,39 @@ def list_quality_suggestions(status: str = "pending") -> list[dict[str, Any]]:
                 item["details"] = json.loads(item.pop("details_json") or "{}")
             except Exception:
                 item["details"] = {}
+            details = item["details"]
+            entity_type = item.get("entity_type")
+            primary_id = int(item.get("primary_record_id") or 0)
+            record_ids = [primary_id, *[int(value) for value in item["relatedRecordIds"]]]
+            record_ids = list(dict.fromkeys(value for value in record_ids if value > 0))
+
+            if entity_type in ENTITY_TABLES and record_ids:
+                config = ENTITY_TABLES[entity_type]
+                placeholders = ",".join("?" for _ in record_ids)
+                current_records = rows_to_dicts(
+                    conn.execute(
+                        f"SELECT *, {config['title']} AS entity_title FROM {config['table']} WHERE id IN ({placeholders})",
+                        record_ids,
+                    ).fetchall()
+                )
+                records_by_id = {int(record["id"]): record for record in current_records}
+                ordered_records = [records_by_id[value] for value in record_ids if value in records_by_id]
+                for record in ordered_records:
+                    document_id = int(record.get(config["document"]) or 0)
+                    document = document_map.get(document_id) or {}
+                    record["source_document_id"] = document_id or None
+                    record["source_document_name"] = document.get("name") or ""
+                    record["source_document_date"] = (
+                        document.get("effective_date") or document.get("modified_at") or ""
+                    )
+                    record["source_document_category"] = document.get("doc_category") or ""
+                details["records"] = ordered_records
+            elif entity_type == "document" and record_ids:
+                current_documents = [document_map[value] for value in record_ids if value in document_map]
+                if item.get("suggestion_kind") == "document_version":
+                    details["documents"] = current_documents
+                elif current_documents:
+                    details["document"] = current_documents[0]
         return rows
     finally:
         conn.close()
@@ -944,6 +985,9 @@ def _merge_records(
         secondary = row_to_dict(conn.execute(f"SELECT * FROM {table} WHERE id = ?", (related_id,)).fetchone())
         if not secondary or related_id == primary_id:
             continue
+        if entity_type == "task" and secondary.get("task_kind") == "observation":
+            from app.services.observations import record_resolution
+            record_resolution(conn, secondary, "linked", primary_id, actor="admin", reason="数据治理合并")
         secondary_entity_id = ensure_entity(conn, entity_type, related_id, secondary[config["title"]], True)
         _copy_entity_evidence(conn, secondary_entity_id, primary_entity_id)
         document_id = secondary.get(config["document"])
@@ -989,7 +1033,90 @@ def apply_quality_suggestion(suggestion_id: int, values: dict[str, Any] | None =
             selected_related = [int(item) for item in values.get("relatedRecordIds", related_ids) if int(item) != primary_id]
             _merge_records(conn, entity_type, primary_id, selected_related, values.get("fieldChoices") or {})
             action_details["relatedRecordIds"] = selected_related
+        elif kind in {"task_match_review", "task_status_review"}:
+            if entity_type != "task" or not primary_id:
+                return {"ok": False, "message": "任务进度治理建议缺少正式任务。"}
+            selected_related = [int(item) for item in related_ids if int(item) != primary_id]
+            if kind == "task_match_review":
+                _merge_records(conn, "task", primary_id, selected_related, {})
+                action_details["relatedRecordIds"] = selected_related
+
+            if details.get("fieldsOnly"):
+                from app.services.task_reconcile import normalize_task_status
+                chosen = values.get("fieldChoices") or {}
+                allowed = details.get("fieldConflicts") or {}
+                task = dict(conn.execute("SELECT * FROM tasks WHERE id=?",(primary_id,)).fetchone())
+                source_date = str(details.get("sourceDate") or "")[:10]
+                if chosen and task.get("status_as_of") and source_date < task["status_as_of"][:10]:
+                    raise ValueError("该建议依据早于当前状态，请保留较新记录")
+                updates = {}
+                for field in ('status','progress','owner','due_date'):
+                    if chosen.get(field) not in (None,''):
+                        if str(chosen[field]) not in [str(v) for v in allowed.get(field,[])]:
+                            raise ValueError("字段值不在本次建议内")
+                        updates[field] = chosen[field]
+                if 'progress' in updates:
+                    updates['progress'] = parse_progress_percent(updates['progress'])
+                if 'status' in updates:
+                    updates['status'] = normalize_task_status(updates['status'])
+                if updates.get('status')=='completed' or updates.get('progress')==100:
+                    updates.update(status='completed',progress=100)
+                if updates:
+                    assignments=','.join(f"{key}=?" for key in updates)
+                    conn.execute(f"UPDATE tasks SET {assignments},status_as_of=?,status_source_document_id=?,status_update_mode='manual_review',updated_at=? WHERE id=?",
+                                 [*updates.values(),source_date,details.get('documentId'),now_iso(),primary_id])
+                action_details['fieldChoices']=updates
+            signal = details.get("signal") or {}
+            signal_status = str(signal.get("status") or "").strip()
+            signal_progress = signal.get("progress")
+            document_id = int(details.get("documentId") or 0) or None
+            source_date = str(details.get("sourceDate") or "").strip()[:10] or None
+            confidence = float(signal.get("confidence") or suggestion.get("confidence") or 0)
+            current = row_to_dict(conn.execute("SELECT status,status_as_of FROM tasks WHERE id = ?", (primary_id,)).fetchone()) or {}
+            should_apply_signal = bool(signal_status and signal_progress is not None)
+            if kind == "task_match_review" and current.get("status") == "completed" and signal_status != "completed":
+                should_apply_signal = False
+                action_details["statusPreserved"] = "completed"
+            if current.get("status_as_of") and (not source_date or source_date < str(current["status_as_of"])[:10]):
+                should_apply_signal = False
+                action_details["statusPreserved"] = "保留较新资料状态"
+            if kind == "task_match_review":
+                # Identity confirmation adds evidence only. Status has its own review.
+                should_apply_signal = False
+                if signal_status and signal_progress is not None:
+                    from app.services.task_reconcile import _create_review
+                    _create_review(conn, "task_status_review", primary_id, selected_related,
+                                   "确认任务字段变化", "关联已完成，执行状态需另行确认。", details, confidence)
+            if should_apply_signal:
+                conn.execute(
+                    """
+                    UPDATE tasks
+                    SET status = ?, progress = ?, status_as_of = COALESCE(?, status_as_of),
+                        status_source_document_id = COALESCE(?, status_source_document_id),
+                        status_confidence = ?, status_update_mode = 'manual_review', updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        signal_status,
+                        max(0, min(100, int(signal_progress))),
+                        source_date,
+                        document_id,
+                        confidence,
+                        now_iso(),
+                        primary_id,
+                    ),
+                )
+                action_details["appliedSignal"] = {
+                    "status": signal_status,
+                    "progress": max(0, min(100, int(signal_progress))),
+                    "sourceDate": source_date,
+                }
         elif kind == "invalid_record":
+            if entity_type == "task":
+                original = conn.execute("SELECT * FROM tasks WHERE id=?", (primary_id,)).fetchone()
+                if original and original["task_kind"] == "observation":
+                    from app.services.observations import record_resolution
+                    record_resolution(conn, dict(original), "ignored", actor="admin", reason="数据治理判定为误识别")
             config = ENTITY_TABLES[entity_type]
             conn.execute(
                 f"UPDATE {config['table']} SET is_archived = 1, archive_reason = ?, updated_at = ? WHERE id = ?",
@@ -1076,3 +1203,28 @@ def apply_all_safe_quality_suggestions() -> dict[str, Any]:
         else:
             failed.append({"id": item["id"], "message": result.get("message") or "应用失败"})
     return {"ok": not failed, "total": len(pending), "applied": applied, "failed": failed}
+
+
+def apply_selected_quality_suggestions(items: list[dict[str, Any]]) -> dict[str, Any]:
+    applied = 0
+    failed: list[dict[str, Any]] = []
+    results: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    for item in items:
+        suggestion_id = int(item.get("id") or 0)
+        if suggestion_id <= 0 or suggestion_id in seen:
+            continue
+        seen.add(suggestion_id)
+        result = apply_quality_suggestion(suggestion_id, item.get("values") or {})
+        results.append({"id": suggestion_id, **result})
+        if result.get("ok"):
+            applied += 1
+        else:
+            failed.append({"id": suggestion_id, "message": result.get("message") or "应用失败"})
+    return {
+        "ok": not failed,
+        "total": len(seen),
+        "applied": applied,
+        "failed": failed,
+        "results": results,
+    }
