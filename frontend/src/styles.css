@@ -403,6 +403,7 @@ input[type="checkbox"] {
 .deliverable-editor-grid .editor-wide { grid-column: 1 / -1; }
 .deliverable-editor-grid textarea { min-height: 100px; resize: vertical; }
 .modal-actions { display: flex; justify-content: flex-end; gap: 8px; padding-top: 12px; }
+.form-error { margin-top: 8px; padding: 8px 10px; border-radius: 6px; color: #b42318; background: #fef3f2; }
 @media (max-width: 650px) { .deliverable-editor-grid { grid-template-columns: 1fr; } .deliverable-editor-grid .editor-wide { grid-column: auto; } }
 
 .tb-scope-explainer strong,

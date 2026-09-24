@@ -1443,6 +1443,9 @@ function DeliverablesView({
   const [showArchived, setShowArchived] = useState(false);
   const [editing, setEditing] = useState(null);
   const [saving, setSaving] = useState(false);
+  const [editorError, setEditorError] = useState("");
+  const [archiveTarget, setArchiveTarget] = useState(null);
+  const [archiveReason, setArchiveReason] = useState("");
   const activeDeliverables = deliverables.filter(item => !!item.is_archived === showArchived);
   const total = deliverables.filter(item => !item.is_archived).length;
   const submitted = deliverables.filter((item) => !item.is_archived && item.status === "submitted").length;
@@ -1469,7 +1472,7 @@ function DeliverablesView({
         title="交付物台账"
         action={(
           <div className="upload-actions">
-            {isAdmin && <><button className="primary-button" onClick={() => setEditing({ name:"", requirement_source:"", description:"", status:"not_started", owner:"", planned_date:"", submitted_date:"", document_id:"" })}><Plus size={15}/>新增交付物</button><button className="ghost-button" aria-pressed={showArchived} onClick={() => setShowArchived(v=>!v)}>{showArchived ? "返回有效清单" : "已归档"}</button></>}
+            {isAdmin && <><button className="primary-button" onClick={() => { setEditorError(""); setEditing({ name:"", requirement_source:"", description:"", status:"not_started", owner:"", planned_date:"", submitted_date:"", document_id:"" }); }}><Plus size={15}/>新增交付物</button><button className="ghost-button" aria-pressed={showArchived} onClick={() => setShowArchived(v=>!v)}>{showArchived ? "返回有效清单" : "已归档"}</button></>}
             <span className="upload-directory-label">上传目录</span>
             <select value={targetValue} onChange={(event) => setTargetValue(event.target.value)} aria-label="交付物上传监控目录">
               {uploadTargets.map((target) => (
@@ -1497,7 +1500,7 @@ function DeliverablesView({
               {activeDeliverables.map((item) => (
                 <tr key={item.id}>
                   <td className="wide-cell" data-label="交付物">
-                    <strong>{item.name}</strong>{isAdmin && !showArchived && <button className="ghost-button small-button" onClick={() => setEditing({ ...item })}>编辑</button>}
+                    <strong>{item.name}</strong>{isAdmin && !showArchived && <button className="ghost-button small-button" onClick={() => { setEditorError(""); setEditing({ ...item }); }}>编辑</button>}
                     <p>{item.description}</p>
                     <small className="deliverable-update-meta">{item.source_count || 0} 个来源 · 最近更新 {formatDate(item.updated_at)}{item.update_mode === "ai_evidence" ? " · AI依据补充" : ""}{item.archive_reason ? ` · 归档原因：${item.archive_reason}` : ""}</small>
                     {!showArchived && <UploadPickerButton
@@ -1535,7 +1538,7 @@ function DeliverablesView({
                       <FileButton documentId={item.document_id} name={item.document_name} onPreview={onPreview} />
                     )}
                     <EvidenceButton entityType="deliverable" record={item} onEvidence={onEvidence} />
-                    {isAdmin && <button className="ghost-button small-button" onClick={() => showArchived ? onRestore(item.id) : onArchive(item.id)}>{showArchived ? "恢复" : "归档删除"}</button>}
+                    {isAdmin && <button className="ghost-button small-button" onClick={() => showArchived ? onRestore(item.id) : (setArchiveReason(""),setArchiveTarget(item))}>{showArchived ? "恢复" : "归档删除"}</button>}
                   </td>
                 </tr>
               ))}
@@ -1544,7 +1547,8 @@ function DeliverablesView({
           {!activeDeliverables.length && <Empty />}
         </div>
       </Section>
-      {editing && <div className="modal-backdrop"><section className="modal deliverable-editor" role="dialog" aria-modal="true"><div className="modal-header"><h2>{editing.id ? "编辑交付物" : "新增交付物"}</h2><button className="icon-button" onClick={() => setEditing(null)} aria-label="关闭"><X size={18}/></button></div><div className="deliverable-editor-grid"><label>交付物名称<input autoFocus value={editing.name||""} onChange={e=>setEditing(v=>({...v,name:e.target.value}))}/></label><label>要求依据<input value={editing.requirement_source||""} onChange={e=>setEditing(v=>({...v,requirement_source:e.target.value}))}/></label><label className="editor-wide">说明<textarea value={editing.description||""} onChange={e=>setEditing(v=>({...v,description:e.target.value}))}/></label><label>状态<select value={editing.status||"not_started"} onChange={e=>setEditing(v=>({...v,status:e.target.value}))}>{deliverableStatuses.map(([value,label])=><option value={value} key={value}>{label}</option>)}</select></label><label>责任人<input value={editing.owner||""} onChange={e=>setEditing(v=>({...v,owner:e.target.value}))}/></label><label>计划日期<input type="date" value={editing.planned_date||""} onChange={e=>setEditing(v=>({...v,planned_date:e.target.value}))}/></label><label>提交日期<input type="date" value={editing.submitted_date||""} onChange={e=>setEditing(v=>({...v,submitted_date:e.target.value}))}/></label><label className="editor-wide">主关联文件<select value={editing.document_id||""} onChange={e=>setEditing(v=>({...v,document_id:e.target.value?Number(e.target.value):null}))}><option value="">未关联</option>{documents.map(doc=><option value={doc.id} key={doc.id}>{doc.name}</option>)}</select></label></div><div className="modal-actions"><button className="ghost-button" onClick={()=>setEditing(null)}>取消</button><button className="primary-button" disabled={saving||!editing.name?.trim()} onClick={async()=>{setSaving(true);const ok=editing.id?await onPatch(editing.id,editing):await onCreate(editing);setSaving(false);if(ok!==false)setEditing(null)}}>{saving&&<span className="button-spinner"/>}保存</button></div></section></div>}
+      {editing && <div className="modal-backdrop"><section className="modal deliverable-editor" role="dialog" aria-modal="true"><div className="modal-header"><h2>{editing.id ? "编辑交付物" : "新增交付物"}</h2><button className="icon-button" onClick={() => setEditing(null)} aria-label="关闭"><X size={18}/></button></div><div className="deliverable-editor-grid"><label>交付物名称<input autoFocus aria-invalid={!!editorError} value={editing.name||""} onChange={e=>{setEditorError("");setEditing(v=>({...v,name:e.target.value}));}}/></label><label>要求依据<input value={editing.requirement_source||""} onChange={e=>setEditing(v=>({...v,requirement_source:e.target.value}))}/></label><label className="editor-wide">说明<textarea value={editing.description||""} onChange={e=>setEditing(v=>({...v,description:e.target.value}))}/></label><label>状态<select value={editing.status||"not_started"} onChange={e=>setEditing(v=>({...v,status:e.target.value}))}>{deliverableStatuses.map(([value,label])=><option value={value} key={value}>{label}</option>)}</select></label><label>责任人<input value={editing.owner||""} onChange={e=>setEditing(v=>({...v,owner:e.target.value}))}/></label><label>计划日期<input type="date" value={editing.planned_date||""} onChange={e=>setEditing(v=>({...v,planned_date:e.target.value}))}/></label><label>提交日期<input type="date" value={editing.submitted_date||""} onChange={e=>setEditing(v=>({...v,submitted_date:e.target.value}))}/></label><label className="editor-wide">主关联文件<select value={editing.document_id||""} onChange={e=>setEditing(v=>({...v,document_id:e.target.value?Number(e.target.value):null}))}><option value="">未关联</option>{documents.map(doc=><option value={doc.id} key={doc.id}>{doc.name}</option>)}</select></label></div>{editorError&&<div className="form-error" role="alert">{editorError}</div>}<div className="modal-actions"><button className="ghost-button" onClick={()=>setEditing(null)}>取消</button><button className="primary-button" disabled={saving} onClick={async()=>{if(!editing.name?.trim()){setEditorError("交付物名称不能为空，请填写名称后再保存。");return;}setSaving(true);setEditorError("");const fields={name:editing.name.trim(),requirement_source:editing.requirement_source||"",description:editing.description||"",status:editing.status||"not_started",owner:editing.owner||"",planned_date:editing.planned_date||"",submitted_date:editing.submitted_date||"",document_id:editing.document_id||null};const ok=editing.id?await onPatch(editing.id,fields):await onCreate(fields);setSaving(false);if(ok!==false)setEditing(null);else setEditorError("保存失败，请检查页面顶部错误提示并重试。");}}>{saving&&<span className="button-spinner"/>}保存</button></div></section></div>}
+      {archiveTarget && <div className="modal-backdrop"><section className="modal deliverable-editor" role="dialog" aria-modal="true" aria-label="归档交付物"><div className="modal-header"><h2>归档交付物</h2><button className="icon-button" onClick={()=>setArchiveTarget(null)} aria-label="关闭"><X size={18}/></button></div><p>“{archiveTarget.name}”将从有效清单和统计中移除，来源与文件会保留，可在已归档列表恢复。</p><label>归档原因（可选）<textarea value={archiveReason} onChange={e=>setArchiveReason(e.target.value)} /></label><div className="modal-actions"><button className="ghost-button" onClick={()=>setArchiveTarget(null)}>取消</button><button className="primary-button" onClick={async()=>{const ok=await onArchive(archiveTarget.id,archiveReason);if(ok!==false)setArchiveTarget(null);}}>{actionStates[`archive-deliverable-${archiveTarget.id}`]&&<span className="button-spinner"/>}确认归档</button></div></section></div>}
     </div>
   );
 }
@@ -3214,9 +3218,7 @@ function App() {
   };
   const patchDeliverable = (id, values) => runAction(`patch-deliverable-${id}`, () => api.patch(`/api/deliverables/${id}`, { values }), "交付物已更新");
   const createDeliverable = values => runAction("create-deliverable", () => api.post("/api/deliverables", { values }), "交付物已新增");
-  const archiveDeliverable = id => {
-    const reason = window.prompt("请输入归档原因（可留空）", "管理员归档");
-    if (reason === null) return false;
+  const archiveDeliverable = (id, reason) => {
     return runAction(`archive-deliverable-${id}`, () => api.post(`/api/deliverables/${id}/archive`, { reason }), "交付物已归档");
   };
   const restoreDeliverable = id => runAction(`restore-deliverable-${id}`, () => api.post(`/api/deliverables/${id}/restore`), "交付物已恢复");
